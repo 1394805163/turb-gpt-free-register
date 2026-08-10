@@ -85,3 +85,6 @@ webui.log
 webui.pid
 logs/
 run/
+.learnings/
+.tmp/
+output/

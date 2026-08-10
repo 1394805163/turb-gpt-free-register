@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from config import proxy as proxy_cfg
 from core import db
+from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_slot
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ def _int_setting(name: str, default: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, value))
 
 
-_WORKERS = _int_setting("PLAN_CHECK_WORKERS", 3, 1, 16)
+_WORKERS = _int_setting("PLAN_CHECK_WORKERS", PIPELINE_MAX_CONCURRENCY, 1, PIPELINE_MAX_CONCURRENCY)
 _QUEUE_LIMIT = _int_setting("PLAN_CHECK_QUEUE_LIMIT", 500, _WORKERS, 5000)
 _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="codex-agent")
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
@@ -108,7 +109,7 @@ def _safe_email_filename(email: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("@", ".", "-", "_") else "_" for ch in (email or "account"))
 
 
-def _run_generate(*, account_id: int, email: str, access_token: str, trigger: str, verify_task: bool) -> dict:
+def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigger: str, verify_task: bool) -> dict:
     env = None
     route_meta: dict = {}
     timeout_seconds = 0.0
@@ -294,6 +295,12 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
             except Exception:
                 pass
         _QUEUE_SLOTS.release()
+
+
+def _run_generate(**kwargs) -> dict:
+    """与注册后套餐查询共用总并发闸门，避免后台池叠加突破两个工作槽。"""
+    with pipeline_slot("codex_agent"):
+        return _run_generate_inner(**kwargs)
 
 
 def enqueue_account_codex_agent(*, account_id: int, email: str, access_token: str, trigger: str = "manual", verify_task: bool = True) -> dict:

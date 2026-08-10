@@ -136,10 +136,22 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                 "account": session_info.get("account"),
                 "expires": session_info.get("expires"),
                 "cloakbrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
+                "registration_proxy": {
+                    "mode": ((opened.raw or {}).get("proxy_mode") if opened else "") or "",
+                    "group": ((opened.raw or {}).get("proxy_group") if opened else "") or "",
+                    "node_name": ((opened.raw or {}).get("proxy_node") if opened else "") or "",
+                    "exit_ip": ((opened.raw or {}).get("proxy_exit_ip") if opened else "") or "",
+                    "selection_ms": ((opened.raw or {}).get("proxy_selection_ms") if opened else 0) or 0,
+                },
                 "registration_password": openai_password,
                 "codex": codex_result,
             },
         )
+        try:
+            from core.email_provider import release_email
+            release_email(email, status="used", note="Cloak registration completed")
+        except Exception:
+            logger.warning("[Cloak registration] Failed to finalize email pool state: %s", email, exc_info=True)
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
         return {"success": bool(codex_ok), "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "codex": codex_result, "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}"}
     except Exception as exc:

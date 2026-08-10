@@ -35,6 +35,7 @@ from core.account_export import (
     save_account_data,
     create_batch_archive_dir,
 )
+from core.pipeline_concurrency import pipeline_limited
 from core.email_provider import acquire_email, wait_for_otp
 from core.humanize import delay as human_delay
 from core.name_samples import random_display_name
@@ -498,7 +499,7 @@ def run_registration(
             },
         )
 
-        logger.info(f"[完成] {email}，账号ID={account_id}，Token={access_token[:16]}...")
+        logger.info("[完成] %s，账号ID=%s，Token已安全落盘（长度=%s）", email, account_id, len(access_token))
 
         # ==================== 阶段9: 后置自动触发 flow ====================
         # 只有走完回调、拿到 token 并保存成功的账号，才会触发 flow。
@@ -602,6 +603,9 @@ def main():
     if args.workers > args.count:
         logger.info(f"[批量] 并发线程数 {args.workers} 大于目标数量，已按 {args.count} 个任务执行")
         args.workers = args.count
+    if args.workers > 2:
+        logger.warning("注册/测活/推送流水线总并发硬上限为 2，CLI workers 已从 %s 调整为 2", args.workers)
+        args.workers = 2
 
     if args.workers > 1:
         batch_dir = create_batch_archive_dir(args.count, args.workers)
@@ -656,6 +660,7 @@ def main():
     sys.exit(0 if success_count == args.count else 1)
 
 
+@pipeline_limited("registration")
 def run_one_batch_item(index: int, total: int, batch_dir=None) -> dict:
     """执行批量注册中的一个任务，返回结构化结果。"""
     logger.info(f"[批量] 开始第 {index + 1}/{total} 个注册")

@@ -17,13 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from core import codex_retry_service, db
+from core.pipeline_concurrency import pipeline_slot
 
 logger = logging.getLogger(__name__)
 
 # 全局线程池，最大并发数（WebUI 每次提交时可按最新 workers 重建）
-_DEFAULT_MAX_WORKERS = 4
+_DEFAULT_MAX_WORKERS = 2
 _MIN_MAX_WORKERS = 1
-_MAX_MAX_WORKERS = 16
+_MAX_MAX_WORKERS = 2
 _executor: ThreadPoolExecutor | None = None
 _executor_workers = _DEFAULT_MAX_WORKERS
 _executor_generation = 0
@@ -274,7 +275,7 @@ class _JobLogContext:
             logging.getLogger().removeHandler(self.handler)
 
 
-def _run_one_job(job_id: int, log_file: str) -> None:
+def _run_one_job_inner(job_id: int, log_file: str) -> None:
     """单任务入口（线程池里跑这个）。"""
     log_logger = logging.getLogger(__name__)
     _activate_job(job_id)
@@ -372,6 +373,22 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         )
     finally:
         _deactivate_job(job_id)
+
+
+def _run_one_job(job_id: int, log_file: str) -> None:
+    """真实注册工作单元：取消预检后，领取邮箱前占用全局流水线槽位。"""
+    current = db.get_job(job_id)
+    if not current:
+        logger.info("[Job %s] 任务记录已删除，跳过执行", job_id)
+        return
+    if current.get("status") == "cancelled":
+        logger.info("[Job %s] 已被用户取消，跳过执行", job_id)
+        return
+
+    # inner 内会再次做取消检查，覆盖排队等待槽位期间发生的取消。
+    # 注册完成只负责非阻塞地把首测/套餐查询加入队列，不等待下游，避免嵌套占槽死锁。
+    with pipeline_slot("registration"):
+        return _run_one_job_inner(job_id, log_file)
 
 
 def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int) -> None:

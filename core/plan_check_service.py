@@ -12,6 +12,7 @@ from datetime import datetime
 from config import proxy as proxy_cfg
 from core import db
 from core.chatgpt_plan import check_account_plan
+from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_slot
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def _float_setting(name: str, default: float, lower: float, upper: float) -> flo
     return max(lower, min(upper, value))
 
 
-_WORKERS = _int_setting("PLAN_CHECK_WORKERS", 3, 1, 16)
+_WORKERS = _int_setting("PLAN_CHECK_WORKERS", PIPELINE_MAX_CONCURRENCY, 1, PIPELINE_MAX_CONCURRENCY)
 _QUEUE_LIMIT = _int_setting("PLAN_CHECK_QUEUE_LIMIT", 500, _WORKERS, 5000)
 _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="plan-check")
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
@@ -58,7 +59,7 @@ def _registration_recheck_delay() -> float:
     return _float_setting("PLAN_CHECK_REGISTRATION_RECHECK_DELAY", 2.0, 0.0, 30.0)
 
 
-def _run_plan_check(
+def _run_plan_check_inner(
     *,
     account_id: int,
     email: str,
@@ -138,6 +139,12 @@ def _run_plan_check(
         _QUEUE_SLOTS.release()
 
 
+def _run_plan_check(**kwargs) -> dict:
+    """注册后套餐查询与注册、测活、推送共用全局两个工作槽。"""
+    with pipeline_slot("plan_check"):
+        return _run_plan_check_inner(**kwargs)
+
+
 def enqueue_account_plan_check(
     *,
     account_id: int,
@@ -194,6 +201,7 @@ def queue_settings() -> dict:
     return {
         "workers": _WORKERS,
         "queue_limit": _QUEUE_LIMIT,
+        "shared_pipeline_limit": PIPELINE_MAX_CONCURRENCY,
         "min_interval": _float_setting("PLAN_CHECK_MIN_INTERVAL", 0.4, 0.0, 30.0),
         "jitter": _float_setting("PLAN_CHECK_JITTER", 0.3, 0.0, 30.0),
     }

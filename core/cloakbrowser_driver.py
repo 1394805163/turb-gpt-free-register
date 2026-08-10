@@ -7,10 +7,28 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from config import cloakbrowser as _cfg
 
 logger = logging.getLogger(__name__)
+
+
+def _proxy_log_label(proxy_url: str | None) -> str:
+    """生成不含账号、密码和 sticky identity 的代理日志标签。"""
+    if not proxy_url:
+        return "无"
+    try:
+        parsed = urlsplit(str(proxy_url))
+        if not parsed.scheme or not parsed.hostname:
+            return "已配置"
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except (TypeError, ValueError):
+        return "已配置"
 
 
 @dataclass
@@ -87,22 +105,49 @@ class CloakElement:
         # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a')。
         text = "".join(str(v or "") for v in values)
         lower = text.lower()
-        try:
-            self.click()
-        except Exception:
-            pass
-        if "\ue03d" in text or "\ue009" in text or "command" in lower or "control" in lower:
-            # Selenium Keys.CONTROL/COMMAND 编码可能传入私有区字符；这里按全选处理。
-            try:
-                self.page.keyboard.press("Meta+A")
-            except Exception:
-                self.page.keyboard.press("Control+A")
-            return
+
+        # Selenium send_keys 不会在每段文本前重新鼠标点击；反复 click 会把光标
+        # 移回输入框中部/开头，逐字符输入最终就会倒序。这里只聚焦，不移动光标。
         try:
             if self.locator is not None:
-                self.locator.fill(text, timeout=10000)
+                self.locator.focus(timeout=3000)
             else:
-                self.handle.fill(text, timeout=10000)
+                self.handle.focus(timeout=3000)
+        except Exception:
+            try:
+                self._eval("el => el.focus()")
+            except Exception:
+                pass
+        if "\ue03d" in text or "\ue009" in text or "command" in lower or "control" in lower:
+            # Selenium Keys.CONTROL/COMMAND 编码可能传入私有区字符；这里按全选处理。
+            import platform
+
+            shortcut = "Meta+A" if platform.system().lower() == "darwin" else "Control+A"
+            self.page.keyboard.press(shortcut)
+            return
+        special_keys = {
+            "\ue003": "Backspace",
+            "\ue004": "Tab",
+            "\ue006": "Enter",
+            "\ue007": "Enter",
+            "\ue00c": "Escape",
+            "\ue00d": "Space",
+            "\ue012": "ArrowLeft",
+            "\ue013": "ArrowUp",
+            "\ue014": "ArrowRight",
+            "\ue015": "ArrowDown",
+            "\ue017": "Delete",
+        }
+        if text in special_keys:
+            self.page.keyboard.press(special_keys[text])
+            return
+        try:
+            # Playwright fill() 会替换整个 value；press_sequentially/type 才符合
+            # Selenium 在当前光标位置追加文本的语义。
+            if self.locator is not None:
+                self.locator.press_sequentially(text, delay=35)
+            else:
+                self.handle.type(text, delay=35)
         except Exception:
             self.page.keyboard.type(text, delay=35)
 
@@ -364,7 +409,61 @@ def _detect_cloak_exit_geo(proxy_url: str | None = None) -> dict:
     return {}
 
 
-def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
+def _detect_openai_route_geo(proxy_url: str | None = None) -> dict:
+    """从 OpenAI 同域 Cloudflare trace 检测真实路由出口。
+
+    透明路由只匹配 OpenAI 域名；常规 IP 查询站会绕过该规则，因此不能用于
+    判断注册请求的真实出口。
+    """
+    try:
+        import requests
+        from config import browser as _browser_cfg
+
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        response = requests.get(
+            "https://auth.openai.com/cdn-cgi/trace",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"},
+            proxies=proxies,
+            timeout=(5, float(getattr(_browser_cfg, "IP_GEO_TIMEOUT", 6) or 6)),
+        )
+        if response.status_code != 200:
+            return {}
+        fields = {}
+        for line in str(response.text or "").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                fields[key.strip().lower()] = value.strip()
+        country = str(fields.get("loc") or "").upper()
+        colo = str(fields.get("colo") or "").upper()
+        timezone = "America/Los_Angeles" if country == "US" else ""
+        return {
+            "ip": fields.get("ip") or "",
+            "country": country,
+            "city": colo,
+            "timezone": timezone,
+            "source": "openai_cloudflare_trace",
+        } if country else {}
+    except Exception as exc:
+        logger.debug("[Cloak] OpenAI 路由出口检测失败：%s: %s", type(exc).__name__, exc)
+        return {}
+
+
+def _assert_mihomo_us_exit(selection: dict | None, geo: dict | None) -> None:
+    data = selection if isinstance(selection, dict) else {}
+    if str(data.get("mode") or "") != "mihomo_us":
+        return
+    country = str((geo or {}).get("country") or "").strip().upper()
+    if not country:
+        raise RuntimeError("无法确认 OpenAI 注册出口国家；已阻止继续注册")
+    if country != "US":
+        raise RuntimeError(f"OpenAI 注册出口非美国（country={country}）；已阻止继续注册")
+
+
+def _build_cloak_locale_options(
+    proxy_url: str | None = None,
+    *,
+    transparent_route: bool = False,
+) -> dict:
     """生成 Cloak/Playwright 双层语言时区配置。"""
     explicit_locale = str(getattr(_cfg, "CLOAK_LOCALE", "") or "").strip()
     explicit_timezone = str(getattr(_cfg, "CLOAK_TIMEZONE", "") or "").strip()
@@ -381,7 +480,11 @@ def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
         return out
     try:
         from config.browser import build_browser_environment
-        geo = _detect_cloak_exit_geo(proxy_url)
+        geo = (
+            _detect_openai_route_geo(proxy_url)
+            if transparent_route
+            else _detect_cloak_exit_geo(proxy_url)
+        )
         profile = build_browser_environment(geo)
         out.setdefault("locale", str(profile.get("navigator_language") or ""))
         out.setdefault("timezone", str(profile.get("timezone_iana") or ""))
@@ -392,6 +495,12 @@ def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
     return {k: v for k, v in out.items() if v}
 
 
+def _allows_transparent_mihomo_route(selection: dict | None) -> bool:
+    """仅允许已完成 Mihomo 美国节点选择的透明路由省略显式代理 URL。"""
+    data = selection if isinstance(selection, dict) else {}
+    return bool(data.get("transparent")) and data.get("mode") == "mihomo_us"
+
+
 def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
     """启动 CloakBrowser 并返回 Selenium 风格 driver。
 
@@ -399,12 +508,26 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     proxy=""    时显式禁用代理；
     proxy="..." 时使用指定代理。
     """
-    if proxy is None and bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
-        try:
-            from config.proxy import pick_proxy
-            proxy = pick_proxy()
-        except Exception:
-            proxy = None
+    from config import proxy as _proxy_cfg
+    proxy_selection: dict = {}
+    if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
+        required = bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
+        if proxy is None or not required:
+            # Resin 关闭时忽略任意显式代理，强制走 Mihomo `chatgpt us` 美国组。
+            proxy_selection = _proxy_cfg.pick_registration_proxy()
+            proxy = str(proxy_selection.get("proxy_url") or "")
+        elif not str(proxy or "").strip():
+            raise RuntimeError("注册代理为空；已阻止直连")
+    if bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False)):
+        if not bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
+            raise RuntimeError("Resin 注册代理门禁已开启，但 CloakBrowser 代理开关未开启")
+        if not str(proxy or "").strip():
+            raise RuntimeError("Resin 注册代理门禁已开启，但合格代理池为空；已阻止 VPS 直连注册")
+    else:
+        if not bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
+            raise RuntimeError("Resin 门禁已关闭但 CloakBrowser 代理开关未开启；已阻止直连注册")
+        if not str(proxy or "").strip() and not _allows_transparent_mihomo_route(proxy_selection):
+            raise RuntimeError("Mihomo 美国代理不可用；已阻止直连注册")
     try:
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:
@@ -416,7 +539,21 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
         launch_args.append(f"--fingerprint={seed}")
 
     proxy_url = _normalize_proxy(proxy) if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)) else None
-    locale_opts = _build_cloak_locale_options(proxy_url)
+    transparent_route = _allows_transparent_mihomo_route(proxy_selection)
+    locale_opts = _build_cloak_locale_options(
+        proxy_url,
+        transparent_route=transparent_route,
+    )
+    exit_geo = locale_opts.get("geo") if isinstance(locale_opts.get("geo"), dict) else {}
+    _assert_mihomo_us_exit(proxy_selection, exit_geo)
+    if proxy_selection:
+        proxy_selection["exit_ip"] = str(exit_geo.get("ip") or "")
+        logger.info(
+            "[Cloak] 注册代理已锁定：mode=%s group=%s node=%s exit_ip=%s selection_ms=%s",
+            proxy_selection.get("mode"), proxy_selection.get("group") or "-",
+            proxy_selection.get("node_name") or "-", proxy_selection.get("exit_ip") or "?",
+            proxy_selection.get("selection_ms") or 0,
+        )
     # geoip=True 交给 CloakBrowser 根据当前出口 IP 自动匹配 timezone/locale/WebRTC。
     # 之前只有显式 proxy_url 时才开启；如果用户走系统代理/VPN/透明代理，代码层面
     # 看不到 proxy_url，会误关 geoip，导致语言/时区不跟随出口。这里改为完全尊重配置。
@@ -441,7 +578,7 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     logger.info(
         "[Cloak] 启动 CloakBrowser：headless=%s humanize=%s geoip=%s proxy=%s locale=%s timezone=%s accept_language=%s persistent=%s",
         opts.get("headless"), opts.get("humanize"), opts.get("geoip"),
-        proxy_url or "无", opts.get("locale") or "自动/默认", opts.get("timezone") or "自动/默认",
+        _proxy_log_label(proxy_url), opts.get("locale") or "自动/默认", opts.get("timezone") or "自动/默认",
         locale_opts.get("accept_language") or "自动/默认", bool(user_data_dir),
     )
     context_kwargs = {}
@@ -467,4 +604,14 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     # 避免 Cloak 注册流程里出现 `[Roxy注册]`。
     driver._registration_log_prefix = "[Cloak注册]"
     driver.set_page_load_timeout(int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90))
-    return driver, CloakOpenResult(raw={"driver": "cloakbrowser", "proxy": proxy_url, "locale": locale_opts, "options": {k: v for k, v in opts.items() if k != "license_key"}})
+    return driver, CloakOpenResult(raw={
+        "driver": "cloakbrowser",
+        "proxy": proxy_url,
+        "proxy_mode": proxy_selection.get("mode") or "explicit",
+        "proxy_group": proxy_selection.get("group") or "",
+        "proxy_node": proxy_selection.get("node_name") or "",
+        "proxy_exit_ip": proxy_selection.get("exit_ip") or "",
+        "proxy_selection_ms": proxy_selection.get("selection_ms") or 0,
+        "locale": locale_opts,
+        "options": {k: v for k, v in opts.items() if k != "license_key"},
+    })

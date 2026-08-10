@@ -30,7 +30,7 @@ def _pool_source_arg(default: str = "outlook") -> str:
     if not src and request.method == "POST":
         data = request.get_json(silent=True) or {}
         src = (data.get("source") or data.get("type") or "").strip()
-    return src if src in ("all", "outlook", "generic_api", "cloudflare_domain") else default
+    return src if src in ("all", "outlook", "generic_api", "cloudflare_domain", "icloud") else default
 
 
 def _with_pool_source(rows: list[dict], source: str) -> list[dict]:
@@ -109,6 +109,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "token_expired", "token_expires_at",
         # 查活状态。
         "live_check_status", "live_check_error", "live_checked_at",
+        "pipeline_status", "push_status", "push_error", "pushed_at",
         # 提链成功/失败时才需要。
         "extract_link_status", "extract_link_type", "extract_link_message", "extract_link_error",
         "extract_link_long_url", "extract_link_copy_paste", "extract_link_image_url_png",
@@ -220,6 +221,16 @@ def create_app(auth_code: str | None = None) -> Flask:
     recovered_live_checks = db.recover_interrupted_live_checks()
     if recovered_live_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
+    try:
+        from core.chatgpt2api_push import resume_pending_pushes
+        recovered_pushes = db.recover_interrupted_account_pushes()
+        if recovered_pushes:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的 chatgpt2api 推送状态", recovered_pushes)
+        resumed_pushes = resume_pending_pushes()
+        if resumed_pushes.get("accepted"):
+            logger.info("已恢复 %s 个 chatgpt2api 推送任务", resumed_pushes["accepted"])
+    except Exception:
+        logger.exception("恢复 chatgpt2api 推送任务失败")
     recovered_codex_agents = db.recover_interrupted_codex_agents()
     if recovered_codex_agents:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
@@ -255,11 +266,15 @@ def create_app(auth_code: str | None = None) -> Flask:
             # GPTMail/MailNest/CloudMail 地址按需生成，不属于本地邮箱池。
             if src in ("gptmail", "mailnest", "cloudmail", "cloudflare"):
                 continue
-            one = (
-                db.generic_api_email_pool_summary() if src == "generic_api"
-                else db.domain_email_pool_summary() if src == "cloudflare_domain"
-                else db.outlook_pool_summary()
-            )
+            if src == "generic_api":
+                one = db.generic_api_email_pool_summary()
+            elif src == "cloudflare_domain":
+                one = db.domain_email_pool_summary()
+            elif src == "icloud":
+                from core.icloud_mail_client import mailbox_summary
+                one = mailbox_summary()
+            else:
+                one = db.outlook_pool_summary()
             for k in pool:
                 pool[k] += int(one.get(k, 0) or 0)
         domain_pool = db.domain_email_pool_summary()
@@ -283,6 +298,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=500, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        status_filter = str(request.args.get("status", default="") or "").lower()
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
@@ -294,11 +310,33 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, q=q, date_from=date_from, date_to=date_to)
+            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to)
             result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
             result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
             return jsonify(result)
-        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, q=q, date_from=date_from, date_to=date_to))
+        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to))
+
+    @app.get("/api/accounts/confirmed-dead.txt")
+    def api_confirmed_dead_accounts_txt():
+        """导出确认死亡账号邮箱；每行一个邮箱，不包含 token。"""
+        rows = db.list_accounts(
+            limit=1_000_000,
+            archived="all",
+            status_filter="confirmed_dead",
+        )
+        emails = [str(row.get("email") or "").strip() for row in rows]
+        content = "\n".join(email for email in emails if email)
+        if content:
+            content += "\n"
+        return Response(
+            content,
+            mimetype="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="confirmed-dead-emails.txt"',
+                "Cache-Control": "no-store, max-age=0",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.get("/api/accounts/plan-check-status")
     def api_account_plan_check_status():
@@ -306,6 +344,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=5000, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        status_filter = str(request.args.get("status", default="") or "").lower()
         q = str(request.args.get("q", default="") or "").strip()
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
@@ -313,10 +352,10 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q)
             snapshot.update({"page": page, "page_size": page_size})
         else:
-            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q)
         snapshot["queue"] = plan_check_service.queue_settings()
         return jsonify(snapshot)
 
@@ -1294,11 +1333,16 @@ def create_app(auth_code: str | None = None) -> Flask:
             rows += _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
             rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
             rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
+            from core import icloud_mail_client
+            rows += _with_pool_source(icloud_mail_client.list_mailboxes(status=status, limit=fetch_limit), "icloud")
             rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
         elif source == "generic_api":
             rows = _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
         elif source == "cloudflare_domain":
             rows = _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
+        elif source == "icloud":
+            from core import icloud_mail_client
+            rows = _with_pool_source(icloud_mail_client.list_mailboxes(status=status, limit=fetch_limit), "icloud")
         else:
             rows = _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
         if q:
@@ -1319,10 +1363,16 @@ def create_app(auth_code: str | None = None) -> Flask:
         """
         data = request.get_json(silent=True) or {}
         source = (data.get("source") or data.get("type") or "").strip()
-        if source not in ("outlook", "generic_api"):
-            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook 或 通用 API"}), 400
+        if source not in ("outlook", "generic_api", "icloud"):
+            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API 或 iCloud 隐藏邮箱池"}), 400
         text = data.get("text") or ""
         as_registered = bool(data.get("as_registered", False))
+        if source == "icloud":
+            from core.icloud_mail_client import import_mailboxes
+            result = import_mailboxes(text)
+            if not result.get("parsed"):
+                return jsonify({"ok": False, "error": "未解析到有效 iCloud 隐藏邮箱；每行填写 alias@icloud.com 或 alias@icloud.com----标签"}), 400
+            return jsonify(result)
         records = []
         for line in text.splitlines():
             line = line.strip()
@@ -1382,6 +1432,9 @@ def create_app(auth_code: str | None = None) -> Flask:
             db.release_generic_api_email(email, status=status, note=data.get("note"))
         elif source == "cloudflare_domain":
             db.release_domain_email(email, status=status, note=data.get("note"))
+        elif source == "icloud":
+            from core.icloud_mail_client import set_mailbox_status
+            set_mailbox_status(email, status=status, note=data.get("note"))
         else:
             db.release_outlook(email, status=status, note=data.get("note"))
         return jsonify({"ok": True})
@@ -1425,6 +1478,9 @@ def create_app(auth_code: str | None = None) -> Flask:
                     db.release_generic_api_email(email, status=status, note=note)
                 elif item_source == "cloudflare_domain":
                     db.release_domain_email(email, status=status, note=note)
+                elif item_source == "icloud":
+                    from core.icloud_mail_client import set_mailbox_status
+                    set_mailbox_status(email, status=status, note=note)
                 else:
                     db.release_outlook(email, status=status, note=note)
                 updated.append({"email": email, "source": item_source, "status": status})
@@ -1447,13 +1503,15 @@ def create_app(auth_code: str | None = None) -> Flask:
         source = (data.get("source") or _pool_source_arg()).strip()
         if source == "all":
             source = "outlook"
-        deleted = (
-            db.delete_generic_api_email(email)
-            if source == "generic_api"
-            else db.delete_domain_email(email)
-            if source == "cloudflare_domain"
-            else db.delete_outlook(email)
-        )
+        if source == "generic_api":
+            deleted = db.delete_generic_api_email(email)
+        elif source == "cloudflare_domain":
+            deleted = db.delete_domain_email(email)
+        elif source == "icloud":
+            from core.icloud_mail_client import delete_mailbox
+            deleted = delete_mailbox(email)
+        else:
+            deleted = db.delete_outlook(email)
         return jsonify({"ok": True, "deleted": deleted})
 
     @app.post("/api/outlook/delete-bulk")
@@ -1486,13 +1544,15 @@ def create_app(auth_code: str | None = None) -> Flask:
             if key in seen:
                 continue
             seen.add(key)
-            deleted_ok = (
-                db.delete_generic_api_email(email)
-                if item_source == "generic_api"
-                else db.delete_domain_email(email)
-                if item_source == "cloudflare_domain"
-                else db.delete_outlook(email)
-            )
+            if item_source == "generic_api":
+                deleted_ok = db.delete_generic_api_email(email)
+            elif item_source == "cloudflare_domain":
+                deleted_ok = db.delete_domain_email(email)
+            elif item_source == "icloud":
+                from core.icloud_mail_client import delete_mailbox
+                deleted_ok = delete_mailbox(email)
+            else:
+                deleted_ok = db.delete_outlook(email)
             if deleted_ok:
                 deleted.append({"email": email, "source": item_source})
             else:
@@ -2115,6 +2175,19 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify(result)
         return jsonify(rows)
 
+    @app.get("/api/registration/proxy-status")
+    def api_registration_proxy_status():
+        from core.resin_proxy_status import registration_proxy_status
+
+        return jsonify({"ok": True, **registration_proxy_status(check_tcp=True)})
+
+    @app.post("/api/registration/proxy-test")
+    def api_registration_proxy_test():
+        from core.resin_proxy_status import test_registration_proxy
+
+        result = test_registration_proxy()
+        return jsonify(result), (200 if result.get("ok") else 503)
+
     @app.post("/api/jobs")
     def api_jobs_create():
         """启动批量注册：body {count, workers}。"""
@@ -2128,14 +2201,27 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         # workers 控制本次新提交任务使用的线程池；若和上次不同，服务层会为新任务切换到新池。
         try:
-            workers = max(1, min(16, int(data.get("workers", 3))))
+            workers = max(1, min(2, int(data.get("workers", 2))))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "workers 非法"}), 400
 
         # 提交前先确认池里有足够可用邮箱，给前端一个温和提示（不阻断）
         from config import email as _email_cfg
         from config import register as _register_cfg
+        from config import proxy as _proxy_cfg
+        from config import roxybrowser as _registration_cfg
         from core.email_provider import parse_email_sources
+        driver = str(getattr(_registration_cfg, "REGISTRATION_DRIVER", "") or "").strip().lower()
+        if driver == "cloak" and bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False)):
+            from core.resin_proxy_status import registration_proxy_status
+            proxy_state = registration_proxy_status(check_tcp=True)
+            if not proxy_state.get("ready"):
+                reason = str(proxy_state.get("error") or "Resin 注册代理尚未就绪")
+                return jsonify({
+                    "ok": False,
+                    "error": f"Resin 代理门禁：{reason}。已阻止直连注册，请先恢复代理池。",
+                    "proxy_status": proxy_state,
+                }), 503
         if not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True)):
             reg_email = str(getattr(_register_cfg, "REGISTER_EMAIL", "") or "").strip()
             if not reg_email:
@@ -2206,6 +2292,19 @@ def create_app(auth_code: str | None = None) -> Flask:
                     "ok": False,
                     "error": "已选择 cloudmail 邮箱来源，请填写 CloudMail Token（配置 → 邮箱 / OTP）。",
                 }), 400
+        if "icloud" in sources:
+            username = str(getattr(_email_cfg, "ICLOUD_IMAP_USERNAME", "") or "").strip()
+            password = str(getattr(_email_cfg, "ICLOUD_IMAP_PASSWORD", "") or "").strip()
+            if not username:
+                return jsonify({
+                    "ok": False,
+                    "error": "已选择 iCloud 邮箱来源，请填写 iCloud 主邮箱（配置 → 邮箱 / OTP）。",
+                }), 400
+            if not password:
+                return jsonify({
+                    "ok": False,
+                    "error": "已选择 iCloud 邮箱来源，请填写 Apple App 专用密码（配置 → 邮箱 / OTP）。",
+                }), 400
         if "gptmail" in sources or "mailnest" in sources or "cloudmail" in sources or "cloudflare" in sources:
             # 临时邮箱在任务开始时动态生成，不需要本地邮箱池容量提示。
             warning = ""
@@ -2219,12 +2318,21 @@ def create_app(auth_code: str | None = None) -> Flask:
             warning = ""
             if pool.get("available", 0) < count:
                 warning = f"通用 API 邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会失败"
+        elif sources == ["icloud"]:
+            from core.icloud_mail_client import mailbox_summary
+            pool = mailbox_summary()
+            warning = ""
+            if pool.get("available", 0) < count:
+                warning = f"iCloud 隐藏邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会失败"
         elif len(sources) > 1:
             available = 0
             if "outlook" in sources:
                 available += db.outlook_pool_summary().get("available", 0)
             if "generic_api" in sources:
                 available += db.generic_api_email_pool_summary().get("available", 0)
+            if "icloud" in sources:
+                from core.icloud_mail_client import mailbox_summary
+                available += mailbox_summary().get("available", 0)
             warning = ""
             if available < count:
                 warning = f"多个邮箱池合计仅 {available} 个可用，少于任务数 {count}，不足的会失败"
@@ -2280,7 +2388,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         """重试失败/停止/取消任务；服务端自动判断完整注册或 Codex 补跑。"""
         data = request.get_json(silent=True) or {}
         try:
-            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+            workers = max(1, min(2, int(data.get("workers", svc.get_executor_workers()))))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "workers 非法"}), 400
         result = svc.retry_job(job_id, workers=workers)
@@ -2298,7 +2406,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         if len(job_ids) > 500:
             return jsonify({"ok": False, "error": "单次最多重试 500 个任务"}), 400
         try:
-            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+            workers = max(1, min(2, int(data.get("workers", svc.get_executor_workers()))))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "workers 非法"}), 400
 

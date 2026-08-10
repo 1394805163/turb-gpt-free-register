@@ -18,7 +18,7 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
-_VALID_SOURCES = ("outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail")
+_VALID_SOURCES = ("outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "icloud")
 
 
 def parse_email_sources(value=None) -> list[str]:
@@ -47,6 +47,9 @@ def parse_email_sources(value=None) -> list[str]:
 
 
 def _pick_from_source(source: str) -> str:
+    if source == "icloud":
+        from core.icloud_mail_client import pick_account
+        return pick_account().email
     if source == "gptmail":
         from core.gptmail_client import pick_account
         return pick_account().email
@@ -87,6 +90,9 @@ def acquire_email() -> str:
 
 def resolve_email_source(email: str) -> str:
     """根据邮箱在各池中的归属判断实际来源。"""
+    from core.icloud_mail_client import get_account_context as get_icloud_context
+    if get_icloud_context(email):
+        return "icloud"
     from core.gptmail_client import get_account_context as get_gptmail_context
     if get_gptmail_context(email):
         return "gptmail"
@@ -157,6 +163,9 @@ def wait_for_otp(
         extra_kwargs["settle_seconds"] = settle_seconds
 
     source = resolve_email_source(email)
+    if source == "icloud":
+        from core.icloud_mail_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "gptmail":
         from core.gptmail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
@@ -182,7 +191,10 @@ def wait_for_otp(
 def release_email(email: str, status: str = "available", note: str | None = None) -> str:
     """按邮箱实际来源回收状态，返回来源名。"""
     source = resolve_email_source(email)
-    if source == "gptmail":
+    if source == "icloud":
+        from core.icloud_mail_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "gptmail":
         from core.gptmail_client import release_account
         release_account(email, status=status, note=note)
     elif source == "cloudflare":

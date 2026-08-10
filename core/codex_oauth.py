@@ -1087,8 +1087,8 @@ def exchange_codex_token(session: BrowserSession, code: str, code_verifier: str)
     if not token_resp.get("access_token"):
         raise RuntimeError(f"[Codex] token 响应缺少 access_token: {token_resp}")
     logger.info(
-        f"[Codex] 换 token 成功，expires_in={token_resp.get('expires_in')}, "
-        f"access_token={token_resp['access_token'][:16]}..."
+        "[Codex] 换 token 成功，expires_in=%s, access_token_len=%s",
+        token_resp.get("expires_in"), len(str(token_resp.get("access_token") or "")),
     )
     return token_resp
 

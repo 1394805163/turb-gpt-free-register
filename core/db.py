@@ -25,6 +25,7 @@ _LEGACY_DATA_DIR = _PROJECT_ROOT / "data"
 _LOG_DIR = _PROJECT_ROOT / "注册日志"
 _PLAN_CHECK_STALE_SECONDS = 120
 _PLAN_CHECK_QUEUE_STALE_SECONDS = 1800
+_DEAD_RECHECK_INTERVAL_SECONDS = 300
 
 _OUTLOOK_JSON = _PROJECT_ROOT / "用于注册的邮箱.json"
 _OUTLOOK_TXT = _PROJECT_ROOT / "用于注册的邮箱.txt"
@@ -49,6 +50,11 @@ _LOCK = threading.RLock()
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _token_fingerprint(token: str) -> str:
+    value = str(token or "")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
 
 
 def _ensure_storage() -> None:
@@ -639,9 +645,11 @@ def insert_account(
                 "created_at": _now(),
             }
             accounts.append(row)
+            previous_token_fingerprint = ""
         else:
             row = existing
             row_id = int(row["id"])
+            previous_token_fingerprint = _token_fingerprint(row.get("access_token") or "")
 
         row.update({
             "access_token": access_token,
@@ -658,6 +666,16 @@ def insert_account(
             "codex_error": codex_error if codex_error is not None else row.get("codex_error"),
             "updated_at": _now(),
         })
+        current_token_fingerprint = _token_fingerprint(access_token)
+        if existing is None:
+            row.setdefault("pipeline_status", "pending")
+            row.setdefault("push_status", "pending")
+        elif current_token_fingerprint != previous_token_fingerprint:
+            # access token 变化后必须重新测活并重新推送，旧幂等指纹不能复用。
+            row["pipeline_status"] = "pending"
+            row["push_status"] = "pending"
+            row["push_error"] = None
+            row["push_next_retry_at"] = None
 
         if outlook_row:
             row["password"] = outlook_row.get("password")
@@ -1102,7 +1120,7 @@ def _parse_iso_dt(value: str | None, end_of_day: bool = False) -> datetime | Non
         return None
 
 
-def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
     rows = _load_accounts()
     if archived in (True, "1", "true", "yes", "only"):
         rows = [r for r in rows if bool(r.get("archived"))]
@@ -1112,6 +1130,12 @@ def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filte
         rows = [r for r in rows if not bool(r.get("archived"))]
     decorated = [_decorate_account(r) for r in rows]
     decorated = [r for r in decorated if _account_matches_plan_filter(r, plan_filter)]
+    wanted_status = str(status_filter or "").strip().lower()
+    if wanted_status and wanted_status not in {"all", "any"}:
+        decorated = [
+            r for r in decorated
+            if str(r.get("pipeline_status") or r.get("live_check_status") or "").strip().lower() == wanted_status
+        ]
     decorated = [r for r in decorated if _account_matches_query(r, q)]
     # 按创建时间筛选（date_from/date_to 为 ISO 字符串或 YYYY-MM-DD）
     if date_from or date_to:
@@ -1132,7 +1156,7 @@ def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filte
     return sorted(decorated, key=lambda x: int(x.get("id") or 0), reverse=True)
 
 
-def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, q: str | None = None) -> dict:
+def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None) -> dict:
     """返回不含 Token/邮箱密码的套餐查询轻量状态快照。"""
     fields = (
         "id", "email", "archived",
@@ -1155,7 +1179,7 @@ def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archive
         "codex_agent_sub2api_mode", "codex_agent_sub2api_total",
     )
     with _LOCK:
-        all_rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, q=q)
+        all_rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q)
         total = len(all_rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
@@ -1205,15 +1229,15 @@ def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archive
         return {"items": items, "total": total, "offset": offset, "limit": limit, "revision": f"{total}:{latest}:{revision_sig}"}
 
 
-def list_accounts(limit: int = 500, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+def list_accounts(limit: int = 500, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, q=q, date_from=date_from, date_to=date_to)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to)
         return rows[max(0, int(offset or 0)): max(0, int(offset or 0)) + max(1, int(limit))]
 
 
-def list_accounts_page(limit: int = 50, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> dict:
+def list_accounts_page(limit: int = 50, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> dict:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, q=q, date_from=date_from, date_to=date_to)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to)
         total = len(rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
@@ -1260,18 +1284,49 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
 
         now = _now()
         ok = bool(result.get("ok"))
-        status = str(result.get("status") or ("live" if ok else "failed"))
+        status = str(result.get("status") or ("live" if ok else "temporary_error"))
+        if status == "deactivated":  # 兼容旧查活结果
+            status = "confirmed_dead"
+        elif status == "failed":
+            status = "temporary_error"
+        if result.get("dead_candidate"):
+            candidate_code = str(result.get("dead_candidate_code") or "invalid_account")
+            previous_code = str(row.get("dead_candidate_code") or "")
+            previous_at = str(row.get("dead_candidate_checked_at") or "")
+            confirmed_by_review = False
+            if previous_code == candidate_code and previous_at:
+                try:
+                    confirmed_by_review = (
+                        datetime.now() - datetime.fromisoformat(previous_at)
+                    ).total_seconds() >= _DEAD_RECHECK_INTERVAL_SECONDS
+                except (TypeError, ValueError):
+                    confirmed_by_review = False
+            if confirmed_by_review:
+                status = "confirmed_dead"
+                result = dict(result)
+                result["error"] = candidate_code
+                row["dead_confirmed_by_recheck"] = True
+                row["dead_confirmed_at"] = now
+            else:
+                status = "temporary_error"
+                row["dead_candidate_code"] = candidate_code
+                row["dead_candidate_checked_at"] = now
         row["live_check_status"] = status
         row["live_check_ok"] = ok
         row["live_checked_at"] = result.get("checked_at") or now
         row["live_check_error"] = None if ok else result.get("error")
         row["updated_at"] = now
 
-        if status == "deactivated":
+        if status == "confirmed_dead":
+            row["pipeline_status"] = "confirmed_dead"
             row["codex_status"] = "deactivated"
             row["codex_error"] = result.get("error") or "账号已删除/停用/封禁"
+        elif status == "temporary_error":
+            row["pipeline_status"] = "temporary_error"
 
         if ok:
+            row["dead_candidate_code"] = None
+            row["dead_candidate_checked_at"] = None
             token = str(result.get("access_token") or "").strip()
             if token:
                 row["access_token"] = token
@@ -1291,10 +1346,143 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
             if result.get("proxy_used"):
                 row["live_check_proxy_used"] = result.get("proxy_used")
             row["live_check_error"] = None
+            current_fingerprint = _token_fingerprint(row.get("access_token") or "")
+            if (
+                row.get("push_status") == "pushed"
+                and row.get("push_token_fingerprint") == current_fingerprint
+            ):
+                row["pipeline_status"] = "pushed"
+            else:
+                row["pipeline_status"] = "live"
+                row["push_status"] = "pending"
+                row["push_error"] = None
+                row["push_next_retry_at"] = None
 
         row["copy_line"] = _account_line(row)
         _save_accounts(rows)
         return True
+
+
+def claim_account_push(acc_id: int, token_fingerprint: str) -> str:
+    """原子占用推送任务，返回 claimed/idempotent/busy/not_live/missing。"""
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return "missing"
+        if str(row.get("live_check_status") or "") != "live":
+            return "not_live"
+        if not str(row.get("access_token") or "").strip():
+            return "missing_token"
+        if row.get("push_status") == "pushed" and row.get("push_token_fingerprint") == token_fingerprint:
+            return "idempotent"
+        if row.get("push_status") in {"queued", "running"} and row.get("push_claim_fingerprint") == token_fingerprint:
+            return "busy"
+        now = _now()
+        row["push_status"] = "running"
+        row["push_claim_fingerprint"] = token_fingerprint
+        row["push_started_at"] = now
+        row["push_error"] = None
+        row["push_next_retry_at"] = None
+        row["updated_at"] = now
+        _save_accounts(rows)
+        return "claimed"
+
+
+def record_account_push_attempt(
+    acc_id: int,
+    *,
+    attempt: int,
+    error: str | None = None,
+    next_retry_at: str | None = None,
+    http_status: int | None = None,
+) -> bool:
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return False
+        row["push_status"] = "running"
+        row["push_attempts"] = int(attempt)
+        row["push_error"] = str(error or "")[:500] or None
+        row["push_next_retry_at"] = next_retry_at
+        row["push_http_status"] = int(http_status) if http_status is not None else None
+        row["push_last_attempt_at"] = _now()
+        row["updated_at"] = _now()
+        _save_accounts(rows)
+        return True
+
+
+def complete_account_push(
+    acc_id: int,
+    *,
+    success: bool,
+    token_fingerprint: str,
+    attempts: int,
+    error: str | None = None,
+    http_status: int | None = None,
+) -> bool:
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return False
+        now = _now()
+        row["push_status"] = "pushed" if success else "push_failed"
+        row["pipeline_status"] = "pushed" if success else "push_failed"
+        row["push_attempts"] = int(attempts)
+        row["push_error"] = None if success else str(error or "推送失败")[:500]
+        row["push_http_status"] = int(http_status) if http_status is not None else None
+        row["push_next_retry_at"] = None
+        row["push_completed_at"] = now
+        row["push_claim_fingerprint"] = None
+        if success:
+            row["push_token_fingerprint"] = token_fingerprint
+            row["pushed_at"] = now
+        row["updated_at"] = now
+        _save_accounts(rows)
+        return True
+
+
+def list_push_candidate_ids(limit: int = 500) -> list[int]:
+    """返回已测活但尚未按当前 token 成功推送的账号 ID。"""
+    with _LOCK:
+        ids: list[int] = []
+        for row in _load_accounts():
+            if str(row.get("live_check_status") or "") != "live":
+                continue
+            token = str(row.get("access_token") or "").strip()
+            if not token:
+                continue
+            fingerprint = _token_fingerprint(token)
+            if row.get("push_status") == "pushed" and row.get("push_token_fingerprint") == fingerprint:
+                continue
+            ids.append(int(row.get("id") or 0))
+            if len(ids) >= max(1, int(limit)):
+                break
+        return ids
+
+
+def recover_interrupted_account_pushes() -> int:
+    """进程启动时把中断的推送任务恢复为可重试状态。"""
+    with _LOCK:
+        rows = _load_accounts()
+        recovered = 0
+        now = _now()
+        for row in rows:
+            if row.get("push_status") not in {"queued", "running"}:
+                continue
+            row["push_status"] = "push_failed"
+            # 账号仍是已测活状态，恢复后允许重新 claim；不把网络中断误记为死亡。
+            row["pipeline_status"] = "live"
+            row["push_error"] = "WebUI 重启或任务异常中断，已恢复等待重试"
+            row["push_claim_fingerprint"] = None
+            row["push_next_retry_at"] = None
+            row["updated_at"] = now
+            recovered += 1
+        if recovered:
+            _save_accounts(rows)
+        return recovered
 
 
 def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
@@ -1335,7 +1523,8 @@ def recover_interrupted_live_checks() -> int:
         for row in rows:
             if row.get("live_check_status") not in {"queued", "running"}:
                 continue
-            row["live_check_status"] = "failed"
+            row["live_check_status"] = "temporary_error"
+            row["pipeline_status"] = "temporary_error"
             row["live_check_ok"] = False
             row["live_check_error"] = "WebUI 重启或任务异常中断，请重新查活"
             row["live_checked_at"] = now

@@ -165,7 +165,7 @@ def fetch_session(session: BrowserSession) -> dict:
     data = resp.json()
 
     if not data.get("accessToken"):
-        logger.error(f"[Session] 响应中没有 accessToken: {data}")
+        logger.error("[Session] 响应中没有 accessToken；响应字段=%s", sorted(data) if isinstance(data, dict) else type(data).__name__)
         raise RuntimeError("未拿到 accessToken，登录态可能未建立")
 
     user = data.get("user") or {}
@@ -260,7 +260,7 @@ def _exchange_new_token(session: BrowserSession, continue_url: str) -> str:
     # 拿新的 accessToken
     new_session = fetch_session(session)
     new_token = new_session["accessToken"]
-    logger.info(f"[2FA] 新 accessToken（含新鲜 pwd_auth_time）: {new_token[:40]}...")
+    logger.info("[2FA] 已获取含新鲜 pwd_auth_time 的 accessToken（长度=%s）", len(new_token))
     return new_token
 
 
@@ -453,4 +453,22 @@ def save_account_data(
             f"[Plan] 注册后自动查询入队异常（不影响注册结果）: "
             f"{email}, {type(exc).__name__}: {str(exc)[:180]}"
         )
+    # 注册成功只进入 pending；必须由独立测活重新登录成功后，才会进入推送队列。
+    try:
+        from core.live_check_service import enqueue_account_live_check
+
+        queued = enqueue_account_live_check(
+            account_id=row_id,
+            email=email,
+            trigger="registration_auto",
+            proxy=None,
+        )
+        if queued.get("accepted"):
+            logger.info("[LiveCheck] 注册后自动测活已入队: id=%s email=%s", row_id, email)
+        elif queued.get("busy"):
+            logger.info("[LiveCheck] 账号已有测活任务: id=%s email=%s", row_id, email)
+        else:
+            logger.warning("[LiveCheck] 注册后自动测活入队失败（账号已保存）: %s", queued.get("error"))
+    except Exception as exc:
+        logger.warning("[LiveCheck] 注册后自动测活入队异常（账号已保存）: %s", type(exc).__name__)
     return row_id

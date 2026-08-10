@@ -313,7 +313,41 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：icloud,outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail",
+    },
+    {
+        "key": "ICLOUD_MAILBOXES_FILE", "file": "email.py", "type": "str", "group": "iCloud 邮箱",
+        "label": "隐藏邮箱列表文件", "help": "每行一个 Hide My Email 地址，兼容 邮箱----标签；相对路径以项目根目录为准",
+    },
+    {
+        "key": "ICLOUD_IMAP_HOST", "file": "email.py", "type": "str", "group": "iCloud 邮箱",
+        "label": "iCloud IMAP 地址", "help": "默认 imap.mail.me.com",
+    },
+    {
+        "key": "ICLOUD_IMAP_PORT", "file": "email.py", "type": "int", "group": "iCloud 邮箱",
+        "label": "iCloud IMAP 端口", "help": "默认 993，使用 SSL",
+    },
+    {
+        "key": "ICLOUD_IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "iCloud 邮箱",
+        "label": "iCloud 收件箱", "help": "默认 INBOX",
+    },
+    {
+        "key": "ICLOUD_IMAP_USERNAME", "file": "email.py", "type": "str", "group": "iCloud 邮箱",
+        "label": "iCloud 主邮箱", "help": "接收所有 Hide My Email 转发邮件的完整 iCloud 邮箱地址",
+        "storage": "env",
+    },
+    {
+        "key": "ICLOUD_IMAP_PASSWORD", "file": "email.py", "type": "str", "group": "iCloud 邮箱",
+        "label": "Apple App 专用密码", "help": "Apple 账号生成的 App 专用密码，不是 Apple ID 登录密码",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "ICLOUD_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "iCloud 邮箱",
+        "label": "iCloud 请求超时", "help": "IMAP 连接超时秒数，默认 30",
+    },
+    {
+        "key": "ICLOUD_MESSAGE_LIMIT", "file": "email.py", "type": "int", "group": "iCloud 邮箱",
+        "label": "每次检查邮件数", "help": "每个隐藏邮箱最多检查的最新邮件数，默认 6",
     },
     {
         "key": "GPTMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -445,6 +479,43 @@ EDITABLE_FIELDS = [
 
     # ---- 代理池 ----
     {
+        "key": "PROXY_POOL_FILE", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "已验证代理文件", "help": "非空文件优先于下方代理池；相对路径以项目根目录为基准，仅只读加载",
+    },
+    {
+        "key": "REGISTRATION_PROXY_REQUIRED", "file": "proxy.py", "type": "bool", "group": "代理池",
+        "label": "注册强制使用 Resin", "help": "开启后代理池为空时后端阻止注册，避免 CloakBrowser 回退到 VPS 直连出口",
+    },
+    {
+        "key": "RESIN_MANAGEMENT_URL", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Resin 管理面板", "help": "只用于前端跳转管理面板，不会被当作 HTTP/SOCKS forward proxy",
+    },
+    {
+        "key": "MIHOMO_US_FALLBACK_ENABLED", "file": "proxy.py", "type": "bool", "group": "代理池",
+        "label": "启用 Mihomo 美国回退", "help": "Resin 门禁关闭时只允许通过 Mihomo 的 chatgpt us 组注册；失败时阻止直连",
+    },
+    {
+        "key": "MIHOMO_CONTROLLER_URL", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo Controller", "help": "例如 http://127.0.0.1:9090",
+    },
+    {
+        "key": "MIHOMO_CONTROLLER_SECRET", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo Controller 密钥", "help": "仅保存在 .env，不写日志",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "MIHOMO_US_GROUP", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo 美国组", "help": "固定使用 chatgpt us；只会选择名称可识别为美国的节点",
+    },
+    {
+        "key": "MIHOMO_PROXY_URL", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo 本地代理", "help": "浏览器使用的本地 HTTP/SOCKS 入口，例如 socks5h://127.0.0.1:7897",
+    },
+    {
+        "key": "MIHOMO_TRANSPARENT_ROUTING", "file": "proxy.py", "type": "bool", "group": "代理池",
+        "label": "Mihomo 路由器透明分流", "help": "控制器切换美国节点后，由路由器按 OpenAI 域名透明分流；开启时无需填写显式代理 URL",
+    },
+    {
         "key": "PROXY_POOL", "file": "proxy.py", "type": "list_str_multiline", "group": "代理池",
         "label": "代理池(每行一个)", "help": "每行一个代理 URL，留空行会被忽略；为空则不使用代理",
     },
@@ -475,7 +546,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "PLAN_CHECK_WORKERS", "file": "proxy.py", "type": "int", "group": "代理池",
-        "label": "套餐查询并发数", "help": "自动、手动和批量查套餐共用；Agent Token 生成使用独立队列；建议 2-4 个线程",
+        "label": "套餐查询并发数", "help": "注册后自动查询与注册/测活/推送共用总闸门；默认及硬上限均为 2",
     },
     {
         "key": "PLAN_CHECK_QUEUE_LIMIT", "file": "proxy.py", "type": "int", "group": "代理池",
@@ -488,6 +559,32 @@ EDITABLE_FIELDS = [
     {
         "key": "PLAN_CHECK_JITTER", "file": "proxy.py", "type": "float", "group": "代理池",
         "label": "套餐/Agent请求随机抖动(秒)", "help": "在查套餐和生成 Agent Token 的最小间隔上增加随机延迟，避免请求过于规律",
+    },
+    # ---- chatgpt2api 推送 ----
+    {
+        "key": "CHATGPT2API_PUSH_ENABLED", "file": "chatgpt2api.py", "type": "bool", "group": "chatgpt2api 推送",
+        "label": "启用测活后推送", "help": "仅测活成功的账号会自动 POST 到 /api/accounts",
+    },
+    {
+        "key": "CHATGPT2API_BASE_URL", "file": "chatgpt2api.py", "type": "str", "group": "chatgpt2api 推送",
+        "label": "目标地址", "help": "chatgpt2api 基础 URL，不要包含 /api/accounts",
+    },
+    {
+        "key": "CHATGPT2API_ADMIN_KEY", "file": "chatgpt2api.py", "type": "str", "group": "chatgpt2api 推送",
+        "label": "管理员密钥", "help": "仅保存在 .env，日志只记录 token 哈希和长度",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "CHATGPT2API_TIMEOUT", "file": "chatgpt2api.py", "type": "float", "group": "chatgpt2api 推送",
+        "label": "请求超时(秒)", "help": "单次 POST /api/accounts 的超时时间",
+    },
+    {
+        "key": "CHATGPT2API_MAX_RETRIES", "file": "chatgpt2api.py", "type": "int", "group": "chatgpt2api 推送",
+        "label": "最大尝试次数", "help": "429、5xx、超时和网络错误按指数退避重试",
+    },
+    {
+        "key": "CHATGPT2API_BACKOFF_BASE", "file": "chatgpt2api.py", "type": "float", "group": "chatgpt2api 推送",
+        "label": "退避基数(秒)", "help": "重试等待为基数 × 2^(attempt-1)",
     },
     # ---- 提链 ----
     {

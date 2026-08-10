@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """已注册账号查活：重新邮箱 OTP 登录，成功拿到最新 ChatGPT accessToken 即视为正常。"""
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -27,10 +28,50 @@ _RUNNING_LOCK = threading.Lock()
 # 查活网络预检失败（403/429/代理/超时等）多为出口 IP 被 CF 标记或代理池抖动，
 # 视为可换新 IP 重试；账号本身问题（废号/邮箱错误等）不重试。
 _RETRYABLE_NETWORK_HINTS = (
-    "403", "429", "502", "503", "504",
+    "403", "429",
     "proxy", "socks", "timeout", "timed out",
     "connection", "closed", "reset",
 )
+_CONFIRMED_DEAD_CODES = frozenset({"account_deactivated", "account_deleted", "account_banned"})
+_DEAD_REVIEW_MARKERS = ("invalid_account", "account_invalid", "account not found", "account_not_found")
+_HTTP_ERROR_RE = re.compile(r"(?:http(?: status)?[=: ]*|status(?:_code)?[=: ]*)([1-5]\d\d)", re.IGNORECASE)
+
+
+def classify_liveness_failure(exc: BaseException | str) -> dict:
+    """把查活失败严格归入 temporary_error 或 confirmed_dead。"""
+    text = str(exc or "")
+    low = text.lower()
+    structured_code = ""
+    if isinstance(exc, AccountUnusableError):
+        structured_code = str(getattr(exc, "error_code", "") or "").strip().lower()
+
+    # 403/429、任意 5xx、超时和代理/连接错误始终是临时错误。
+    status_codes = {int(value) for value in _HTTP_ERROR_RE.findall(text)}
+    status_codes.update(int(value) for value in re.findall(r"(?<!\d)(403|429|5\d\d)(?!\d)", text))
+    if (
+        403 in status_codes
+        or 429 in status_codes
+        or any(500 <= code <= 599 for code in status_codes)
+        or _is_retryable_network_error(RuntimeError(text))
+    ):
+        return {"ok": False, "status": "temporary_error", "error": f"{type(exc).__name__}: {text[:500]}"}
+
+    if structured_code in _CONFIRMED_DEAD_CODES:
+        return {"ok": False, "status": "confirmed_dead", "error": structured_code}
+
+    detected = detect_account_unusable_text(text)
+    if detected in _CONFIRMED_DEAD_CODES:
+        return {"ok": False, "status": "confirmed_dead", "error": detected}
+    candidate_code = next((marker.replace(" ", "_") for marker in _DEAD_REVIEW_MARKERS if marker in low), "")
+    if candidate_code:
+        return {
+            "ok": False,
+            "status": "temporary_error",
+            "error": f"{type(exc).__name__}: {text[:500]}",
+            "dead_candidate": True,
+            "dead_candidate_code": candidate_code,
+        }
+    return {"ok": False, "status": "temporary_error", "error": f"{type(exc).__name__}: {text[:500]}"}
 
 
 def _is_retryable_network_error(exc: BaseException) -> bool:
@@ -40,7 +81,13 @@ def _is_retryable_network_error(exc: BaseException) -> bool:
     return any(h in text for h in _RETRYABLE_NETWORK_HINTS)
 
 
-def _network_preflight_with_retry(email: str, proxy: str | None, max_attempts: int = 4) -> tuple[BrowserSession, str]:
+def _network_preflight_with_retry(
+    email: str,
+    proxy: str | None,
+    max_attempts: int = 4,
+    *,
+    rotate_transparent_route: bool = False,
+) -> tuple[BrowserSession, str]:
     """Providers → CSRF → Signin 网络预检；失败换新 IP 重试（每轮新会话新代理）。"""
     session: BrowserSession | None = None
     last_exc: BaseException | None = None
@@ -50,7 +97,20 @@ def _network_preflight_with_retry(email: str, proxy: str | None, max_attempts: i
                 session.session.close()
             except Exception:
                 pass
-        session = BrowserSession(proxy=proxy if proxy else None)
+        if attempt > 1 and rotate_transparent_route:
+            from config import proxy as proxy_cfg
+
+            selection = proxy_cfg.pick_registration_proxy()
+            if not bool(selection.get("transparent")):
+                raise RuntimeError("查活重试未获得 Mihomo 透明路由；已阻止直连")
+            logger.info(
+                "[查活] 网络预检重试前已轮换美国节点：group=%s node=%s",
+                selection.get("group") or "-",
+                selection.get("node_name") or "-",
+            )
+        # None 表示“从配置代理池随机选取”，空字符串表示“显式不设置代理”。
+        # Mihomo 透明路由必须保留空字符串，否则会意外回落到已失效的本地代理端口。
+        session = BrowserSession(proxy=proxy)
         logger.info(
             "[查活] 会话创建完成：proxy=%s device_id=%s（网络预检第 %s/%s 次）",
             session.proxy or "配置随机/直连", session.device_id, attempt, max_attempts,
@@ -64,9 +124,10 @@ def _network_preflight_with_retry(email: str, proxy: str | None, max_attempts: i
             last_exc = exc
             if attempt >= max_attempts or not _is_retryable_network_error(exc):
                 raise
+            action = "轮换美国节点重试" if rotate_transparent_route else "新建会话重试"
             logger.warning(
-                "[查活] 网络预检失败（%s/%s），换新 IP 重试：%s",
-                attempt, max_attempts, str(exc)[:200],
+                "[查活] 网络预检失败（%s/%s），%s：%s",
+                attempt, max_attempts, action, str(exc)[:200],
             )
             time.sleep(2)
     raise RuntimeError(f"网络预检多次失败：{last_exc}")
@@ -123,14 +184,20 @@ def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: floa
     raise last_exc if last_exc else RuntimeError("OTP 验证失败")
 
 
-def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: bool = True) -> dict:
+def check_account_liveness(
+    email: str,
+    proxy: str | None = None,
+    *,
+    clear_log: bool = True,
+    rotate_transparent_route: bool = False,
+) -> dict:
     """
     重新登录账号并刷新最新 accessToken。
 
     返回：
       {
         ok: bool,
-        status: live/deactivated/failed,
+        status: live/temporary_error/confirmed_dead,
         access_token: str?,
         session: dict?,
         checked_at: ISO,
@@ -166,13 +233,17 @@ def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: b
         logger.info("[查活] 日志文件：%s", path)
         logger.info("[查活] 开始重新登录：%s", email)
         logger.info("[查活] 流程：Providers → CSRF → Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
-        session, authorize_url = _network_preflight_with_retry(email, proxy)
+        session, authorize_url = _network_preflight_with_retry(
+            email,
+            proxy,
+            rotate_transparent_route=rotate_transparent_route,
+        )
 
         otp_after_ts = time.time()
         final_url = follow_authorize(session, authorize_url)
         dead_code = detect_account_unusable_text(final_url)
         if dead_code:
-            return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": dead_code}
+            return {"ok": False, "status": "confirmed_dead", "checked_at": checked_at, "error": dead_code}
 
         validate_result = _validate_with_retry(session, email, otp_after_ts)
         page = validate_result.get("page") if isinstance(validate_result, dict) else {}
@@ -210,16 +281,15 @@ def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: b
             "proxy_used": session.proxy or None,
         }
     except AccountUnusableError as exc:
-        code = getattr(exc, "error_code", "") or detect_account_unusable_text(str(exc)) or "account_deactivated"
-        logger.warning("[查活] 已废号：%s %s", email, code)
-        return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": code}
+        result = classify_liveness_failure(exc)
+        result["checked_at"] = checked_at
+        logger.warning("[查活] 结果：%s status=%s error=%s", email, result["status"], result["error"])
+        return result
     except Exception as exc:
-        code = detect_account_unusable_text(str(exc))
-        if code:
-            logger.warning("[查活] 已废号：%s %s", email, code)
-            return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": code}
-        logger.warning("[查活] 失败：%s %s: %s", email, type(exc).__name__, str(exc)[:260])
-        return {"ok": False, "status": "failed", "checked_at": checked_at, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+        result = classify_liveness_failure(exc)
+        result["checked_at"] = checked_at
+        logger.warning("[查活] 结果：%s status=%s error=%s", email, result["status"], result["error"])
+        return result
     finally:
         try:
             logger.info("[查活] 结束：%s", email)

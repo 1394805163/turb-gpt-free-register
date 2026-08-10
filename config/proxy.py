@@ -10,7 +10,69 @@
     - socks5h://           SOCKS5（DNS 在代理端解析，推荐，避免 DNS-IP 错配）
 """
 from config.env_loader import apply_env_overrides
+import logging
 import random
+import re
+import time
+from pathlib import Path
+from urllib.parse import quote, urlparse
+
+
+logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+
+
+def _normalize_proxy_line(raw: str) -> str | None:
+    """Normalize one proxy-list line; return None for comments or invalid rows."""
+    text = str(raw or "").strip().lstrip("\ufeff")
+    if not text or text.startswith(("#", ";")):
+        return None
+    if "://" not in text:
+        if ":" not in text:
+            return None
+        text = f"http://{text}"
+    try:
+        parsed = urlparse(text)
+        if parsed.scheme.lower() not in _SUPPORTED_PROXY_SCHEMES:
+            return None
+        if not parsed.hostname or not parsed.port:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return text
+
+
+def load_proxy_pool_file(file_path: str | Path) -> list[str]:
+    """Read a proxy file without modifying it, preserving order and removing duplicates."""
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    if not path.is_file():
+        return []
+
+    proxies: list[str] = []
+    seen: set[str] = set()
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        proxy = _normalize_proxy_line(raw)
+        if proxy and proxy not in seen:
+            seen.add(proxy)
+            proxies.append(proxy)
+    return proxies
+
+
+def resolve_proxy_pool(configured_pool: list[str], file_path: str | Path | None) -> tuple[list[str], Path | None]:
+    """Prefer a non-empty verified proxy file; otherwise keep configured proxies."""
+    if not str(file_path or "").strip():
+        return list(configured_pool or []), None
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    path = path.resolve()
+    file_pool = load_proxy_pool_file(path)
+    if file_pool:
+        return file_pool, path
+    return list(configured_pool or []), None
 
 
 # 本地代理入口；实际出口地区以代理/分流规则为准。
@@ -18,6 +80,27 @@ import random
 PROXY_POOL = [
     "socks5://127.0.0.1:7897",
 ]
+
+# Resin sticky-account proxy output. A non-empty file takes priority over PROXY_POOL.
+# Missing/empty files fall back to PROXY_POOL so WebUI can start independently.
+PROXY_POOL_FILE: str = "../data/register-proxies.txt"
+
+# True 时注册任务必须拿到一个 Resin/代理池地址；代理为空时后端直接阻止任务，
+# 避免 CloakBrowser 悄悄回退到 VPS 直连出口。
+REGISTRATION_PROXY_REQUIRED = False
+
+# 只用于 WebUI 显示和跳转管理面板，不作为浏览器 forward proxy 地址。
+RESIN_MANAGEMENT_URL = ""
+
+# Resin 门禁关闭后的唯一注册回退：通过 Mihomo Controller 切换 `chatgpt us`
+# 组中的美国节点，再把浏览器指向本地 Mihomo 代理端口。该路径不允许直连兜底。
+MIHOMO_US_FALLBACK_ENABLED = True
+MIHOMO_CONTROLLER_URL = "http://127.0.0.1:9090"
+MIHOMO_CONTROLLER_SECRET = ""
+MIHOMO_US_GROUP = "chatgpt us"
+MIHOMO_PROXY_URL = "socks5h://127.0.0.1:7897"
+MIHOMO_TRANSPARENT_ROUTING = False
+MIHOMO_CONTROLLER_TIMEOUT = 5.0
 
 # 套餐/Plus 试用资格查询与 Codex Agent Token 生成共用这组独立网络策略，
 # 避免批量请求被注册代理池中的临时本地代理拖垮，也避免无条件直连造成出口策略失控。
@@ -41,7 +124,7 @@ PLAN_CHECK_REGISTRATION_RECHECK_DELAY = 2.0
 
 # 自动、手动和批量套餐查询共用同一个后台队列；Codex Agent Token 使用独立队列，
 # 但复用这里的网络模式、请求启动间隔与随机抖动，避免批量后台请求过于集中。
-PLAN_CHECK_WORKERS = 3
+PLAN_CHECK_WORKERS = 2
 PLAN_CHECK_QUEUE_LIMIT = 500
 PLAN_CHECK_MIN_INTERVAL = 0.4
 PLAN_CHECK_JITTER = 0.3
@@ -52,12 +135,113 @@ def pick_proxy() -> str:
     return random.choice(PROXY_POOL) if PROXY_POOL else ""
 
 
+def is_us_node_name(node_name: str) -> bool:
+    """按节点名识别美国节点，并显式排除 DIRECT/REJECT。"""
+    name = str(node_name or "").strip()
+    upper = name.upper()
+    if not name or upper in {"DIRECT", "REJECT", "GLOBAL", "COMPATIBLE"}:
+        return False
+    return bool(
+        "🇺🇸" in name
+        or "美国" in name
+        or "UNITED STATES" in upper
+        or re.search(r"(?:^|[\s\-_|/])(US|USA)(?:$|[\s\-_|/0-9])", upper)
+    )
+
+
+def select_mihomo_us_proxy(
+    *,
+    controller_url: str,
+    secret: str,
+    group: str,
+    proxy_url: str,
+    allow_transparent: bool = False,
+    session=None,
+) -> dict:
+    """从指定 Mihomo 组选择美国节点；缺失/失败时抛错，绝不返回直连。"""
+    import requests
+
+    base = str(controller_url or "").strip().rstrip("/")
+    group_name = str(group or "").strip()
+    transparent = bool(allow_transparent)
+    local_proxy = None if transparent else _normalize_proxy_line(proxy_url)
+    if not base or not group_name or (not local_proxy and not transparent):
+        raise RuntimeError("Mihomo 美国代理配置不完整")
+    client = session or requests
+    headers = {"Accept": "application/json"}
+    if str(secret or "").strip():
+        headers["Authorization"] = f"Bearer {str(secret).strip()}"
+    timeout = max(0.2, float(globals().get("MIHOMO_CONTROLLER_TIMEOUT", 5.0) or 5.0))
+    endpoint = f"{base}/proxies/{quote(group_name, safe='')}"
+    started = time.monotonic()
+    response = client.get(endpoint, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+    names = payload.get("all") if isinstance(payload, dict) else []
+    candidates = [str(name) for name in (names or []) if is_us_node_name(str(name))]
+    if not candidates:
+        raise RuntimeError(f"Mihomo 组 {group_name!r} 中没有美国节点；已阻止直连")
+    current = str(payload.get("now") or "") if isinstance(payload, dict) else ""
+    alternatives = [name for name in candidates if name != current]
+    if alternatives:
+        candidates = alternatives
+    node_name = random.choice(candidates)
+    switched = client.put(
+        endpoint,
+        headers={**headers, "Content-Type": "application/json"},
+        json={"name": node_name},
+        timeout=timeout,
+    )
+    switched.raise_for_status()
+    return {
+        "mode": "mihomo_us",
+        "group": group_name,
+        "node_name": node_name,
+        "proxy_url": local_proxy or "",
+        "transparent": transparent,
+        "selection_ms": round((time.monotonic() - started) * 1000),
+    }
+
+
+def pick_registration_proxy() -> dict:
+    """选择注册代理；Resin 关闭时强制 Mihomo 美国组，任何失败都终止注册。"""
+    if bool(REGISTRATION_PROXY_REQUIRED):
+        selected = pick_proxy()
+        if not selected:
+            raise RuntimeError("Resin 注册代理池为空；已阻止直连")
+        return {"mode": "resin", "proxy_url": selected, "node_name": "", "selection_ms": 0}
+    if not bool(MIHOMO_US_FALLBACK_ENABLED):
+        raise RuntimeError("Mihomo 美国代理回退未启用；已阻止直连")
+    if not str(MIHOMO_US_GROUP or "").strip():
+        raise RuntimeError("Mihomo 美国代理配置不完整；已阻止直连")
+    try:
+        return select_mihomo_us_proxy(
+            controller_url=MIHOMO_CONTROLLER_URL,
+            secret=MIHOMO_CONTROLLER_SECRET,
+            group=MIHOMO_US_GROUP,
+            proxy_url=MIHOMO_PROXY_URL,
+            allow_transparent=MIHOMO_TRANSPARENT_ROUTING,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Mihomo 美国代理选择失败；已阻止直连: {type(exc).__name__}") from exc
+
+
 # 兼容入口：默认每次进程启动随机选一个，作为本次注册全程的固定代理
 PROXY = pick_proxy()
 
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {
     'PROXY_POOL': 'list_str_multiline',
+    'PROXY_POOL_FILE': 'str',
+    'REGISTRATION_PROXY_REQUIRED': 'bool',
+    'RESIN_MANAGEMENT_URL': 'str',
+    'MIHOMO_US_FALLBACK_ENABLED': 'bool',
+    'MIHOMO_CONTROLLER_URL': 'str',
+    'MIHOMO_CONTROLLER_SECRET': 'str',
+    'MIHOMO_US_GROUP': 'str',
+    'MIHOMO_PROXY_URL': 'str',
+    'MIHOMO_TRANSPARENT_ROUTING': 'bool',
+    'MIHOMO_CONTROLLER_TIMEOUT': 'float',
     'PLAN_CHECK_PROXY_MODE': 'str',
     'PLAN_CHECK_PROXY': 'str',
     'PLAN_CHECK_TIMEOUT': 'float',
@@ -69,4 +253,7 @@ apply_env_overrides(globals(), {
     'PLAN_CHECK_MIN_INTERVAL': 'float',
     'PLAN_CHECK_JITTER': 'float',
 })
+PROXY_POOL, PROXY_POOL_LOADED_FROM = resolve_proxy_pool(PROXY_POOL, PROXY_POOL_FILE)
+if PROXY_POOL_LOADED_FROM:
+    logger.info("已从验证结果文件加载 %s 个代理: %s", len(PROXY_POOL), PROXY_POOL_LOADED_FROM)
 PROXY = pick_proxy()
