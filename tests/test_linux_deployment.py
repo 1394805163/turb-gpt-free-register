@@ -131,8 +131,15 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
             for app_dir in ("/opt/turb-gpt-register", "/opt/app with space"):
                 with self.subTest(app_dir=app_dir):
                     unit = self.render_unit(app_dir, Path(temp_dir) / "rendered.service")
-                    self.assertIn(f'WorkingDirectory="{app_dir}"', unit)
-                    self.assertIn(f'EnvironmentFile="{app_dir}/.env"', unit)
+                    expected_path = app_dir.replace(" ", r"\x20")
+                    self.assertIn("User=turbgpt", unit)
+                    self.assertIn("Group=turbgpt", unit)
+                    self.assertNotIn('User="turbgpt"', unit)
+                    self.assertNotIn('Group="turbgpt"', unit)
+                    self.assertIn(f"WorkingDirectory={expected_path}", unit)
+                    self.assertIn(f"EnvironmentFile={expected_path}/.env", unit)
+                    self.assertNotIn('WorkingDirectory="', unit)
+                    self.assertNotIn('EnvironmentFile="', unit)
                     self.assertIn('Environment="HOME=/home/turb gpt"', unit)
                     self.assertIn(
                         f'ExecStart="{app_dir}/.venv/bin/gunicorn" --config '
@@ -140,15 +147,42 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
                         unit,
                     )
                     self.assertNotIn("\\x2f", unit)
-                    self.assertNotIn("\\x20", unit)
 
     def test_render_only_escapes_specifiers_backslashes_and_quotes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = '/opt/100% "quoted"\\path with space'
             unit = self.render_unit(app_dir, Path(temp_dir) / "rendered.service")
-        self.assertIn('WorkingDirectory="/opt/100%% \\"quoted\\"\\\\path with space"', unit)
-        self.assertIn('EnvironmentFile="/opt/100%% \\"quoted\\"\\\\path with space/.env"', unit)
-        self.assertNotIn('WorkingDirectory="/opt/100% ', unit)
+        escaped_path = r'/opt/100%%\x20\x22quoted\x22\x5cpath\x20with\x20space'
+        self.assertIn(f"WorkingDirectory={escaped_path}", unit)
+        self.assertIn(f"EnvironmentFile={escaped_path}/.env", unit)
+        self.assertNotIn('WorkingDirectory="', unit)
+        self.assertNotIn('EnvironmentFile="', unit)
+        self.assertNotIn('WorkingDirectory=/opt/100% ', unit)
+
+    def test_render_only_rejects_invalid_identity_scalars(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for option, value in (
+                ("--service-user", "turb gpt"),
+                ("--service-group", 'turb"gpt'),
+                ("--service-group", "turb\tgpt"),
+            ):
+                with self.subTest(option=option, value=value):
+                    result = run_bash(
+                        "deploy/linux/install-systemd.sh",
+                        "--render-only",
+                        str(Path(temp_dir) / "rendered.service"),
+                        "--app-dir",
+                        "/opt/turb-gpt-register",
+                        "--service-user",
+                        "turbgpt",
+                        "--service-group",
+                        "turbgpt",
+                        "--service-home",
+                        "/home/turbgpt",
+                        option,
+                        value,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_render_only_does_not_reprocess_tokens_inside_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -157,7 +191,7 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
                 Path(temp_dir) / "rendered.service",
                 service_home="/home/__APP_DIR__",
             )
-        self.assertIn('WorkingDirectory="/opt/__HOST_ENV__"', unit)
+        self.assertIn('WorkingDirectory=/opt/__HOST_ENV__', unit)
         self.assertIn('Environment="HOME=/home/__APP_DIR__"', unit)
 
     def test_render_only_rejects_newline_project_path(self):

@@ -45,6 +45,11 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 require_value() { [[ $# -ge 2 && -n "$2" ]] || usage_error "$1 requires a value"; }
 validate_no_newline() { [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || usage_error "$1 cannot contain newline characters"; }
+validate_identity_scalar() {
+  local label="$1" value="$2"
+  [[ -n "$value" ]] || usage_error "$label cannot be empty"
+  [[ "$value" != *[[:space:]]* && "$value" != *'"'* && "$value" != *"'"* && "$value" != *[[:cntrl:]]* ]] || usage_error "$label cannot contain whitespace, quotes, or control characters"
+}
 
 select_service_user() {
   local current_user
@@ -62,6 +67,7 @@ validate_inputs() {
   validate_no_newline "host" "$HOST"
   validate_no_newline "port" "$PORT"
   [[ "$SERVICE_USER" != root ]] || usage_error "root cannot be the service user"
+  validate_identity_scalar "service user" "$SERVICE_USER"
   [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || usage_error "port must be an integer from 1 to 65535"
 }
 ensure_service_user() {
@@ -78,11 +84,11 @@ resolve_service_identity() {
     [[ -n "$SERVICE_HOME" ]] || SERVICE_HOME="$(printf '%s\n' "$record" | cut -d: -f6)"
   fi
   [[ "$SERVICE_HOME" == /* ]] || fail "service HOME must be absolute"
-  validate_no_newline "service group" "$SERVICE_GROUP"
+  validate_identity_scalar "service group" "$SERVICE_GROUP"
   validate_no_newline "service HOME" "$SERVICE_HOME"
 }
 
-# Keep directive paths and ExecStart argv literal; do not use unit-name escaping.
+# Environment values and ExecStart argv require quoted systemd C-style strings.
 systemd_quote() {
   local value="$1"
   value="${value//%/%%}"
@@ -91,14 +97,32 @@ systemd_quote() {
   value="${value//$'\t'/\\t}"
   printf '"%s"' "$value"
 }
+
+# Path scalar directives are unquoted and use systemd C-style escapes; do not use unit-name escaping.
+systemd_path_escape() {
+  local value="$1" escaped="" character
+  local index
+  for ((index = 0; index < ${#value}; index++)); do
+    character="${value:index:1}"
+    case "$character" in
+      '%') escaped+='%%' ;;
+      ' ') escaped+='\x20' ;;
+      '\') escaped+='\x5c' ;;
+      '"') escaped+='\x22' ;;
+      $'\t') escaped+='\x09' ;;
+      *) escaped+="$character" ;;
+    esac
+  done
+  printf '%s' "$escaped"
+}
 render_unit() {
   local output="$1" line
   local user group home_env working_dir env_file host_env port_env gunicorn config
-  user="$(systemd_quote "$SERVICE_USER")"
-  group="$(systemd_quote "$SERVICE_GROUP")"
+  user="$SERVICE_USER"
+  group="$SERVICE_GROUP"
   home_env="$(systemd_quote "HOME=$SERVICE_HOME")"
-  working_dir="$(systemd_quote "$APP_DIR")"
-  env_file="$(systemd_quote "$APP_DIR/.env")"
+  working_dir="$(systemd_path_escape "$APP_DIR")"
+  env_file="$(systemd_path_escape "$APP_DIR/.env")"
   host_env="$(systemd_quote "HOST=$HOST")"
   port_env="$(systemd_quote "PORT=$PORT")"
   gunicorn="$(systemd_quote "$APP_DIR/.venv/bin/gunicorn")"
