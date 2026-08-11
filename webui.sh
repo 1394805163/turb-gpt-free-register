@@ -66,7 +66,7 @@ read_pid() {
 }
 
 find_pids_by_port() {
-  pgrep -f "gunicorn.*gunicorn\.conf\.py|python.*web\.py.*--port[ =]${PORT}" 2>/dev/null || true
+  pgrep -f "python.*web\.py.*--port[ =]${PORT}" 2>/dev/null || true
 }
 
 get_python() {
@@ -119,6 +119,7 @@ cmd_start() {
 
   local command=("$py" "web.py" "--host" "$HOST" "--port" "$PORT")
   if [[ -x "$ROOT_DIR/.venv/bin/gunicorn" ]]; then
+    export HOST PORT
     command=("$ROOT_DIR/.venv/bin/gunicorn"
       --config "$ROOT_DIR/deploy/linux/gunicorn.conf.py"
       "webui.app:create_app()")
