@@ -1,15 +1,36 @@
-﻿from pathlib import Path
+from pathlib import Path
+import os
 import re
 import runpy
+import shutil
+import shlex
+import subprocess
+import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WEBUI = (ROOT / "webui.sh").read_text(encoding="utf-8")
+BASH = Path("C:/Program Files/Git/bin/bash.exe")
+if not BASH.is_file():
+    BASH = Path(shutil.which("bash") or "")
 
 
 def read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def run_bash(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(BASH), "-c", f"exec {shlex.join(args)}"],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+        env={**os.environ, "MSYS2_ARG_CONV_EXCL": "*"},
+    )
 
 
 class GunicornConfigTests(unittest.TestCase):
@@ -70,6 +91,107 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
             "deploy/linux/doctor.sh",
         ):
             self.assertTrue((ROOT / relative_path).is_file(), relative_path)
+
+    def render_unit(self, app_dir: str, output: Path) -> str:
+        result = run_bash(
+            "deploy/linux/install-systemd.sh",
+            "--render-only",
+            str(output),
+            "--app-dir",
+            app_dir,
+            "--service-user",
+            "turbgpt",
+            "--service-group",
+            "turbgpt",
+            "--service-home",
+            "/home/turb gpt",
+            "--host",
+            "[::1]",
+            "--port",
+            "5001",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return output.read_text(encoding="utf-8")
+
+    def test_render_only_keeps_real_systemd_paths_and_exec_argv(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for app_dir in ("/opt/turb-gpt-register", "/opt/app with space"):
+                with self.subTest(app_dir=app_dir):
+                    unit = self.render_unit(app_dir, Path(temp_dir) / "rendered.service")
+                    self.assertIn(f'WorkingDirectory="{app_dir}"', unit)
+                    self.assertIn(f'EnvironmentFile="{app_dir}/.env"', unit)
+                    self.assertIn('Environment="HOME=/home/turb gpt"', unit)
+                    self.assertIn(
+                        f'ExecStart="{app_dir}/.venv/bin/gunicorn" --config '
+                        f'"{app_dir}/deploy/linux/gunicorn.conf.py" webui.app:create_app()',
+                        unit,
+                    )
+                    self.assertNotIn("\\x2f", unit)
+                    self.assertNotIn("\\x20", unit)
+
+    def test_render_only_rejects_newline_project_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_bash(
+                "deploy/linux/install-systemd.sh",
+                "--render-only",
+                str(Path(temp_dir) / "rendered.service"),
+                "--app-dir",
+                "/opt/bad\npath",
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newline", result.stderr)
+
+    @unittest.skipUnless(
+        os.name != "nt" and shutil.which("systemd-analyze"),
+        "?? Linux systemd-analyze",
+    )
+    def test_rendered_unit_passes_systemd_analyze_verify_when_available(self):
+        with tempfile.TemporaryDirectory(prefix="turb gpt ") as temp_dir:
+            app_dir = Path(temp_dir) / "app with space"
+            gunicorn = app_dir / ".venv/bin/gunicorn"
+            config = app_dir / "deploy/linux/gunicorn.conf.py"
+            gunicorn.parent.mkdir(parents=True)
+            config.parent.mkdir(parents=True)
+            gunicorn.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            gunicorn.chmod(0o755)
+            config.write_text("# test config\n", encoding="utf-8")
+            (app_dir / ".env").write_text("", encoding="utf-8")
+            unit_path = Path(temp_dir) / "turb-gpt-register.service"
+            self.render_unit(str(app_dir), unit_path)
+            result = subprocess.run(
+                ["systemd-analyze", "verify", str(unit_path)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(
+        os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0 and shutil.which("runuser"),
+        "?? root ? runuser ???????????",
+    )
+    def test_access_check_rejects_project_untraversable_by_service_user(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = Path(temp_dir) / "private-app"
+            app_dir.mkdir()
+            app_dir.chmod(0o700)
+            result = run_bash(
+                "deploy/linux/install-systemd.sh",
+                "--check-access-only",
+                "--app-dir",
+                str(app_dir),
+                "--service-user",
+                "nobody",
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("service user cannot", result.stderr)
+
+    def test_doctor_rejects_invalid_port_and_newline_host_as_usage_errors(self):
+        for args in (("--port", "0"), ("--port", "65536"), ("--port", "x"), ("--host", "bad\nhost")):
+            with self.subTest(args=args):
+                result = run_bash("deploy/linux/doctor.sh", *args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
 
 
 if __name__ == "__main__":
