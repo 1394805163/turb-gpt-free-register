@@ -361,7 +361,8 @@ class LinuxDocumentationAndCITests(unittest.TestCase):
         workflow = read(".github/workflows/linux-ci.yml")
         for command in (
             "python-version: '3.12'",
-            "python -m pip install -r requirements.txt",
+            "python -m venv .venv",
+            ".venv/bin/python -m pip install -r requirements.txt",
             "bash -n deploy/linux/*.sh",
             "python -m unittest tests.test_linux_deployment -v",
             "python -m compileall -q .",
@@ -401,6 +402,57 @@ class LinuxDocumentationAndCITests(unittest.TestCase):
         doctor = guidance.index("sudo deploy/linux/doctor.sh")
         self.assertLess(install, restart)
         self.assertLess(restart, doctor)
+
+
+class RepositoryHygieneTests(unittest.TestCase):
+    def test_har_capture_is_untracked_and_ignored(self):
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", "Default-all-domains-*.json"],
+            cwd=ROOT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(tracked.returncode, 0, tracked.stderr)
+        with self.subTest("HAR ??????? Git ??"):
+            self.assertEqual(tracked.stdout.splitlines(), [])
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", "Default-all-domains-regression.json"],
+            cwd=ROOT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+        with self.subTest("HAR ??????? .gitignore ??"):
+            self.assertEqual(ignored.returncode, 0, ignored.stderr)
+
+
+class LinuxGunicornSmokeContractTests(unittest.TestCase):
+    def test_ci_runs_real_gunicorn_lifecycle_smoke_without_env_or_cloak_download(self):
+        workflow = read(".github/workflows/linux-ci.yml")
+        required = (
+            ".venv/bin/gunicorn",
+            "--config deploy/linux/gunicorn.conf.py",
+            "webui.app:create_app()",
+            "curl --fail",
+            'master_pid=$!',
+            'worker_pids="$(pgrep -P "$master_pid")"',
+            'kill -TERM "$master_pid"',
+            'wait "$master_pid"',
+            'kill -0 "$master_pid"',
+            'kill -0 "$worker_pid"',
+            "trap cleanup EXIT",
+            "test ! -e .env",
+        )
+        for command in required:
+            with self.subTest(command=command):
+                self.assertIn(command, workflow)
+        self.assertNotIn("cloakbrowser install", workflow)
+        self.assertNotIn("playwright install", workflow)
 
 
 if __name__ == "__main__":

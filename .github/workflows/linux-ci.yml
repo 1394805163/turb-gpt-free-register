@@ -14,13 +14,68 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install Python requirements
-        run: python -m pip install -r requirements.txt
+      - name: Create virtual environment and install Python requirements
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
       - name: Check shell syntax
         run: bash -n deploy/linux/*.sh
       - name: Run Linux deployment tests
-        run: python -m unittest tests.test_linux_deployment -v
+        run: .venv/bin/python -m unittest tests.test_linux_deployment -v
       - name: Compile Python sources
-        run: python -m compileall -q .
+        run: .venv/bin/python -m compileall -q .
+      - name: Smoke Gunicorn application factory
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test ! -e .env
+          export HOST=127.0.0.1
+          export PORT=5010
+          export WEBUI_AUTH_CODE=ci-smoke-only
+          master_pid=""
+          worker_pids=""
+          cleanup() {
+            set +e
+            if [[ -n "$master_pid" ]] && kill -0 "$master_pid" 2>/dev/null; then
+              kill -TERM "$master_pid"
+              wait "$master_pid"
+            fi
+            for worker_pid in $worker_pids; do
+              if kill -0 "$worker_pid" 2>/dev/null; then
+                kill -KILL "$worker_pid"
+              fi
+            done
+          }
+          trap cleanup EXIT
+          .venv/bin/gunicorn --config deploy/linux/gunicorn.conf.py "webui.app:create_app()" &
+          master_pid=$!
+          for attempt in {1..50}; do
+            if curl --fail --silent --show-error "http://${HOST}:${PORT}/login" -o /dev/null; then
+              break
+            fi
+            if ! kill -0 "$master_pid" 2>/dev/null; then
+              echo "Gunicorn master exited before /login became ready" >&2
+              exit 1
+            fi
+            sleep 0.2
+          done
+          curl --fail --silent --show-error "http://${HOST}:${PORT}/login" -o /dev/null
+          worker_pids="$(pgrep -P "$master_pid")"
+          [[ -n "$worker_pids" ]]
+          [[ "$(wc -w <<< "$worker_pids")" -eq 1 ]]
+          printf 'gunicorn master=%s worker=%s\n' "$master_pid" "$worker_pids"
+          kill -TERM "$master_pid"
+          wait "$master_pid"
+          if kill -0 "$master_pid" 2>/dev/null; then
+            echo "Gunicorn master remains after SIGTERM" >&2
+            exit 1
+          fi
+          for worker_pid in $worker_pids; do
+            if kill -0 "$worker_pid" 2>/dev/null; then
+              echo "Gunicorn worker remains after SIGTERM: $worker_pid" >&2
+              exit 1
+            fi
+          done
       - name: Run full unittest suite
-        run: python -m unittest discover -s tests -v
+        run: .venv/bin/python -m unittest discover -s tests -v
