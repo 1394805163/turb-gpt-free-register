@@ -13,6 +13,16 @@ usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 validate_arguments() {
   [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || usage_error "port must be an integer from 1 to 65535"
   [[ "$HOST" != *$'\n'* && "$HOST" != *$'\r'* ]] || usage_error "host cannot contain newline characters"
+  if [[ "$HOST" =~ ^\[(.*)\]$ ]]; then
+    python3 - "$HOST" <<'PY' >/dev/null 2>&1 || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
+import ipaddress
+import sys
+ipaddress.IPv6Address(sys.argv[1][1:-1])
+PY
+    return
+  fi
+  [[ "$HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
+  [[ "$HOST" != *..* ]] || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
 }
 check() {
   local label="$1"

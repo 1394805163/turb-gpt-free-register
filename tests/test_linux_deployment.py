@@ -20,9 +20,22 @@ def read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
-def run_bash(*args: str) -> subprocess.CompletedProcess[str]:
+def run_bash(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [str(BASH), "-c", f"exec {shlex.join(args)}"],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+        env={**os.environ, "MSYS2_ARG_CONV_EXCL": "*", **(env or {})},
+    )
+
+
+def run_bash_snippet(snippet: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(BASH), "-c", snippet],
         cwd=ROOT,
         text=True,
         encoding="utf-8",
@@ -129,6 +142,14 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
                     self.assertNotIn("\\x2f", unit)
                     self.assertNotIn("\\x20", unit)
 
+    def test_render_only_escapes_specifiers_backslashes_and_quotes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = '/opt/100% "quoted"\\path with space'
+            unit = self.render_unit(app_dir, Path(temp_dir) / "rendered.service")
+        self.assertIn('WorkingDirectory="/opt/100%% \\"quoted\\"\\\\path with space"', unit)
+        self.assertIn('EnvironmentFile="/opt/100%% \\"quoted\\"\\\\path with space/.env"', unit)
+        self.assertNotIn('WorkingDirectory="/opt/100% ', unit)
+
     def test_render_only_rejects_newline_project_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             result = run_bash(
@@ -192,6 +213,83 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
                 result = run_bash("deploy/linux/doctor.sh", *args)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("ERROR:", result.stderr)
+
+    def test_doctor_rejects_non_endpoint_host_syntax(self):
+        invalid_hosts = ("host name", "http://host", "host/path", "host\tname", "[not:ipv6]")
+        for host in invalid_hosts:
+            with self.subTest(host=host):
+                result = run_bash("deploy/linux/doctor.sh", "--host", host)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+
+    def test_bootstrap_keeps_utf8_chinese_messages(self):
+        script = read("deploy/linux/bootstrap.sh")
+        self.assertNotIn("??", script)
+        self.assertIn("用法: sudo deploy/linux/bootstrap.sh", script)
+        self.assertIn("Ubuntu 原生部署完成", script)
+
+    def test_bootstrap_service_user_prefers_explicit_then_sudo_user(self):
+        explicit = run_bash(
+            "deploy/linux/bootstrap.sh",
+            "--print-service-user",
+            "--service-user",
+            "explicit-user",
+            env={"SUDO_USER": "sudo-user"},
+        )
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertEqual(explicit.stdout.strip(), "explicit-user")
+        sudo_user = run_bash(
+            "deploy/linux/bootstrap.sh",
+            "--print-service-user",
+            env={"SUDO_USER": "sudo-user"},
+        )
+        self.assertEqual(sudo_user.returncode, 0, sudo_user.stderr)
+        self.assertEqual(sudo_user.stdout.strip(), "sudo-user")
+
+    def test_unit_verify_failure_keeps_existing_unit_unchanged(self):
+        result = run_bash_snippet(
+            r'''
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir "$work/units"
+printf 'old unit\n' > "$work/units/turb-gpt-register.service"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$work/analyze"
+printf '#!/usr/bin/env bash\necho systemctl >> "$1.log"\nexit 0\n' > "$work/systemctl"
+chmod +x "$work/analyze" "$work/systemctl"
+set +e
+UNIT_DIR="$work/units" SYSTEMD_ANALYZE_BIN="$work/analyze" SYSTEMCTL_BIN="$work/systemctl" \
+  deploy/linux/install-systemd.sh --apply-unit-only --app-dir '/opt/app with space' \
+  --service-user turbgpt --service-group turbgpt --service-home /home/turbgpt
+status=$?
+set -e
+printf 'status=%s\ncontent=%s\n' "$status" "$(cat "$work/units/turb-gpt-register.service")"
+'''
+        )
+        self.assertIn("status=1", result.stdout)
+        self.assertIn("content=old unit", result.stdout)
+
+    def test_unit_reload_failure_restores_existing_unit_and_reloads_again(self):
+        result = run_bash_snippet(
+            r'''
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir "$work/units"
+printf 'old unit\n' > "$work/units/turb-gpt-register.service"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/analyze"
+printf '#!/usr/bin/env bash\ncount_file="$0.count"\ncount=0; test -f "$count_file" && count=$(cat "$count_file")\ncount=$((count + 1)); echo "$count" > "$count_file"\nif [ "$1" = daemon-reload ] && [ "$count" -eq 1 ]; then exit 1; fi\nexit 0\n' > "$work/systemctl"
+chmod +x "$work/analyze" "$work/systemctl"
+set +e
+UNIT_DIR="$work/units" SYSTEMD_ANALYZE_BIN="$work/analyze" SYSTEMCTL_BIN="$work/systemctl" \
+  deploy/linux/install-systemd.sh --apply-unit-only --app-dir /opt/app \
+  --service-user turbgpt --service-group turbgpt --service-home /home/turbgpt
+status=$?
+set -e
+printf 'status=%s\ncontent=%s\nreloads=%s\n' "$status" "$(cat "$work/units/turb-gpt-register.service")" "$(cat "$work/systemctl.count")"
+'''
+        )
+        self.assertIn("status=1", result.stdout)
+        self.assertIn("content=old unit", result.stdout)
+        self.assertIn("reloads=2", result.stdout)
 
 
 if __name__ == "__main__":
