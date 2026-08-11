@@ -155,16 +155,85 @@ class ICloudMailboxPool:
             raise RuntimeError("iCloud IMAP 打开收件箱失败")
         return imap
 
+    def _mailbox_name(self) -> str:
+        return str(self.config.get("imap_mailbox") or "INBOX")
+
+    @staticmethod
+    def _close_imap(imap) -> None:
+        if imap is None:
+            return
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _uidvalidity(imap) -> str:
+        try:
+            _status, values = imap.response("UIDVALIDITY")
+            if values and values[0] is not None:
+                value = values[0]
+                return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+        except Exception:
+            pass
+        return ""
+
+    def _refresh_selected_mailbox(self, imap, *, force_select: bool = False) -> None:
+        status, _ = imap.noop()
+        if status != "OK":
+            raise imaplib.IMAP4.error("iCloud IMAP NOOP 失败")
+        if force_select:
+            status, _ = imap.select(self._mailbox_name(), readonly=True)
+            if status != "OK":
+                raise imaplib.IMAP4.error("iCloud IMAP 重新选择收件箱失败")
+
+    @staticmethod
+    def _all_uids(imap) -> list[bytes]:
+        status, data = imap.uid("search", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            return []
+        values = [value for value in data[0].split() if value.isdigit()]
+        return sorted(values, key=lambda value: int(value))
+
+    def _candidate_uid_window(self, all_uids: list[bytes], mailbox: dict[str, Any]) -> list[bytes]:
+        seen_uids = mailbox.setdefault("_seen_uids", set())
+        pending_uids = mailbox.setdefault("_pending_uids", set())
+        last_uid = int(mailbox.get("_last_uid") or 0)
+        initial_limit = max(1, min(100, int(self.config.get("initial_scan_limit") or 20)))
+        if last_uid > 0:
+            candidates = [uid for uid in all_uids if int(uid) > last_uid or uid in pending_uids]
+        else:
+            candidates = all_uids[-initial_limit:]
+        return [uid for uid in candidates if uid not in seen_uids]
+
+    def _parse_uid_message(self, uid: bytes, raw: bytes) -> tuple[str, str, datetime | None, str] | None:
+        if not raw:
+            return None
+        message = message_from_bytes(raw, policy=policy.default)
+        try:
+            received = parsedate_to_datetime(str(message.get("Date") or ""))
+            received = received if received.tzinfo else received.replace(tzinfo=timezone.utc)
+        except Exception:
+            received = None
+        text = f"{self._decode(message.get('Subject'))}\n{self._body(message)}"
+        headers = "\n".join(f"{key}: {self._decode(value)}" for key, value in message.items())
+        message_id = str(message.get("Message-ID") or uid.decode(errors="replace"))
+        return message_id, text, received, headers
+
+    def _fetch_uid_message(self, imap, uid: bytes) -> tuple[str, str, datetime | None, str] | None:
+        status, fetched = imap.uid("fetch", uid, "(BODY.PEEK[])")
+        raw = next(
+            (part[1] for part in fetched or [] if isinstance(part, tuple) and isinstance(part[1], bytes)),
+            b"",
+        )
+        if status != "OK" or not raw:
+            return None
+        return self._parse_uid_message(uid, raw)
+
     def _candidate_uids(self, imap, address: str) -> list[bytes]:
-        """仅返回当前隐藏邮箱的邮件；多个注册任务共用收件箱时绝不回退到 ALL。"""
-        # ponytail: 当前注册流程至多会产生少量重发邮件；需要更多历史邮件时再调高上限。
-        limit = min(6, max(1, int(self.config.get("message_limit") or 20)))
-        candidates: set[bytes] = set()
-        for header in ("TO", "DELIVERED-TO", "X-ORIGINAL-TO"):
-            status, data = imap.uid("search", None, "HEADER", header, address)
-            if status == "OK" and data and data[0]:
-                candidates.update(data[0].split())
-        return sorted(candidates, key=lambda uid: int(uid))[-limit:]
+        """兼容旧调用：枚举末尾 UID，别名匹配统一在下载邮件后本地完成。"""
+        limit = max(1, min(100, int(self.config.get("message_limit") or 20)))
+        return self._all_uids(imap)[-limit:]
 
     def _messages(self, mailbox: dict[str, Any], imap=None) -> list[tuple[str, str, datetime | None, str]]:
         own_connection = imap is None
@@ -173,21 +242,13 @@ class ICloudMailboxPool:
             messages: list[tuple[str, str, datetime | None, str]] = []
             target = str(mailbox["address"]).strip().lower()
             for uid in reversed(self._candidate_uids(imap, target)):
-                status, fetched = imap.uid("fetch", uid, "(BODY.PEEK[])")
-                raw = next((part[1] for part in fetched or [] if isinstance(part, tuple) and isinstance(part[1], bytes)), b"")
-                if status != "OK" or not raw:
+                parsed = self._fetch_uid_message(imap, uid)
+                if parsed is None:
                     continue
-                message = message_from_bytes(raw, policy=policy.default)
-                try:
-                    received = parsedate_to_datetime(str(message.get("Date") or ""))
-                    received = received if received.tzinfo else received.replace(tzinfo=timezone.utc)
-                except Exception:
-                    received = None
-                text = f"{self._decode(message.get('Subject'))}\n{self._body(message)}"
-                headers = "\n".join(f"{key}: {self._decode(value)}" for key, value in message.items())
+                message_id, text, received, headers = parsed
                 if target not in headers.lower():
                     continue
-                messages.append((str(message.get("Message-ID") or uid.decode()), text, received, headers))
+                messages.append((message_id, text, received, headers))
             return messages
         finally:
             if own_connection:
@@ -198,12 +259,51 @@ class ICloudMailboxPool:
 
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
         deadline = time.monotonic() + float(self.config.get("wait_timeout") or 360)
+        reselect_interval = max(0.0, float(self.config.get("reselect_interval", 12)))
+        reconnect_interval = max(0.0, float(self.config.get("reconnect_interval", 18)))
         imap = None
+        connected_at = 0.0
+        selected_at = 0.0
         try:
             while time.monotonic() < deadline:
                 try:
-                    imap = imap or self._connect_imap()
-                    for message_id, text, received, _headers in self._messages(mailbox, imap):
+                    now = time.monotonic()
+                    if imap is not None and now - connected_at >= reconnect_interval:
+                        self._close_imap(imap)
+                        imap = None
+                    if imap is None:
+                        imap = self._connect_imap()
+                        connected_at = now
+                        selected_at = now
+
+                    force_select = now - selected_at >= reselect_interval
+                    self._refresh_selected_mailbox(imap, force_select=force_select)
+                    if force_select:
+                        selected_at = now
+
+                    uidvalidity = self._uidvalidity(imap)
+                    previous_uidvalidity = str(mailbox.get("_uidvalidity") or "")
+                    if previous_uidvalidity and uidvalidity and previous_uidvalidity != uidvalidity:
+                        mailbox["_seen_uids"] = set()
+                        mailbox["_last_uid"] = 0
+                    if uidvalidity:
+                        mailbox["_uidvalidity"] = uidvalidity
+
+                    all_uids = self._all_uids(imap)
+                    candidates = self._candidate_uid_window(all_uids, mailbox)
+                    target = str(mailbox["address"]).strip().lower()
+                    seen_uids = mailbox.setdefault("_seen_uids", set())
+                    pending_uids = mailbox.setdefault("_pending_uids", set())
+                    for uid in reversed(candidates):
+                        parsed = self._fetch_uid_message(imap, uid)
+                        if parsed is None:
+                            pending_uids.add(uid)
+                            continue
+                        pending_uids.discard(uid)
+                        seen_uids.add(uid)
+                        message_id, text, received, headers = parsed
+                        if target not in headers.lower():
+                            continue
                         if received and received < mailbox["_code_not_before"]:
                             continue
                         fingerprint = message_id or hashlib.sha256(text.encode()).hexdigest()
@@ -213,18 +313,12 @@ class ICloudMailboxPool:
                         match = re.search(r"(?:Verification code|code is|代码为|验证码)[:\s]*(\d{6})", text, re.I) or re.search(r"(?<![#&])\b(\d{6})\b", text)
                         if match and match.group(1) != "177010":
                             return match.group(1)
+                    if all_uids:
+                        mailbox["_last_uid"] = max(int(uid) for uid in all_uids)
                 except (imaplib.IMAP4.error, OSError):
-                    try:
-                        if imap:
-                            imap.logout()
-                    except Exception:
-                        pass
+                    self._close_imap(imap)
                     imap = None
                 time.sleep(max(1, min(2, float(self.config.get("wait_interval") or 5))))
             return None
         finally:
-            try:
-                if imap:
-                    imap.logout()
-            except Exception:
-                pass
+            self._close_imap(imap)
