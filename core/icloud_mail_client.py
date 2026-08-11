@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from core.icloud_mail_pool import ICloudMailboxPool
+from core.log_safety import redact_email
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -240,7 +241,7 @@ def fetch_latest_otp(
         state["last_uid"] = int(mailbox.get("_last_uid") or 0)
         state["uidvalidity"] = str(mailbox.get("_uidvalidity") or "")
     if not code:
-        raise TimeoutError(f"iCloud OTP wait timed out for {mailbox['address']}")
+        raise TimeoutError(f"iCloud OTP wait timed out for {redact_email(mailbox['address'])}")
     return code
 
 

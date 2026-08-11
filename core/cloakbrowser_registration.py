@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import traceback
 from pathlib import Path
 
 from config import cloakbrowser as _cfg
@@ -12,7 +13,7 @@ from core.account_export import save_account_data
 from core.cloakbrowser_driver import build_cloak_driver
 from core.email_provider import OtpWaitSession, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
-from core.log_safety import redact_email
+from core.log_safety import redact_email, redact_emails
 
 # 复用 Roxy 注册流程里已维护好的页面操作函数。
 from core.roxy_registration import (  # noqa: F401
@@ -64,7 +65,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                         otp_attempt + 1,
                         max_otp_attempts,
                         type(exc).__name__,
-                        str(exc)[:180],
+                        redact_emails(exc)[:180],
                     )
                     if not resend_used:
                         resend_used = True
@@ -83,7 +84,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
             try:
                 _click_continue(driver)
             except Exception as exc:
-                logger.info("[Cloak注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
+                logger.info("[Cloak注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", redact_emails(exc)[:120])
 
             outcome = _wait_after_email_otp_submit(driver, timeout=10)
             if outcome == "accepted":
@@ -162,13 +163,18 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         try:
             from core.email_provider import release_email
             release_email(email, status="used", note="Cloak registration completed")
-        except Exception:
-            logger.warning("[Cloak registration] Failed to finalize email pool state: %s", redact_email(email), exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "[Cloak registration] Failed to finalize email pool state: %s: %s: %s",
+                redact_email(email),
+                type(exc).__name__,
+                redact_emails(exc),
+            )
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
         return {"success": bool(codex_ok), "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "codex": codex_result, "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}"}
     except Exception as exc:
-        logger.error("[Cloak注册] 失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Cloak注册] 失败详情", exc_info=True)
+        logger.error("[Cloak注册] 失败：%s: %s", type(exc).__name__, redact_emails(exc))
+        logger.debug("[Cloak注册] 失败详情\n%s", redact_emails(traceback.format_exc()))
         try:
             from core.email_provider import release_email
             release_email(email, status="failed" if create_acknowledged else "available", note=f"Cloak注册失败: {str(exc)[:180]}")

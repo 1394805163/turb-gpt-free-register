@@ -15,6 +15,7 @@ import random
 import threading
 import string
 import time
+import traceback
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from core.account_export import save_account_data
 from core.browser_use_client import BrowserUseClient
 from core.email_provider import OtpWaitSession, resolve_email_source, wait_for_otp
 from core.humanize import delay as human_delay
-from core.log_safety import redact_email
+from core.log_safety import redact_email, redact_emails
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ def _close_browser_use_session(browser, *, reason: str = "") -> None:
         logger.info("[BrowserUse] 关闭注册浏览器 session%s", label)
         browser.close()
     except Exception as exc:
-        logger.warning("[BrowserUse] 关闭注册浏览器 session 失败%s：%s: %s", label, type(exc).__name__, str(exc)[:180])
+        logger.warning("[BrowserUse] 关闭注册浏览器 session 失败%s：%s: %s", label, type(exc).__name__, redact_emails(exc)[:180])
 
 
 def _bu_delay(kind: str, seconds: float | None = None) -> None:
@@ -290,7 +291,7 @@ def _apply_cloud_browser_automation_mask(context, page, *, label: str, proxy_cou
 """)
         logger.info("[%s] 已注入轻量自动化特征弱化脚本", label)
     except Exception as exc:
-        logger.debug("[%s] 注入自动化特征弱化脚本失败：%s", label, str(exc)[:180])
+        logger.debug("[%s] 注入自动化特征弱化脚本失败：%s", label, redact_emails(exc)[:180])
     return {}
 
 
@@ -751,7 +752,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
                 if _is_target_closed_error(exc):
                     raise
                 if _is_transient_navigation_error(exc):
-                    logger.info("[BrowserUse] 密码页检测遇到页面跳转，稍后重试：%s", str(exc)[:140])
+                    logger.info("[BrowserUse] 密码页检测遇到页面跳转，稍后重试：%s", redact_emails(exc)[:140])
                     time.sleep(0.4 if _fast_mode() else 1.0)
                     continue
                 raise
@@ -1020,7 +1021,7 @@ def _click_resend_otp(page) -> bool:
         logger.info("[BrowserUse][OTP] 非文本重发按钮探测结果：%s", result)
         return bool(isinstance(result, dict) and result.get("ok"))
     except Exception as exc:
-        logger.info("[BrowserUse][OTP] 非文本重发按钮探测失败：%s: %s", type(exc).__name__, str(exc)[:160])
+        logger.info("[BrowserUse][OTP] 非文本重发按钮探测失败：%s: %s", type(exc).__name__, redact_emails(exc)[:160])
         return False
 
 
@@ -1591,7 +1592,7 @@ def _browser_use_heartbeat(page, context=None, label: str = ""):
                 page = recovered
                 logger.info("[BrowserUse] evaluate 关闭后切换存活页%s：url=%s", tag, _page_url(page) or "-")
             else:
-                logger.debug("[BrowserUse] 心跳失败%s：%s", tag, str(exc)[:180])
+                logger.debug("[BrowserUse] 心跳失败%s：%s", tag, redact_emails(exc)[:180])
     except Exception as exc:
         if _is_target_closed_error(exc):
             recovered = _recover_live(None)
@@ -1600,7 +1601,7 @@ def _browser_use_heartbeat(page, context=None, label: str = ""):
             page = recovered
             logger.info("[BrowserUse] evaluate 关闭后切换存活页%s：url=%s", tag, _page_url(page) or "-")
         else:
-            logger.debug("[BrowserUse] 心跳失败%s：%s", tag, str(exc)[:180])
+            logger.debug("[BrowserUse] 心跳失败%s：%s", tag, redact_emails(exc)[:180])
     return page
 
 
@@ -1657,7 +1658,7 @@ def _wait_for_otp_with_browser_heartbeat(
             last_exc = exc
             if _is_target_closed_error(exc):
                 raise
-            logger.info("[BrowserUse][OTP] 本轮未取到验证码，保持云端页面活跃后继续：%s: %s", type(exc).__name__, str(exc)[:220])
+            logger.info("[BrowserUse][OTP] 本轮未取到验证码，保持云端页面活跃后继续：%s: %s", type(exc).__name__, redact_emails(exc)[:220])
             page = _browser_use_heartbeat(page, context=context, label=f"otp-after-{attempt}")
             time.sleep(0.5 if _fast_mode() else 1.0)
 
@@ -1915,7 +1916,7 @@ def run_browser_use_registration(
                 openai_password = _fill_password_if_present(page, email, timeout=8 if _fast_mode() else 15, context=context)
                 _t_pwd.done("password_set=yes" if openai_password else "password_set=no")
             except Exception as exc:
-                _t_pwd.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
+                _t_pwd.done(f"failed={type(exc).__name__}: {redact_emails(exc)[:160]}")
                 raise
             _check_manual_stop()
 
@@ -1939,7 +1940,7 @@ def run_browser_use_registration(
                         page,
                         context,
                         email,
-                        attempts=2,
+                        attempts=1,
                         timeout_ms=12000 if _fast_mode() else 18000,
                     )
                     _check_manual_stop()
@@ -1953,12 +1954,12 @@ def run_browser_use_registration(
                     except Exception as pwd_exc:
                         if _is_manual_stop_exception(pwd_exc):
                             raise
-                        logger.info("[BrowserUse][OTP] 重启 OTP 流后密码页处理跳过/失败，继续等待验证码页：%s", str(pwd_exc)[:140])
+                        logger.info("[BrowserUse][OTP] 重启 OTP 流后密码页处理跳过/失败，继续等待验证码页：%s", redact_emails(pwd_exc)[:140])
                     _bu_delay("api")
                 except Exception as restart_exc:
                     if _is_manual_stop_exception(restart_exc):
                         raise
-                    logger.warning("[BrowserUse][OTP] 重新触发邮箱 OTP 失败，继续按当前页面处理：%s: %s", type(restart_exc).__name__, str(restart_exc)[:180])
+                    logger.warning("[BrowserUse][OTP] 重新触发邮箱 OTP 失败，继续按当前页面处理：%s: %s", type(restart_exc).__name__, redact_emails(restart_exc)[:180])
 
             current_otp = otp_code
             otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
@@ -1998,7 +1999,7 @@ def run_browser_use_registration(
                         page = _pick_live_page(context, page) or page
                         _t_otp_wait.done()
                     except Exception as exc:
-                        _t_otp_wait.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
+                        _t_otp_wait.done(f"failed={type(exc).__name__}: {redact_emails(exc)[:160]}")
                         if _is_manual_stop_exception(exc):
                             raise
                         if otp_attempt >= max_otp_attempts:
@@ -2008,7 +2009,7 @@ def run_browser_use_registration(
                             otp_attempt + 1,
                             max_otp_attempts,
                             type(exc).__name__,
-                            str(exc)[:180],
+                            redact_emails(exc)[:180],
                         )
                         if not resend_used:
                             resend_used = True
@@ -2026,7 +2027,7 @@ def run_browser_use_registration(
                 try:
                     _click_continue(page)
                 except Exception as exc:
-                    logger.info("[BrowserUse][OTP] 提交按钮未找到，继续观察页面：%s", str(exc)[:120])
+                    logger.info("[BrowserUse][OTP] 提交按钮未找到，继续观察页面：%s", redact_emails(exc)[:120])
                 _check_manual_stop()
 
                 outcome = _wait_after_otp(page, timeout=6 if _fast_mode() else 12)
@@ -2085,7 +2086,7 @@ def run_browser_use_registration(
                             client.close_browser_session(session_info_open.session_id)
                             logger.info("[Skyvern] 已关闭注册 browser session：%s", session_info_open.session_id)
                         except Exception as exc:
-                            logger.warning("[Skyvern] 关闭注册 browser session 失败：%s: %s", type(exc).__name__, str(exc)[:180])
+                            logger.warning("[Skyvern] 关闭注册 browser session 失败：%s: %s", type(exc).__name__, redact_emails(exc)[:180])
                     browser = None
                     context = None
                     page = None
@@ -2094,7 +2095,7 @@ def run_browser_use_registration(
                 else:
                     logger.info("[BrowserUse][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
             except Exception as exc:
-                logger.warning("[BrowserUse][Codex] 自动授权失败：%s: %s", type(exc).__name__, str(exc)[:220])
+                logger.warning("[BrowserUse][Codex] 自动授权失败：%s: %s", type(exc).__name__, redact_emails(exc)[:220])
                 codex_result = {
                     "status": "failed",
                     "ok": False,
@@ -2133,8 +2134,8 @@ def run_browser_use_registration(
                 "error": None,
             }
     except Exception as exc:
-        logger.error("[BrowserUse] 注册失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[BrowserUse] 失败详情", exc_info=True)
+        logger.error("[BrowserUse] 注册失败：%s: %s", type(exc).__name__, redact_emails(exc))
+        logger.debug("[BrowserUse] 失败详情\n%s", redact_emails(traceback.format_exc()))
         try:
             from core.email_provider import release_email
             release_email(

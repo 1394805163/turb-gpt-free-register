@@ -7,6 +7,7 @@ import sys
 import argparse
 import logging
 import time
+import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from config import REGISTER_EMAIL, REGISTER_NAME  # 这两个一般不在 WebUI 改
@@ -38,6 +39,7 @@ from core.account_export import (
 from core.pipeline_concurrency import pipeline_limited
 from core.email_provider import acquire_email, wait_for_otp
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email, redact_emails
 from core.name_samples import random_display_name
 from core.profile_utils import generate_random_birthday
 
@@ -89,11 +91,12 @@ def _finalize_registration_session(
     if not continue_url:
         raise RuntimeError("create_account 响应缺少 continue_url，无法完成 OAuth 回调")
 
+    redacted_email = redact_email(email)
     last_exc: Exception | None = None
     for attempt in range(1, _FINALIZE_SESSION_MAX_ATTEMPTS + 1):
         try:
             logger.info(
-                f"[登录态] 完成 OAuth 回调并拉取 Token：{email} "
+                f"[登录态] 完成 OAuth 回调并拉取 Token：{redacted_email} "
                 f"(尝试 {attempt}/{_FINALIZE_SESSION_MAX_ATTEMPTS})"
             )
             follow_oauth_callback(session, continue_url, referer=callback_referer)
@@ -102,7 +105,7 @@ def _finalize_registration_session(
             access_token = session_info.get("accessToken")
             if not access_token:
                 raise RuntimeError("session 响应缺少 accessToken")
-            logger.info(f"[登录态] 已拿到 accessToken：{email}")
+            logger.info(f"[登录态] 已拿到 accessToken：{redacted_email}")
             return session_info, access_token
         except Exception as exc:
             last_exc = exc
@@ -110,8 +113,8 @@ def _finalize_registration_session(
                 break
             backoff = _FINALIZE_SESSION_BACKOFF_BASE ** (attempt - 1)
             logger.warning(
-                f"[登录态] 回调或拉取 Token 失败：{email}，"
-                f"{type(exc).__name__}: {str(exc)[:180]}，{backoff:.1f}s 后重试"
+                f"[登录态] 回调或拉取 Token 失败：{redacted_email}，"
+                f"{type(exc).__name__}: {redact_emails(exc)[:180]}，{backoff:.1f}s 后重试"
             )
             time.sleep(backoff)
 
@@ -136,7 +139,7 @@ def prepare_registration_inputs() -> tuple[str, str, str]:
     if not email:
         if _email_cfg.USE_EMAIL_SERVICE:
             email = acquire_email()
-            logger.debug(f"自动获取邮箱: {email}")
+            logger.debug("自动获取邮箱: %s", redact_email(email))
         else:
             email = input("请输入注册邮箱: ").strip()
 
@@ -177,6 +180,7 @@ def run_registration(
         proxy: 代理地址（不传则从 PROXY_POOL 随机抽）
         otp_code: 邮箱验证码（如果为None，会等待手动输入）
     """
+    redacted_email = redact_email(email)
     # 可选注册驱动：
     #   protocol     = 原有纯协议（curl_cffi）
     #   roxy         = RoxyBrowser 指纹浏览器 + Selenium
@@ -248,7 +252,7 @@ def run_registration(
     if not birthday:
         birthday = generate_random_birthday()
 
-    logger.info(f"[注册] 开始：{email}，代理={proxy_label}")
+    logger.info(f"[注册] 开始：{redacted_email}，代理={proxy_label}")
     logger.info(f"[注册] 本次随机生日: {birthday}")
     logger.debug(f"[注册] 设备ID={session.device_id}，会话日志ID={session.auth_session_logging_id}")
 
@@ -304,7 +308,7 @@ def run_registration(
         for otp_attempt in range(1, max_otp_attempts + 1):
             if current_otp is None:
                 if _email_cfg.USE_EMAIL_SERVICE:
-                    logger.info(f"[OTP] 等待验证码：{email}（第 {otp_attempt}/{max_otp_attempts} 次）")
+                    logger.info(f"[OTP] 等待验证码：{redacted_email}（第 {otp_attempt}/{max_otp_attempts} 次）")
                     current_otp = wait_for_otp(email, after_ts=otp_after_ts)
                 else:
                     logger.info("")
@@ -328,7 +332,7 @@ def run_registration(
             except EmailOtpInvalidError as exc:
                 if otp_attempt >= max_otp_attempts:
                     raise
-                logger.warning(f"[OTP] 验证码错误/过期：{str(exc)[:180]}，准备重新发送并重新获取验证码")
+                logger.warning(f"[OTP] 验证码错误/过期：{redact_emails(exc)[:180]}，准备重新发送并重新获取验证码")
                 otp_after_ts = time.time()
                 send_email_otp(session)
                 human_delay("api")
@@ -372,7 +376,7 @@ def run_registration(
         if page_type == "external_url" or direct_oauth_after_otp:
             if not otp_continue_url:
                 raise RuntimeError(f"OTP external_url 响应缺少可跟随 URL，无法继续: {validate_result}")
-            logger.info(f"[注册] OTP 后进入 OAuth 回调分支，跳过 create_account：{email}")
+            logger.info(f"[注册] OTP 后进入 OAuth 回调分支，跳过 create_account：{redacted_email}")
             create_acknowledged = True
             session_info, access_token = _finalize_registration_session(
                 session,
@@ -416,7 +420,7 @@ def run_registration(
             create_result = create_account(session, name, birthday, sentinel_header_11, so_header_11)
             create_acknowledged = True
 
-            logger.info(f"[注册] 创建接口已通过：{email}，继续完成 OAuth 回调")
+            logger.info(f"[注册] 创建接口已通过：{redacted_email}，继续完成 OAuth 回调")
             human_delay("post_auth")
 
             # 步骤12.5: 跟随 create_account 返回的 continue_url 完成 OAuth 回调
@@ -444,8 +448,8 @@ def run_registration(
             try:
                 totp_secret = setup_2fa(session, email)
             except Exception as exc:
-                logger.error(f"2FA 设置失败: {exc}")
-                logger.debug("2FA 错误详情:", exc_info=True)
+                logger.error("2FA 设置失败: %s", redact_emails(exc))
+                logger.debug("2FA 错误详情:\n%s", redact_emails(traceback.format_exc()))
                 logger.warning("将继续保存账号信息（不含 TOTP secret），可后续手动设置")
         else:
             logger.debug("已跳过 2FA 设置 (config.ENABLE_2FA=False)")
@@ -469,14 +473,14 @@ def run_registration(
 
         if codex_result.get("ok"):
             logger.info(
-                f"[Codex] 成功：{email}，file={codex_result.get('file_path')}，"
-                f"callback={codex_result.get('callback_url')}"
+                f"[Codex] 成功：{redacted_email}，file={redact_emails(codex_result.get('file_path'))}，"
+                f"callback={redact_emails(codex_result.get('callback_url'))}"
             )
         elif codex_result.get("status") == "skipped":
-            logger.info(f"[Codex] 跳过：{email}，原因={codex_result.get('message')}")
+            logger.info(f"[Codex] 跳过：{redacted_email}，原因={redact_emails(codex_result.get('message'))}")
         else:
             logger.warning(
-                f"[Codex] 失败：{email}，原因={codex_result.get('message')}"
+                f"[Codex] 失败：{redacted_email}，原因={redact_emails(codex_result.get('message'))}"
             )
 
         # ==================== 阶段8: 持久化账号 ====================
@@ -499,7 +503,7 @@ def run_registration(
             },
         )
 
-        logger.info("[完成] %s，账号ID=%s，Token已安全落盘（长度=%s）", email, account_id, len(access_token))
+        logger.info("[完成] %s，账号ID=%s，Token已安全落盘（长度=%s）", redacted_email, account_id, len(access_token))
 
         # ==================== 阶段9: 后置自动触发 flow ====================
         # 只有走完回调、拿到 token 并保存成功的账号，才会触发 flow。
@@ -513,15 +517,15 @@ def run_registration(
 
         if flow_result.get("ok"):
             logger.info(
-                f"[Flow] 成功：{email}，HTTP={flow_result.get('http_status')}, "
-                f"flow_id={flow_result.get('flow_id') or '未解析'}"
+                f"[Flow] 成功：{redacted_email}，HTTP={flow_result.get('http_status')}, "
+                f"flow_id={redact_emails(flow_result.get('flow_id') or '未解析')}"
             )
         elif flow_result.get("status") == "skipped":
-            logger.info(f"[Flow] 跳过：{email}，原因={flow_result.get('message')}")
+            logger.info(f"[Flow] 跳过：{redacted_email}，原因={redact_emails(flow_result.get('message'))}")
         else:
             logger.warning(
-                f"[Flow] 失败：{email}，HTTP={flow_result.get('http_status') or '无'}, "
-                f"原因={flow_result.get('message')}"
+                f"[Flow] 失败：{redacted_email}，HTTP={flow_result.get('http_status') or '无'}, "
+                f"原因={redact_emails(flow_result.get('message'))}"
             )
 
         logger.debug(f"[完成] TOTP Secret: {totp_secret or '(未设置)'}")
@@ -534,7 +538,7 @@ def run_registration(
         task_error = None
         if not task_success:
             task_error = f"Codex 未完成: {codex_result.get('message', '未知')}"
-            logger.warning(f"[任务结果] {email} 账号已保存但任务标失败，原因: {task_error}")
+            logger.warning(f"[任务结果] {redacted_email} 账号已保存但任务标失败，原因: {redact_emails(task_error)}")
 
         return {"success": task_success, "email": email, "account_id": account_id,
                 "access_token": access_token, "totp_secret": totp_secret,
@@ -542,8 +546,8 @@ def run_registration(
                 "error": task_error}
 
     except Exception as e:
-        logger.error(f"[失败] {email}: {type(e).__name__}: {e}")
-        logger.debug("详细错误信息:", exc_info=True)
+        logger.error(f"[失败] {redacted_email}: {type(e).__name__}: {redact_emails(e)}")
+        logger.debug("详细错误信息:\n%s", redact_emails(traceback.format_exc()))
         # 邮箱状态回收策略，三种情况：
         #   1. 账号已废（account_deactivated 等）：邮箱素材本身不可用，标 failed 直接剔除。
         #   2. 创建接口通过后失败：远端已消耗这个邮箱，直接废弃，避免重复注册。
@@ -558,16 +562,16 @@ def run_registration(
                         email, status="failed",
                         note=f"账号已废弃，邮箱不可用: {str(e)[:180]}",
                     )
-                    logger.warning(f"[邮箱:{src}] {email} 账号已废弃，标记为 failed，不再重新注册")
+                    logger.warning(f"[邮箱:{src}] {redacted_email} 账号已废弃，标记为 failed，不再重新注册")
                 elif create_acknowledged:
                     src = release_email(
                         email, status="failed",
                         note=f"创建接口已通过但后续失败，已废弃: {str(e)[:180]}",
                     )
-                    logger.warning(f"[邮箱:{src}] {email} 已创建但后续失败，标记为 failed，不再重新注册")
+                    logger.warning(f"[邮箱:{src}] {redacted_email} 已创建但后续失败，标记为 failed，不再重新注册")
                 else:
                     src = release_email(email, status="available", note=f"上次失败: {str(e)[:180]}")
-                    logger.info(f"[邮箱:{src}] {email} 已恢复 available")
+                    logger.info(f"[邮箱:{src}] {redacted_email} 已恢复 available")
         except Exception:
             pass
         return {"success": False, "email": email, "error": str(e)}
@@ -674,8 +678,8 @@ def run_one_batch_item(index: int, total: int, batch_dir=None) -> dict:
             # proxy 不传 → BrowserSession 会从 PROXY_POOL 随机抽
         )
     except Exception as exc:
-        logger.error(f"[批量] 第 {index + 1} 个注册准备阶段失败: {type(exc).__name__}: {exc}")
-        logger.debug("准备阶段错误详情:", exc_info=True)
+        logger.error(f"[批量] 第 {index + 1} 个注册准备阶段失败: {type(exc).__name__}: {redact_emails(exc)}")
+        logger.debug("准备阶段错误详情:\n%s", redact_emails(traceback.format_exc()))
         return {"success": False, "error": str(exc)}
 
 
@@ -734,8 +738,8 @@ def run_parallel_batch(
                 try:
                     result = future.result()
                 except Exception as exc:
-                    logger.error(f"[批量] 第 {index + 1}/{count} 个注册线程异常: {type(exc).__name__}: {exc}")
-                    logger.debug("线程错误详情:", exc_info=True)
+                    logger.error(f"[批量] 第 {index + 1}/{count} 个注册线程异常: {type(exc).__name__}: {redact_emails(exc)}")
+                    logger.debug("线程错误详情:\n%s", redact_emails(traceback.format_exc()))
                     result = {"success": False, "error": str(exc)}
                 results.append(result)
 

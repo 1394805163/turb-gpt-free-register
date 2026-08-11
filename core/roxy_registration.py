@@ -6,6 +6,7 @@ import logging
 import random
 import string
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from config import twofa as _twofa_cfg
 from core.account_export import save_account_data
 from core.email_provider import OtpWaitSession, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
-from core.log_safety import redact_email
+from core.log_safety import redact_email, redact_emails
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
 
 logger = logging.getLogger(__name__)
@@ -104,7 +105,7 @@ def _center_browser_window(driver) -> None:
         driver.set_window_position(x, y)
         logger.info("[Roxy] 浏览器窗口已居中：x=%s y=%s width=%s height=%s", x, y, width, height)
     except Exception as exc:
-        logger.warning("[Roxy] 浏览器窗口居中失败，继续执行：%s", exc)
+        logger.warning("[Roxy] 浏览器窗口居中失败，继续执行：%s", redact_emails(exc))
 
 
 def _wait(driver, timeout: int | None = None):
@@ -136,7 +137,7 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
             last_exc = exc
             logger.warning(
                 "%s 页面加载超时，尝试停止加载后检查 DOM：url=%s attempt=%s/%s error=%s",
-                _log_prefix(driver), url, attempt, attempts, str(exc).splitlines()[0] if str(exc) else "TimeoutException",
+                _log_prefix(driver), url, attempt, attempts, redact_emails(exc).splitlines()[0] if str(exc) else "TimeoutException",
             )
             try:
                 driver.execute_script("window.stop();")
@@ -170,7 +171,7 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
         except WebDriverException as exc:
             last_exc = exc
             if attempt < attempts:
-                logger.warning("%s 页面跳转失败，准备重试：url=%s attempt=%s/%s error=%s", _log_prefix(driver), url, attempt, attempts, exc)
+                logger.warning("%s 页面跳转失败，准备重试：url=%s attempt=%s/%s error=%s", _log_prefix(driver), url, attempt, attempts, redact_emails(exc))
                 time.sleep(1.5 * attempt)
                 continue
             raise
@@ -223,7 +224,7 @@ def _apply_browser_automation_mask(driver) -> None:
             pass
         logger.info("%s 已注入浏览器自动化特征弱化脚本", _log_prefix(driver))
     except Exception as exc:
-        logger.debug("%s 注入自动化特征弱化脚本失败：%s", _log_prefix(driver), exc)
+        logger.debug("%s 注入自动化特征弱化脚本失败：%s", _log_prefix(driver), redact_emails(exc))
 
 
 def _human_scroll_to(driver, el) -> None:
@@ -280,7 +281,7 @@ def _human_click(driver, el, *, label: str = "") -> None:
             el.click();
             """, el)
     except Exception as exc:
-        logger.debug("%s 人工化点击失败，回退 el.click label=%s err=%s", _log_prefix(driver), label, exc)
+        logger.debug("%s 人工化点击失败，回退 el.click label=%s err=%s", _log_prefix(driver), label, redact_emails(exc))
         time.sleep(random.uniform(0.12, 0.45))
         try:
             driver.execute_script("arguments[0].click();", el)
@@ -338,7 +339,7 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
             el,
         )
     except Exception as exc:
-        logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), exc)
+        logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), redact_emails(exc))
         _set_element_value(driver, el, value)
 
 
@@ -1347,7 +1348,7 @@ def _select_or_type(driver, selectors: list[str], value: str, timeout: int = 3) 
             _human_type_text(driver, el, str(value), clear=True)
         return True
     except Exception as exc:
-        logger.debug('%s 填写字段失败 selectors=%s value=%s err=%s', _log_prefix(driver), selectors, value, exc)
+        logger.debug('%s 填写字段失败 selectors=%s value=%s err=%s', _log_prefix(driver), selectors, value, redact_emails(exc))
         return False
 
 
@@ -1489,7 +1490,7 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
         """, birthday)
         return 'spinbutton'
     except Exception as exc:
-        logger.debug('%s spinbutton 生日填写失败：%s', _log_prefix(driver), exc)
+        logger.debug('%s spinbutton 生日填写失败：%s', _log_prefix(driver), redact_emails(exc))
         return None
 
 
@@ -1771,7 +1772,7 @@ def _accept_profile_consents(driver) -> int:
             logger.info("%s 已勾选 about-you/profile 同意协议复选框：%s", _log_prefix(driver), result.get('names'))
         return count
     except Exception as exc:
-        logger.debug('%s 勾选 profile consent 失败：%s', _log_prefix(driver), exc)
+        logger.debug('%s 勾选 profile consent 失败：%s', _log_prefix(driver), redact_emails(exc))
         return 0
 
 
@@ -2037,7 +2038,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                         otp_attempt + 1,
                         max_otp_attempts,
                         type(exc).__name__,
-                        str(exc)[:180],
+                        redact_emails(exc)[:180],
                     )
                     if not resend_used:
                         resend_used = True
@@ -2059,7 +2060,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 _click_continue(driver)
                 logger.info("[Roxy注册][OTP] 已提交邮箱验证码，等待资料页或登录态")
             except Exception as exc:
-                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
+                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", redact_emails(exc)[:120])
 
             outcome = _wait_after_email_otp_submit(driver, timeout=30)
             if outcome == 'accepted':
@@ -2149,8 +2150,8 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
         }
     except Exception as exc:
-        logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Roxy注册] 失败详情", exc_info=True)
+        logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, redact_emails(exc))
+        logger.debug("[Roxy注册] 失败详情\n%s", redact_emails(traceback.format_exc()))
         # 未确认创建前回收邮箱；确认后避免重复使用。
         try:
             from core.email_provider import release_email

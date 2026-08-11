@@ -1,11 +1,23 @@
 import ast
 import logging
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, patch
 
-from core import account_liveness, codex_retry_service, email_provider
+import main as registration_main
+from core import (
+    account_liveness,
+    browser_use_registration,
+    cloakbrowser_registration,
+    codex_retry_service,
+    email_provider,
+    icloud_mail_client,
+    roxy_registration,
+)
 from core.log_safety import email_fingerprint, redact_email
 
 
@@ -79,6 +91,96 @@ class EmailLogRedactionTests(unittest.TestCase):
         self.assertNotIn(ALIAS, output)
         self.assertIn(email_fingerprint(ALIAS), output)
 
+    def test_icloud_timeout_exception_redacts_alias_at_source(self):
+        pool = Mock()
+        pool.wait_for_code.return_value = None
+
+        with patch.object(icloud_mail_client, "_pool", return_value=pool), self.assertRaises(TimeoutError) as raised:
+            icloud_mail_client.fetch_latest_otp(ALIAS, after_ts=0, max_wait=1)
+
+        output = str(raised.exception)
+        full_alias_logged = ALIAS in output
+        self.assertFalse(full_alias_logged)
+        self.assertIn(email_fingerprint(ALIAS), output)
+
+    def test_registration_driver_error_logs_redact_external_alias(self):
+        def run_cloak(error: Exception):
+            with patch.object(
+                cloakbrowser_registration, "build_cloak_driver", side_effect=error
+            ), patch.object(
+                cloakbrowser_registration._cfg, "CLOAK_KEEP_BROWSER_OPEN", False
+            ), patch("core.email_provider.release_email"):
+                return cloakbrowser_registration.run_cloak_registration(ALIAS, "Fixture", "1990-01-01")
+
+        def run_roxy(error: Exception):
+            client = Mock()
+            opened = SimpleNamespace(profile_id="roxy-profile", raw={})
+            client.open_profile.return_value = opened
+            with patch.object(roxy_registration, "RoxyBrowserClient", return_value=client), patch.object(
+                roxy_registration, "_build_driver", side_effect=error
+            ), patch.object(roxy_registration._cfg, "ROXY_KEEP_BROWSER_OPEN", False), patch(
+                "core.email_provider.release_email"
+            ):
+                return roxy_registration.run_roxy_registration(ALIAS, "Fixture", "1990-01-01")
+
+        def run_browser_use(error: Exception):
+            client = Mock()
+            client.open_session.return_value = SimpleNamespace(
+                connect_url="ws://fixture",
+                proxy_country_code="US",
+                profile_id="browser-use-profile",
+                session_id="",
+                raw={},
+            )
+            playwright = SimpleNamespace(chromium=Mock())
+            playwright.chromium.connect_over_cdp.side_effect = error
+            playwright_context = MagicMock()
+            playwright_context.__enter__.return_value = playwright
+            sync_api = types.ModuleType("playwright.sync_api")
+            sync_api.sync_playwright = Mock(return_value=playwright_context)
+            playwright_package = types.ModuleType("playwright")
+            with patch.dict(
+                sys.modules,
+                {"playwright": playwright_package, "playwright.sync_api": sync_api},
+            ), patch.object(
+                browser_use_registration, "BrowserUseClient", return_value=client
+            ), patch("core.email_provider.release_email"):
+                return browser_use_registration.run_browser_use_registration(ALIAS, "Fixture", "1990-01-01")
+
+        cases = (
+            ("core.cloakbrowser_registration", run_cloak),
+            ("core.roxy_registration", run_roxy),
+            ("core.browser_use_registration", run_browser_use),
+        )
+        for logger_name, runner in cases:
+            with self.subTest(logger=logger_name), self.assertLogs(logger_name, level=logging.DEBUG) as captured:
+                result = runner(RuntimeError(f"external failure for {ALIAS}"))
+
+            self.assertFalse(result["success"], result)
+            output = "\n".join(captured.output)
+            full_alias_logged = ALIAS in output
+            self.assertFalse(full_alias_logged)
+            self.assertIn(email_fingerprint(ALIAS), output)
+
+    def test_protocol_driver_logs_redacted_email_and_external_error(self):
+        session = Mock(proxy=None, device_id="device-fixture", auth_session_logging_id="log-fixture")
+        with patch.object(registration_main._roxy_cfg, "REGISTRATION_DRIVER", "protocol"), patch.object(
+            registration_main, "BrowserSession", return_value=session
+        ), patch.object(
+            registration_main,
+            "network_preflight",
+            side_effect=RuntimeError(f"protocol failure for {ALIAS}"),
+        ), patch("core.email_provider.release_email", return_value="icloud"), self.assertLogs(
+            "main", level=logging.DEBUG
+        ) as captured:
+            result = registration_main.run_registration(ALIAS, "Fixture", "1990-01-01")
+
+        self.assertFalse(result["success"], result)
+        output = "\n".join(captured.output)
+        full_alias_logged = ALIAS in output
+        self.assertFalse(full_alias_logged)
+        self.assertIn(email_fingerprint(ALIAS), output)
+
     def test_account_log_filenames_use_only_email_fingerprint(self):
         for path in (account_liveness.log_path(ALIAS), codex_retry_service.log_path(ALIAS)):
             with self.subTest(path=path):
@@ -105,6 +207,7 @@ class EmailLogRedactionTests(unittest.TestCase):
             "core/codex_oauth.py",
             "core/extract_link_service.py",
             "core/roxy_codex_oauth.py",
+            "main.py",
         ):
             source = (root / relative).read_text(encoding="utf-8")
             tree = ast.parse(source, filename=relative)
@@ -123,7 +226,7 @@ class EmailLogRedactionTests(unittest.TestCase):
                         if (
                             isinstance(current, ast.Call)
                             and isinstance(current.func, ast.Name)
-                            and current.func.id == "redact_email"
+                            and current.func.id in ("redact_email", "redact_emails")
                         ):
                             protected = True
                             break
