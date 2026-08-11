@@ -21,8 +21,17 @@ ipaddress.IPv6Address(sys.argv[1][1:-1])
 PY
     return
   fi
-  [[ "$HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
-  [[ "$HOST" != *..* ]] || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
+  validate_hostname "$HOST" || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
+}
+validate_hostname() {
+  local host="$1" label
+  [[ ${#host} -le 253 && "$host" != *..* ]] || return 1
+  local IFS=.
+  read -r -a labels <<< "$host"
+  for label in "${labels[@]}"; do
+    [[ -n "$label" && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]$ || "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])$ ]] || return 1
+  done
 }
 check() {
   local label="$1"

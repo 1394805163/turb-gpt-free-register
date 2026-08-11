@@ -105,7 +105,7 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
         ):
             self.assertTrue((ROOT / relative_path).is_file(), relative_path)
 
-    def render_unit(self, app_dir: str, output: Path) -> str:
+    def render_unit(self, app_dir: str, output: Path, service_home: str = "/home/turb gpt") -> str:
         result = run_bash(
             "deploy/linux/install-systemd.sh",
             "--render-only",
@@ -117,7 +117,7 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
             "--service-group",
             "turbgpt",
             "--service-home",
-            "/home/turb gpt",
+            service_home,
             "--host",
             "[::1]",
             "--port",
@@ -149,6 +149,16 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
         self.assertIn('WorkingDirectory="/opt/100%% \\"quoted\\"\\\\path with space"', unit)
         self.assertIn('EnvironmentFile="/opt/100%% \\"quoted\\"\\\\path with space/.env"', unit)
         self.assertNotIn('WorkingDirectory="/opt/100% ', unit)
+
+    def test_render_only_does_not_reprocess_tokens_inside_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            unit = self.render_unit(
+                "/opt/__HOST_ENV__",
+                Path(temp_dir) / "rendered.service",
+                service_home="/home/__APP_DIR__",
+            )
+        self.assertIn('WorkingDirectory="/opt/__HOST_ENV__"', unit)
+        self.assertIn('Environment="HOME=/home/__APP_DIR__"', unit)
 
     def test_render_only_rejects_newline_project_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -215,7 +225,15 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
                 self.assertIn("ERROR:", result.stderr)
 
     def test_doctor_rejects_non_endpoint_host_syntax(self):
-        invalid_hosts = ("host name", "http://host", "host/path", "host\tname", "[not:ipv6]")
+        invalid_hosts = (
+            "host name",
+            "http://host",
+            "host/path",
+            "host\tname",
+            "[not:ipv6]",
+            "a.-b.example",
+            "a.b-.example",
+        )
         for host in invalid_hosts:
             with self.subTest(host=host):
                 result = run_bash("deploy/linux/doctor.sh", "--host", host)
@@ -225,8 +243,8 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
     def test_bootstrap_keeps_utf8_chinese_messages(self):
         script = read("deploy/linux/bootstrap.sh")
         self.assertNotIn("??", script)
-        self.assertIn("用法: sudo deploy/linux/bootstrap.sh", script)
-        self.assertIn("Ubuntu 原生部署完成", script)
+        self.assertIn("\u7528\u6cd5: sudo deploy/linux/bootstrap.sh", script)
+        self.assertIn("Ubuntu \u539f\u751f\u90e8\u7f72\u5b8c\u6210", script)
 
     def test_bootstrap_service_user_prefers_explicit_then_sudo_user(self):
         explicit = run_bash(
@@ -251,14 +269,15 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
             r'''
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir "$work/units"
+mkdir -p "$work/units" "$work/app/.venv/bin" "$work/app/deploy/linux"
 printf 'old unit\n' > "$work/units/turb-gpt-register.service"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$work/analyze"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$work/systemd-analyze"
 printf '#!/usr/bin/env bash\necho systemctl >> "$1.log"\nexit 0\n' > "$work/systemctl"
-chmod +x "$work/analyze" "$work/systemctl"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/app/.venv/bin/gunicorn"
+touch "$work/app/.env" "$work/app/deploy/linux/gunicorn.conf.py" "$work/app/requirements.txt" "$work/app/web.py"
+chmod +x "$work/systemd-analyze" "$work/systemctl" "$work/app/.venv/bin/gunicorn"
 set +e
-UNIT_DIR="$work/units" SYSTEMD_ANALYZE_BIN="$work/analyze" SYSTEMCTL_BIN="$work/systemctl" \
-  deploy/linux/install-systemd.sh --apply-unit-only --app-dir '/opt/app with space' \
+deploy/linux/install-systemd.sh --apply-unit-only --test-root "$work" --app-dir "$work/app" \
   --service-user turbgpt --service-group turbgpt --service-home /home/turbgpt
 status=$?
 set -e
@@ -273,23 +292,68 @@ printf 'status=%s\ncontent=%s\n' "$status" "$(cat "$work/units/turb-gpt-register
             r'''
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir "$work/units"
+mkdir -p "$work/units" "$work/app/.venv/bin" "$work/app/deploy/linux"
 printf 'old unit\n' > "$work/units/turb-gpt-register.service"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$work/analyze"
-printf '#!/usr/bin/env bash\ncount_file="$0.count"\ncount=0; test -f "$count_file" && count=$(cat "$count_file")\ncount=$((count + 1)); echo "$count" > "$count_file"\nif [ "$1" = daemon-reload ] && [ "$count" -eq 1 ]; then exit 1; fi\nexit 0\n' > "$work/systemctl"
-chmod +x "$work/analyze" "$work/systemctl"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/systemd-analyze"
+printf '#!/usr/bin/env bash\ncount_file="$0.count"\ncount=0; test -f "$count_file" && count=$(cat "$count_file")\ncount=$((count + 1)); echo "$count" > "$count_file"\necho "CALL:$1"\nif [ "$1" = daemon-reload ] && [ "$count" -eq 1 ]; then exit 1; fi\nexit 0\n' > "$work/systemctl"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/app/.venv/bin/gunicorn"
+touch "$work/app/.env" "$work/app/deploy/linux/gunicorn.conf.py" "$work/app/requirements.txt" "$work/app/web.py"
+chmod +x "$work/systemd-analyze" "$work/systemctl" "$work/app/.venv/bin/gunicorn"
 set +e
-UNIT_DIR="$work/units" SYSTEMD_ANALYZE_BIN="$work/analyze" SYSTEMCTL_BIN="$work/systemctl" \
-  deploy/linux/install-systemd.sh --apply-unit-only --app-dir /opt/app \
+deploy/linux/install-systemd.sh --apply-unit-only --test-root "$work" --app-dir "$work/app" \
   --service-user turbgpt --service-group turbgpt --service-home /home/turbgpt
 status=$?
 set -e
-printf 'status=%s\ncontent=%s\nreloads=%s\n' "$status" "$(cat "$work/units/turb-gpt-register.service")" "$(cat "$work/systemctl.count")"
+printf 'status=%s\ncontent=%s\n' "$status" "$(cat "$work/units/turb-gpt-register.service")"
 '''
         )
         self.assertIn("status=1", result.stdout)
         self.assertIn("content=old unit", result.stdout)
-        self.assertIn("reloads=2", result.stdout)
+        self.assertEqual(result.stdout.count("CALL:daemon-reload"), 2, result.stdout + result.stderr)
+
+    def test_production_mode_rejects_environment_injected_unit_tools(self):
+        result = run_bash_snippet(
+            r'''
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir "$work/units"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/systemctl"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/analyze"
+chmod +x "$work/systemctl" "$work/analyze"
+set +e
+UNIT_DIR="$work/units" SYSTEMCTL_BIN="$work/systemctl" SYSTEMD_ANALYZE_BIN="$work/analyze" \
+  deploy/linux/install-systemd.sh --apply-unit-only --app-dir /opt/app \
+  --service-user turbgpt --service-group turbgpt --service-home /home/turbgpt
+status=$?
+set -e
+printf 'status=%s\n' "$status"
+'''
+        )
+        self.assertIn("status=2", result.stdout)
+
+    def test_enable_failure_restores_existing_unit_and_reloads_again(self):
+        result = run_bash_snippet(
+            r'''
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/units" "$work/app/.venv/bin" "$work/app/deploy/linux"
+printf 'old unit\n' > "$work/units/turb-gpt-register.service"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/systemd-analyze"
+printf '#!/usr/bin/env bash\necho "CALL:$1"\nif [ "$1" = enable ]; then exit 1; fi\nexit 0\n' > "$work/systemctl"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/app/.venv/bin/gunicorn"
+touch "$work/app/.env" "$work/app/deploy/linux/gunicorn.conf.py" "$work/app/requirements.txt" "$work/app/web.py"
+chmod +x "$work/systemd-analyze" "$work/systemctl" "$work/app/.venv/bin/gunicorn"
+set +e
+deploy/linux/install-systemd.sh --test-root "$work" --app-dir "$work/app" \
+  --service-user turbgpt --service-group turbgpt --service-home /home/turbgpt
+status=$?
+set -e
+printf 'status=%s\ncontent=%s\n' "$status" "$(cat "$work/units/turb-gpt-register.service")"
+'''
+        )
+        self.assertIn("status=1", result.stdout)
+        self.assertIn("content=old unit", result.stdout)
+        self.assertEqual(result.stdout.count("CALL:daemon-reload"), 2, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

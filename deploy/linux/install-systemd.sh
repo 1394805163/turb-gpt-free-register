@@ -5,10 +5,10 @@ SERVICE_NAME="turb-gpt-register"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 TEMPLATE="$SCRIPT_DIR/${SERVICE_NAME}.service.template"
-UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+UNIT_DIR="/etc/systemd/system"
 UNIT_PATH="$UNIT_DIR/${SERVICE_NAME}.service"
-SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
-SYSTEMD_ANALYZE_BIN="${SYSTEMD_ANALYZE_BIN:-systemd-analyze}"
+SYSTEMCTL_BIN="/usr/bin/systemctl"
+SYSTEMD_ANALYZE_BIN="/usr/bin/systemd-analyze"
 SERVICE_USER=""
 SERVICE_GROUP=""
 SERVICE_HOME=""
@@ -20,6 +20,8 @@ RENDER_ONLY=0
 RENDER_OUTPUT=""
 CHECK_ACCESS_ONLY=0
 APPLY_UNIT_ONLY=0
+TEST_ROOT=""
+TEST_MODE=0
 TMP_UNIT=""
 BACKUP_UNIT=""
 
@@ -36,6 +38,7 @@ Usage: sudo deploy/linux/install-systemd.sh [options]
   --render-only FILE
   --check-access-only
   --apply-unit-only
+  --test-root DIR      Internal test seam; requires --apply-unit-only
 EOF
 }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -100,17 +103,29 @@ render_unit() {
   port_env="$(systemd_quote "PORT=$PORT")"
   gunicorn="$(systemd_quote "$APP_DIR/.venv/bin/gunicorn")"
   config="$(systemd_quote "$APP_DIR/deploy/linux/gunicorn.conf.py")"
+  for value in "$user" "$group" "$home_env" "$working_dir" "$env_file" "$host_env" "$port_env" "$gunicorn" "$config"; do
+    [[ "$value" != *'@@TURB_RENDER_'* ]] || fail "rendered value collides with internal token sentinel"
+  done
   : > "$output"
   while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line//__SERVICE_USER__/$user}"
-    line="${line//__SERVICE_GROUP__/$group}"
-    line="${line//__HOME_ENV__/$home_env}"
-    line="${line//__APP_DIR__/$working_dir}"
-    line="${line//__ENV_FILE__/$env_file}"
-    line="${line//__HOST_ENV__/$host_env}"
-    line="${line//__PORT_ENV__/$port_env}"
-    line="${line//__GUNICORN_ARG__/$gunicorn}"
-    line="${line//__GUNICORN_CONFIG_ARG__/$config}"
+    line="${line//__SERVICE_USER__/@@TURB_RENDER_USER@@}"
+    line="${line//__SERVICE_GROUP__/@@TURB_RENDER_GROUP@@}"
+    line="${line//__HOME_ENV__/@@TURB_RENDER_HOME@@}"
+    line="${line//__APP_DIR__/@@TURB_RENDER_APP@@}"
+    line="${line//__ENV_FILE__/@@TURB_RENDER_ENV_FILE@@}"
+    line="${line//__HOST_ENV__/@@TURB_RENDER_HOST@@}"
+    line="${line//__PORT_ENV__/@@TURB_RENDER_PORT@@}"
+    line="${line//__GUNICORN_ARG__/@@TURB_RENDER_GUNICORN@@}"
+    line="${line//__GUNICORN_CONFIG_ARG__/@@TURB_RENDER_CONFIG@@}"
+    line="${line//@@TURB_RENDER_USER@@/$user}"
+    line="${line//@@TURB_RENDER_GROUP@@/$group}"
+    line="${line//@@TURB_RENDER_HOME@@/$home_env}"
+    line="${line//@@TURB_RENDER_APP@@/$working_dir}"
+    line="${line//@@TURB_RENDER_ENV_FILE@@/$env_file}"
+    line="${line//@@TURB_RENDER_HOST@@/$host_env}"
+    line="${line//@@TURB_RENDER_PORT@@/$port_env}"
+    line="${line//@@TURB_RENDER_GUNICORN@@/$gunicorn}"
+    line="${line//@@TURB_RENDER_CONFIG@@/$config}"
     printf '%s\n' "$line" >> "$output"
   done < "$TEMPLATE"
 }
@@ -140,6 +155,25 @@ prepare_service_access() {
   chmod 0600 "$APP_DIR/.env"
   check_service_user_access
 }
+validate_install_prerequisites() {
+  [[ -f "$APP_DIR/requirements.txt" ]] || fail "requirements.txt not found"
+  [[ -f "$APP_DIR/web.py" ]] || fail "web.py not found"
+  [[ -f "$APP_DIR/deploy/linux/gunicorn.conf.py" ]] || fail "Gunicorn configuration not found"
+  [[ -x "$APP_DIR/.venv/bin/gunicorn" ]] || fail "Gunicorn not found: $APP_DIR/.venv/bin/gunicorn"
+  [[ -f "$APP_DIR/.env" ]] || fail ".env not found; run bootstrap.sh first"
+}
+configure_test_mode() {
+  [[ "$(id -u)" -ne 0 ]] || usage_error "--test-root is only available to non-root tests"
+  [[ "$TEST_ROOT" == /* ]] || usage_error "test root must be absolute"
+  validate_no_newline "test root" "$TEST_ROOT"
+  [[ "$TEST_ROOT" != /etc && "$TEST_ROOT" != /etc/* ]] || usage_error "test root cannot target /etc"
+  UNIT_DIR="$TEST_ROOT/units"
+  UNIT_PATH="$UNIT_DIR/${SERVICE_NAME}.service"
+  SYSTEMCTL_BIN="$TEST_ROOT/systemctl"
+  SYSTEMD_ANALYZE_BIN="$TEST_ROOT/systemd-analyze"
+  [[ -d "$UNIT_DIR" && -x "$SYSTEMCTL_BIN" && -x "$SYSTEMD_ANALYZE_BIN" ]] || fail "test root is incomplete"
+  TEST_MODE=1
+}
 cleanup() {
   [[ -n "$TMP_UNIT" ]] && rm -f "$TMP_UNIT"
   [[ -n "$BACKUP_UNIT" ]] && rm -f "$BACKUP_UNIT"
@@ -162,9 +196,7 @@ apply_unit_transaction() {
   render_unit "$TMP_UNIT"
   if [[ "$(id -u)" -eq 0 ]]; then chown root:root "$TMP_UNIT"; fi
   chmod 0644 "$TMP_UNIT"
-  if [[ -n "$SYSTEMD_ANALYZE_BIN" ]] && command -v "$SYSTEMD_ANALYZE_BIN" >/dev/null 2>&1; then
-    "$SYSTEMD_ANALYZE_BIN" verify "$TMP_UNIT" || fail "systemd-analyze verify failed; existing unit was not replaced"
-  fi
+  "$SYSTEMD_ANALYZE_BIN" verify "$TMP_UNIT" || fail "systemd-analyze verify failed; existing unit was not replaced"
   mv -f "$TMP_UNIT" "$UNIT_PATH"
   TMP_UNIT=""
   if ! "$SYSTEMCTL_BIN" daemon-reload; then
@@ -189,7 +221,7 @@ apply_unit_transaction() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --service-user|--service-group|--service-home|--app-dir|--host|--port|--render-only)
+    --service-user|--service-group|--service-home|--app-dir|--host|--port|--render-only|--test-root)
       require_value "$1" "${2:-}"
       case "$1" in
         --service-user) SERVICE_USER="$2" ;;
@@ -199,6 +231,7 @@ while [[ $# -gt 0 ]]; do
         --host) HOST="$2" ;;
         --port) PORT="$2" ;;
         --render-only) RENDER_ONLY=1; RENDER_OUTPUT="$2" ;;
+        --test-root) TEST_ROOT="$2" ;;
       esac
       shift 2 ;;
     --no-start) START_SERVICE=0; shift ;;
@@ -213,18 +246,26 @@ done
 select_service_user
 validate_inputs
 if [[ "$RENDER_ONLY" -eq 1 ]]; then
+  [[ -z "$TEST_ROOT" ]] || usage_error "--test-root is only valid with --apply-unit-only"
+  [[ "$(id -u)" -ne 0 ]] || usage_error "--render-only is only available to non-root tests"
   resolve_service_identity
   validate_no_newline "render output path" "$RENDER_OUTPUT"
+  [[ "$RENDER_OUTPUT" != /etc && "$RENDER_OUTPUT" != /etc/* ]] || usage_error "render output cannot target /etc"
   render_unit "$RENDER_OUTPUT"
   exit 0
 fi
-[[ "$(id -u)" -eq 0 || "$APPLY_UNIT_ONLY" -eq 1 && "$UNIT_DIR" != /etc/systemd/system ]] || fail "root is required to install the systemd service"
+if [[ -n "$TEST_ROOT" ]]; then
+  configure_test_mode
+elif [[ "$APPLY_UNIT_ONLY" -eq 1 ]]; then
+  usage_error "--apply-unit-only requires --test-root"
+elif [[ "$(id -u)" -ne 0 ]]; then
+  fail "root is required to install the systemd service"
+fi
 ensure_service_user
 resolve_service_identity
 if [[ "$CHECK_ACCESS_ONLY" -eq 1 ]]; then check_service_user_access; exit 0; fi
-if [[ "$APPLY_UNIT_ONLY" -eq 0 ]]; then
-  [[ -x "$APP_DIR/.venv/bin/gunicorn" ]] || fail "Gunicorn not found: $APP_DIR/.venv/bin/gunicorn"
-  [[ -f "$APP_DIR/.env" ]] || fail ".env not found; run bootstrap.sh first"
+validate_install_prerequisites
+if [[ "$TEST_MODE" -eq 0 ]]; then
   prepare_service_access
 fi
 trap cleanup EXIT
