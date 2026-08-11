@@ -1,0 +1,27 @@
+[Unit]
+Description=Turb GPT Free Register WebUI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=__ENV_FILE__
+Environment=HOME=__SERVICE_HOME__
+Environment=HOST=__HOST__
+Environment=PORT=__PORT__
+Environment=PYTHONUNBUFFERED=1
+Environment=MALLOC_ARENA_MAX=2
+ExecStart=__GUNICORN__ --config __GUNICORN_CONFIG__ webui.app:create_app()
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillMode=control-group
+TasksMax=512
+MemoryHigh=1700M
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target
