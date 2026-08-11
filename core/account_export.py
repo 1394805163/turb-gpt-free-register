@@ -453,22 +453,6 @@ def save_account_data(
             f"[Plan] 注册后自动查询入队异常（不影响注册结果）: "
             f"{email}, {type(exc).__name__}: {str(exc)[:180]}"
         )
-    # 注册成功只进入 pending；必须由独立测活重新登录成功后，才会进入推送队列。
-    try:
-        from core.live_check_service import enqueue_account_live_check
-
-        queued = enqueue_account_live_check(
-            account_id=row_id,
-            email=email,
-            trigger="registration_auto",
-            proxy=None,
-        )
-        if queued.get("accepted"):
-            logger.info("[LiveCheck] 注册后自动测活已入队: id=%s email=%s", row_id, email)
-        elif queued.get("busy"):
-            logger.info("[LiveCheck] 账号已有测活任务: id=%s email=%s", row_id, email)
-        else:
-            logger.warning("[LiveCheck] 注册后自动测活入队失败（账号已保存）: %s", queued.get("error"))
-    except Exception as exc:
-        logger.warning("[LiveCheck] 注册后自动测活入队异常（账号已保存）: %s", type(exc).__name__)
+    # 套餐/Token 快速检查成功即可确认当前 Token 可用并自动推送。
+    # 完整 OTP 登录只保留为手动“登录测活/刷新 Token”，注册后不再自动触发第二封 OTP。
     return row_id

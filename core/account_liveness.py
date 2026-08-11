@@ -285,6 +285,7 @@ def check_account_liveness(
         return {
             "ok": True,
             "status": "live",
+            "method": "otp",
             "checked_at": checked_at,
             "access_token": access_token,
             "session": session_info,

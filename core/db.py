@@ -923,6 +923,11 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
         row["plan_check_completed_at"] = _now()
         row["plan_check_http_status"] = result.get("http_status")
         row["plan_check_error"] = None if ok else result.get("error")
+        if ok:
+            row["needs_live_check"] = False
+        elif result.get("needs_live_check") is not None:
+            # Token 401 只表示需要完整登录刷新，不等于账号已经死亡。
+            row["needs_live_check"] = bool(result.get("needs_live_check"))
 
         if result.get("account_id"):
             row["account_id"] = result.get("account_id")
@@ -1313,6 +1318,8 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
                 row["dead_candidate_checked_at"] = now
         row["live_check_status"] = status
         row["live_check_ok"] = ok
+        if result.get("method"):
+            row["live_check_method"] = str(result.get("method"))
         row["live_checked_at"] = result.get("checked_at") or now
         row["live_check_error"] = None if ok else result.get("error")
         row["updated_at"] = now
@@ -1325,6 +1332,7 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
             row["pipeline_status"] = "temporary_error"
 
         if ok:
+            row["needs_live_check"] = False
             row["dead_candidate_code"] = None
             row["dead_candidate_checked_at"] = None
             token = str(result.get("access_token") or "").strip()
