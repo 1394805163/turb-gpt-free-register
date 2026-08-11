@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,7 +40,11 @@ def _settings() -> dict[str, Any]:
         "imap_mailbox": getattr(cfg, "ICLOUD_IMAP_MAILBOX", "INBOX"),
         "request_timeout": int(getattr(cfg, "ICLOUD_REQUEST_TIMEOUT", 30) or 30),
         "message_limit": int(getattr(cfg, "ICLOUD_MESSAGE_LIMIT", 6) or 6),
-        "wait_timeout": int(getattr(cfg, "OTP_MAX_WAIT", 180) or 180),
+        "initial_scan_limit": int(getattr(cfg, "ICLOUD_INITIAL_SCAN_LIMIT", 20) or 20),
+        "reselect_interval": int(getattr(cfg, "ICLOUD_RESELECT_INTERVAL", 12) or 12),
+        "reconnect_interval": int(getattr(cfg, "ICLOUD_RECONNECT_INTERVAL", 18) or 18),
+        "clock_skew_seconds": int(getattr(cfg, "ICLOUD_CLOCK_SKEW_SECONDS", 30) or 30),
+        "wait_timeout": int(getattr(cfg, "OTP_MAX_WAIT", 120) or 120),
         "wait_interval": int(getattr(cfg, "OTP_POLL_INTERVAL", 3) or 3),
     }
 
@@ -205,12 +210,27 @@ def fetch_latest_otp(
     after_ts: float,
     max_wait: int | None = None,
     poll_interval: int | None = None,
+    used_codes: set[str] | None = None,
+    otp_state: dict[str, set] | None = None,
     **_kwargs: Any,
 ) -> str:
+    state = otp_state if otp_state is not None else {}
+    seen_uids = state.setdefault("seen_uids", set())
+    pending_uids = state.setdefault("pending_uids", set())
+    seen_message_ids = state.setdefault("seen_message_ids", set())
+    seen_code_hashes = state.setdefault("seen_code_hashes", set())
+    used_code_hashes = state.setdefault("used_code_hashes", set())
+    for code in used_codes or set():
+        used_code_hashes.add(hashlib.sha256(str(code).encode()).hexdigest())
     mailbox = {
         "address": str(email or "").strip().lower(),
         "_code_not_before": datetime.fromtimestamp(float(after_ts), tz=timezone.utc),
-        "_seen": set(),
+        "_seen": seen_message_ids,
+        "_seen_uids": seen_uids,
+        "_pending_uids": pending_uids,
+        "_seen_message_ids": seen_message_ids,
+        "_seen_code_hashes": seen_code_hashes,
+        "_used_code_hashes": used_code_hashes,
     }
     code = _pool(wait_timeout=max_wait, wait_interval=poll_interval).wait_for_code(mailbox)
     if not code:

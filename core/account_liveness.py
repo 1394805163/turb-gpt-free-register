@@ -148,18 +148,27 @@ def is_checking(email: str) -> bool:
         return key in _RUNNING
 
 
-def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: float, max_otp_attempts: int = 3) -> dict:
+def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: float, max_otp_attempts: int = 2) -> dict:
     current_otp = None
     last_exc: Exception | None = None
+    used_codes: set[str] = set()
+    otp_state: dict[str, set] = {}
     for attempt in range(1, max_otp_attempts + 1):
         try:
             if current_otp is None:
                 logger.info("[查活] 等待登录 OTP：%s（第 %s/%s 次）", email, attempt, max_otp_attempts)
-                current_otp = wait_for_otp(email, after_ts=otp_after_ts)
+                current_otp = wait_for_otp(
+                    email,
+                    after_ts=otp_after_ts,
+                    used_codes=used_codes,
+                    otp_state=otp_state,
+                )
             result = validate_email_otp(session, current_otp, sentinel_header=None, so_header=None)
             return result
         except EmailOtpInvalidError as exc:
             last_exc = exc
+            if current_otp:
+                used_codes.add(current_otp)
             if attempt >= max_otp_attempts:
                 break
             logger.warning("[查活] OTP 无效/过期，重新发送后再取：%s", str(exc)[:180])
@@ -173,6 +182,8 @@ def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: floa
             if attempt >= max_otp_attempts or not _is_retryable_network_error(exc):
                 raise
             last_exc = exc
+            if current_otp:
+                used_codes.add(current_otp)
             logger.warning("[查活] OTP 验证网络抖动，重新发送后再取（%s/%s）：%s", attempt, max_otp_attempts, str(exc)[:180])
             try:
                 send_email_otp(session)

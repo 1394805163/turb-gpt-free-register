@@ -5,7 +5,7 @@ import imaplib
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -285,6 +285,7 @@ class ICloudMailboxPool:
                     previous_uidvalidity = str(mailbox.get("_uidvalidity") or "")
                     if previous_uidvalidity and uidvalidity and previous_uidvalidity != uidvalidity:
                         mailbox["_seen_uids"] = set()
+                        mailbox["_pending_uids"] = set()
                         mailbox["_last_uid"] = 0
                     if uidvalidity:
                         mailbox["_uidvalidity"] = uidvalidity
@@ -294,6 +295,11 @@ class ICloudMailboxPool:
                     target = str(mailbox["address"]).strip().lower()
                     seen_uids = mailbox.setdefault("_seen_uids", set())
                     pending_uids = mailbox.setdefault("_pending_uids", set())
+                    seen_message_ids = mailbox.setdefault("_seen_message_ids", mailbox.setdefault("_seen", set()))
+                    seen_code_hashes = mailbox.setdefault("_seen_code_hashes", set())
+                    used_code_hashes = mailbox.setdefault("_used_code_hashes", set())
+                    clock_skew = max(0.0, float(self.config.get("clock_skew_seconds", 30)))
+                    not_before = mailbox["_code_not_before"] - timedelta(seconds=clock_skew)
                     for uid in reversed(candidates):
                         parsed = self._fetch_uid_message(imap, uid)
                         if parsed is None:
@@ -304,15 +310,20 @@ class ICloudMailboxPool:
                         message_id, text, received, headers = parsed
                         if target not in headers.lower():
                             continue
-                        if received and received < mailbox["_code_not_before"]:
-                            continue
                         fingerprint = message_id or hashlib.sha256(text.encode()).hexdigest()
-                        if fingerprint in mailbox["_seen"]:
+                        if fingerprint in seen_message_ids:
                             continue
-                        mailbox["_seen"].add(fingerprint)
+                        seen_message_ids.add(fingerprint)
+                        if received and received < not_before:
+                            continue
                         match = re.search(r"(?:Verification code|code is|代码为|验证码)[:\s]*(\d{6})", text, re.I) or re.search(r"(?<![#&])\b(\d{6})\b", text)
                         if match and match.group(1) != "177010":
-                            return match.group(1)
+                            code = match.group(1)
+                            code_hash = hashlib.sha256(code.encode()).hexdigest()
+                            if code_hash in used_code_hashes or code_hash in seen_code_hashes:
+                                continue
+                            seen_code_hashes.add(code_hash)
+                            return code
                     if all_uids:
                         mailbox["_last_uid"] = max(int(uid) for uid in all_uids)
                 except (imaplib.IMAP4.error, OSError):

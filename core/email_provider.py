@@ -130,6 +130,8 @@ def wait_for_otp(
     max_wait: int | None = None,
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
+    used_codes: set[str] | None = None,
+    otp_state: dict[str, set] | None = None,
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 
@@ -165,7 +167,13 @@ def wait_for_otp(
     source = resolve_email_source(email)
     if source == "icloud":
         from core.icloud_mail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return fetch_latest_otp(
+            email,
+            after_ts=after_ts,
+            used_codes=used_codes,
+            otp_state=otp_state,
+            **extra_kwargs,
+        )
     if source == "gptmail":
         from core.gptmail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
