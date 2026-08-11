@@ -20,6 +20,7 @@ import pyotp
 
 from core.session import BrowserSession
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email
 
 logger = logging.getLogger(__name__)
 
@@ -171,8 +172,11 @@ def fetch_session(session: BrowserSession) -> dict:
     user = data.get("user") or {}
     account = data.get("account") or {}
     logger.info(
-        f"[Session] 成功，user_id={user.get('id')}, email={user.get('email')}, "
-        f"plan={account.get('planType')}, mfa={user.get('mfa')}"
+        "[Session] 成功，user_id=%s, email=%s, plan=%s, mfa=%s",
+        user.get("id"),
+        redact_email(user.get("email")),
+        account.get("planType"),
+        user.get("mfa"),
     )
     return data
 
@@ -432,7 +436,7 @@ def save_account_data(
         extra=extra,
         batch_dir=batch_dir,
     )
-    logger.info(f"[Save] 账号已写入 DB, id={row_id}, email={email}")
+    logger.info("[Save] 账号已写入 DB, id=%s, email=%s", row_id, redact_email(email))
     logger.info(f"[Save] 批次归档目录: {batch_folder}")
     # session 中的 account.planType 不能说明 Plus 试用资格。账号落库后只负责
     # 入队，由专用线程池异步查询并回写，避免占用注册工作线程。
@@ -446,15 +450,17 @@ def save_account_data(
             trigger="registration_auto",
         )
         if queued.get("accepted"):
-            logger.info(f"[Plan] 注册后自动查询已入队: id={row_id}, email={email}")
+            logger.info("[Plan] 注册后自动查询已入队: id=%s, email=%s", row_id, redact_email(email))
         elif queued.get("busy"):
-            logger.info(f"[Plan] 账号已有套餐查询，注册流程不重复入队: id={row_id}, email={email}")
+            logger.info("[Plan] 账号已有套餐查询，注册流程不重复入队: id=%s, email=%s", row_id, redact_email(email))
         else:
-            logger.warning(f"[Plan] 注册后自动查询入队失败（不影响注册结果）: {email}, {queued.get('error')}")
+            logger.warning("[Plan] 注册后自动查询入队失败（不影响注册结果）: %s, %s", redact_email(email), queued.get("error"))
     except Exception as exc:
         logger.warning(
-            f"[Plan] 注册后自动查询入队异常（不影响注册结果）: "
-            f"{email}, {type(exc).__name__}: {str(exc)[:180]}"
+            "[Plan] 注册后自动查询入队异常（不影响注册结果）: %s, %s: %s",
+            redact_email(email),
+            type(exc).__name__,
+            str(exc)[:180],
         )
     # 套餐/Token 快速检查成功即可确认当前 Token 可用并自动推送。
     # 完整 OTP 登录只保留为手动“登录测活/刷新 Token”，注册后不再自动触发第二封 OTP。

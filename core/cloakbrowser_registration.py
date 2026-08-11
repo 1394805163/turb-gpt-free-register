@@ -12,6 +12,7 @@ from core.account_export import save_account_data
 from core.cloakbrowser_driver import build_cloak_driver
 from core.email_provider import OtpWaitSession, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email
 
 # 复用 Roxy 注册流程里已维护好的页面操作函数。
 from core.roxy_registration import (  # noqa: F401
@@ -31,7 +32,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
     openai_password: str | None = None
     try:
         driver, opened = build_cloak_driver(proxy=proxy)
-        logger.info("[Cloak注册] 开始：%s，profile=%s", email, opened.profile_id)
+        logger.info("[Cloak注册] 开始：%s，profile=%s", redact_email(email), opened.profile_id)
 
         otp_after_ts = time.time()
         logger.info("[Cloak注册] 打开登录页：https://chatgpt.com/auth/login")
@@ -49,24 +50,29 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         current_otp = otp_code
         otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
         max_otp_attempts = 3
+        resend_used = False
         for otp_attempt in range(1, max_otp_attempts + 1):
             if current_otp is None:
-                logger.info("[Cloak注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
+                logger.info("[Cloak注册][OTP] 等待验证码：%s（第 %s/%s 次）", redact_email(email), otp_attempt, max_otp_attempts)
                 try:
                     current_otp = otp_wait_session.wait(email, after_ts=otp_after_ts)
                 except Exception as exc:
                     if otp_attempt >= max_otp_attempts:
                         raise
                     logger.warning(
-                        "[Cloak注册][OTP] 一直未收到验证码，点击“重新发送电子邮件”后继续等待（下一轮 %s/%s）：%s: %s",
+                        "[Cloak注册][OTP] 一直未收到验证码，继续下一轮等待（%s/%s）：%s: %s",
                         otp_attempt + 1,
                         max_otp_attempts,
                         type(exc).__name__,
                         str(exc)[:180],
                     )
-                    otp_after_ts = time.time()
-                    _click_resend_email_otp(driver, timeout=25)
-                    human_delay("api")
+                    if not resend_used:
+                        resend_used = True
+                        otp_after_ts = time.time()
+                        _click_resend_email_otp(driver, timeout=25)
+                        human_delay("api")
+                    else:
+                        logger.info("[Cloak注册][OTP] 本任务已使用一次重发，不再重复发送")
                     current_otp = None
                     continue
             otp_wait_session.mark_used(current_otp)
@@ -84,9 +90,13 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                 break
             if otp_attempt >= max_otp_attempts:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
-            otp_after_ts = time.time()
-            _click_resend_email_otp(driver, timeout=25)
-            human_delay("api")
+            if not resend_used:
+                resend_used = True
+                otp_after_ts = time.time()
+                _click_resend_email_otp(driver, timeout=25)
+                human_delay("api")
+            else:
+                logger.info("[Cloak注册][OTP] 本任务已使用一次重发，不再重复发送")
             current_otp = None
 
         profile_submitted = _complete_profile_page(driver, name, birthday, timeout=60)
@@ -96,7 +106,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
 
         session_info = _fetch_chatgpt_session(driver, timeout=120)
         access_token = session_info["accessToken"]
-        logger.info("[Cloak注册] 已拿到 accessToken：%s", email)
+        logger.info("[Cloak注册] 已拿到 accessToken：%s", redact_email(email))
 
         if _twofa_cfg.ENABLE_2FA:
             logger.warning("[Cloak注册] 当前 CloakBrowser 自动化路径暂不执行 2FA 设置，已跳过")
@@ -153,7 +163,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
             from core.email_provider import release_email
             release_email(email, status="used", note="Cloak registration completed")
         except Exception:
-            logger.warning("[Cloak registration] Failed to finalize email pool state: %s", email, exc_info=True)
+            logger.warning("[Cloak registration] Failed to finalize email pool state: %s", redact_email(email), exc_info=True)
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
         return {"success": bool(codex_ok), "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "codex": codex_result, "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}"}
     except Exception as exc:

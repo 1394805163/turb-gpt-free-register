@@ -11,6 +11,7 @@ from pathlib import Path
 from core import db
 from core.account_liveness import check_account_liveness, log_path
 from core.chatgpt_plan import resolve_plan_check_route
+from core.log_safety import redact_email
 from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_slot
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
             db.update_account_liveness(account_id, result)
         except Exception:
             logger.exception("[查活] 写入异常状态失败: account_id=%s", account_id)
-        logger.exception("[查活] 后台异常: %s", email)
+        logger.exception("[查活] 后台异常: %s", redact_email(email))
         try:
             _append_log(email, f"[查活] 后台异常：{result['error']}")
         except Exception:

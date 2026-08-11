@@ -19,6 +19,7 @@ from core.openai_auth import (
 )
 from core.account_export import follow_oauth_callback, fetch_session
 from core.email_provider import OtpWaitSession, wait_for_otp
+from core.log_safety import email_fingerprint, redact_email, redact_emails
 
 logger = logging.getLogger(__name__)
 _LOG_DIR = Path(__file__).resolve().parent.parent / "注册日志"
@@ -138,8 +139,7 @@ def _now() -> str:
 
 
 def log_path(email: str) -> Path:
-    safe = str(email or "").replace("/", "_").replace("\\", "_").replace(":", "_")
-    return _LOG_DIR / f"live-check-{safe}.log"
+    return _LOG_DIR / f"live-check-email-{email_fingerprint(email)}.log"
 
 
 def is_checking(email: str) -> bool:
@@ -155,7 +155,7 @@ def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: floa
     for attempt in range(1, max_otp_attempts + 1):
         try:
             if current_otp is None:
-                logger.info("[查活] 等待登录 OTP：%s（第 %s/%s 次）", email, attempt, max_otp_attempts)
+                logger.info("[查活] 等待登录 OTP：%s（第 %s/%s 次）", redact_email(email), attempt, max_otp_attempts)
                 current_otp = otp_wait_session.wait(email, after_ts=otp_after_ts)
             result = validate_email_otp(session, current_otp, sentinel_header=None, so_header=None)
             return result
@@ -234,7 +234,7 @@ def check_account_liveness(
         root_logger.addHandler(fh)
 
         logger.info("[查活] 日志文件：%s", path)
-        logger.info("[查活] 开始重新登录：%s", email)
+        logger.info("[查活] 开始重新登录：%s", redact_email(email))
         logger.info("[查活] 流程：Providers → CSRF → Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
         session, authorize_url = _network_preflight_with_retry(
             email,
@@ -273,7 +273,7 @@ def check_account_liveness(
 
         user = session_info.get("user") or {}
         account = session_info.get("account") or {}
-        logger.info("[查活] 正常：%s user_id=%s plan=%s", email, user.get("id"), account.get("planType"))
+        logger.info("[查活] 正常：%s user_id=%s plan=%s", redact_email(email), user.get("id"), account.get("planType"))
         return {
             "ok": True,
             "status": "live",
@@ -287,16 +287,16 @@ def check_account_liveness(
     except AccountUnusableError as exc:
         result = classify_liveness_failure(exc)
         result["checked_at"] = checked_at
-        logger.warning("[查活] 结果：%s status=%s error=%s", email, result["status"], result["error"])
+        logger.warning("[查活] 结果：%s status=%s error=%s", redact_email(email), result["status"], redact_emails(result["error"]))
         return result
     except Exception as exc:
         result = classify_liveness_failure(exc)
         result["checked_at"] = checked_at
-        logger.warning("[查活] 结果：%s status=%s error=%s", email, result["status"], result["error"])
+        logger.warning("[查活] 结果：%s status=%s error=%s", redact_email(email), result["status"], redact_emails(result["error"]))
         return result
     finally:
         try:
-            logger.info("[查活] 结束：%s", email)
+            logger.info("[查活] 结束：%s", redact_email(email))
             if fh is not None:
                 root_logger.removeHandler(fh)
                 fh.close()

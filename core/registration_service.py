@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from core import codex_retry_service, db
+from core.log_safety import redact_email
 from core.pipeline_concurrency import pipeline_slot
 
 logger = logging.getLogger(__name__)
@@ -139,7 +140,7 @@ def _release_unconsumed_job_email(email: str | None, reason: str) -> None:
 
         release_email_if_unconsumed(email, note=f"任务未消耗，已自动回收: {reason[:180]}")
     except Exception:
-        logger.exception("[Service] 回收未消耗邮箱失败: %s", email)
+        logger.exception("[Service] 回收未消耗邮箱失败: %s", redact_email(email))
 
 
 def _is_final_session_access_token_timeout(error: object) -> bool:
@@ -178,10 +179,10 @@ def _disable_job_email(email: str | None, reason: str) -> bool:
         from core.email_provider import release_email
 
         source = release_email(email, status="disabled", note=f"自动停用: {reason[:180]}")
-        logger.warning("[Service] 已自动停用邮箱: source=%s email=%s reason=%s", source, email, reason[:220])
+        logger.warning("[Service] 已自动停用邮箱: source=%s email=%s reason=%s", source, redact_email(email), reason[:220])
         return True
     except Exception:
-        logger.exception("[Service] 自动停用邮箱失败: %s", email)
+        logger.exception("[Service] 自动停用邮箱失败: %s", redact_email(email))
         return False
 
 
@@ -321,7 +322,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
                     account_id=result.get("account_id"),
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
-                log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
+                log_logger.info("[Job %s] 成功: %s", job_id, redact_email(result.get("email")))
             else:
                 # 注意：失败也可能伴随 account_id（如 Codex 失败但账号已注册成功）
                 err = (result or {}).get("error") if isinstance(result, dict) else "unknown"

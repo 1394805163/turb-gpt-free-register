@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from config import roxybrowser as _roxy_cfg
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email
 from core import sms_provider
 from core.openai_auth import AccountUnusableError, detect_account_unusable_response_body
 from core.roxybrowser_client import RoxyBrowserClient
@@ -200,7 +201,7 @@ def _maybe_click_passwordless_after_email(driver, email: str, timeout: int = 18)
                 result = _click_passwordless_signup_if_present(driver)
                 if result.get("ok"):
                     clicked = True
-                    logger.info("[Codex][Browser] 已点击一次性验证码入口：email=%s detail=%s", email, result)
+                    logger.info("[Codex][Browser] 已点击一次性验证码入口：email=%s detail=%s", redact_email(email), result)
                     human_delay("form")
                     continue
         except Exception as exc:
@@ -254,7 +255,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
     # 非日本出口时按钮文案/顺序会变，不能按可见文字点“继续”，否则可能误点 Google。
     try:
         _type_email_address(driver, email, timeout=12)
-        logger.info("[Codex][Browser] 已填写邮箱：%s", email)
+        logger.info("[Codex][Browser] 已填写邮箱：%s", redact_email(email))
         human_delay("form")
         _submit_email_step(driver)
         logger.info("[Codex][Browser] 已提交邮箱，等待邮箱 OTP 页面")
@@ -292,7 +293,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         human_delay("api")
 
     for otp_attempt in range(1, max_otp_attempts + 1):
-        logger.info("[Codex][Browser] 等待邮箱 OTP：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
+        logger.info("[Codex][Browser] 等待邮箱 OTP：%s（第 %s/%s 次）", redact_email(email), otp_attempt, max_otp_attempts)
         try:
             code = _wait_for_fresh_email_otp(
                 otp_provider,
@@ -1287,7 +1288,7 @@ def _run_roxy_codex_oauth_once(
             driver = _build_driver(opened)
             _center_browser_window(driver)
         driver.set_page_load_timeout(int(_roxy_cfg.ROXY_SELENIUM_TIMEOUT))
-        logger.info("[Codex][Browser] 开始授权：%s，profile=%s，reuse_existing_profile=%s", email, opened.profile_id, reuse_existing_profile)
+        logger.info("[Codex][Browser] 开始授权：%s，profile=%s，reuse_existing_profile=%s", redact_email(email), opened.profile_id, reuse_existing_profile)
         if reuse_existing_profile and clear_existing_state:
             clear_roxy_browser_auth_state(driver)
 
@@ -1359,14 +1360,14 @@ def _run_roxy_codex_oauth_once(
             message=f"{_codex_driver_name()} plan={id_claims.get('plan_type') or 'unknown'}",
         )
     except AccountUnusableError as exc:
-        logger.warning("[Codex][Browser] 账号已废：%s，%s", email, exc.error_code)
+        logger.warning("[Codex][Browser] 账号已废：%s，%s", redact_email(email), exc.error_code)
         return proto._codex_result(
             status="deactivated",
             email=email,
             message=f"账号已废（{exc.error_code or 'account_deactivated'}）",
         )
     except Exception as exc:
-        logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, str(exc)[:240])
+        logger.warning("[Codex][Browser] 失败：%s，%s: %s", redact_email(email), type(exc).__name__, str(exc)[:240])
         logger.debug("[Codex][Browser] 失败详情", exc_info=True)
         return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {str(exc)[:220]}")
     finally:
@@ -1404,7 +1405,7 @@ def run_roxy_codex_oauth(
         if round_no > 1:
             logger.warning(
                 "[Codex][Browser] CPA callback 返回 Timeout waiting for OAuth callback，重新开启第 %s/%s 轮 Codex 授权：%s",
-                round_no, max_rounds, email,
+                round_no, max_rounds, redact_email(email),
             )
         result = _run_roxy_codex_oauth_once(
             email=email,

@@ -19,6 +19,7 @@ except Exception:  # WebUI 环境未装 curl_cffi 时使用标准库兜底
 
 from config import extract_link as cfg
 from core import db
+from core.log_safety import redact_email
 from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_limited
 
 logger = logging.getLogger(__name__)
@@ -303,7 +304,7 @@ def _run_extract(*, account_id: int, email: str, access_token: str, link_type: s
                     result = {}
                 final = {"ok": True, "status": "success", "job_id": job_id, "link_type": link_type, "result": result, "logs": logs}
                 db.update_account_extract(account_id, final)
-                logger.info("[提链] 成功: %s type=%s job=%s", email, link_type, job_id)
+                logger.info("[提链] 成功: %s type=%s job=%s", redact_email(email), link_type, job_id)
                 return final
             elif event == "error":
                 msg = _extract_error_message(data)
@@ -324,7 +325,7 @@ def _run_extract(*, account_id: int, email: str, access_token: str, link_type: s
             db.update_account_extract(account_id, result)
         except Exception:
             logger.exception("[提链] 写入失败状态异常: account_id=%s", account_id)
-        logger.exception("[提链] 失败: %s", email)
+        logger.exception("[提链] 失败: %s", redact_email(email))
         return result
     finally:
         _QUEUE_SLOTS.release()

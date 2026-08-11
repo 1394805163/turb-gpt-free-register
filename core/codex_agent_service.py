@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from config import proxy as proxy_cfg
 from core import db
+from core.log_safety import redact_email
 from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_slot
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
                 env = BrowserSession(proxy=route["proxy"], detect_exit_geo=False)
                 logger.info(
                     "[CodexAgent] 独立环境: %s attempt=%s/%s route=%s proxy=%s did=%s session=%s profile_ua=%s",
-                    email,
+                    redact_email(email),
                     attempt,
                     attempts,
                     route_meta.get("network_route") or "-",
@@ -210,7 +211,7 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
                     results.append({"mode": "api", **api_result})
                     logger.info(
                         "[CodexAgent] 已通过 API 上传 sub2api: %s url=%s status=%s payload=%s",
-                        email,
+                        redact_email(email),
                         api_result.get("url"),
                         api_result.get("status_code"),
                         api_result.get("payload_mode"),
@@ -225,7 +226,7 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
                     results.append({"mode": "file", **file_result})
                     logger.info(
                         "[CodexAgent] 已同步本地 sub2api: %s path=%s action=%s total=%s",
-                        email,
+                        redact_email(email),
                         file_result.get("path"),
                         "updated" if file_result.get("updated") else "added",
                         file_result.get("total"),
@@ -264,7 +265,7 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
             "request_timeout": timeout_seconds,
         }
         db.update_account_codex_agent(account_id, result)
-        logger.info("[CodexAgent] 生成成功: %s runtime=%s", email, result.get("agent_runtime_id") or "-")
+        logger.info("[CodexAgent] 生成成功: %s runtime=%s", redact_email(email), result.get("agent_runtime_id") or "-")
         return result
     except Exception as exc:
         result = {
@@ -286,7 +287,7 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
             db.update_account_codex_agent(account_id, result)
         except Exception:
             logger.exception("[CodexAgent] 写入失败状态异常: account_id=%s", account_id)
-        logger.exception("[CodexAgent] 生成失败: %s", email)
+        logger.exception("[CodexAgent] 生成失败: %s", redact_email(email))
         return result
     finally:
         if env is not None:

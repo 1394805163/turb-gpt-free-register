@@ -24,6 +24,7 @@ from core.browser_use_registration import (
     _click_passwordless_signup_if_present,
 )
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email
 
 logger = logging.getLogger(__name__)
 
@@ -638,7 +639,7 @@ def _maybe_click_passwordless_after_email(page, email: str, timeout: int = 18) -
             if "/password" in lower or "auth.openai.com" in lower:
                 if _click_passwordless_signup_if_present(page):
                     clicked = True
-                    logger.info("[Codex][BrowserUse] 已点击一次性验证码入口：email=%s", email)
+                    logger.info("[Codex][BrowserUse] 已点击一次性验证码入口：email=%s", redact_email(email))
                     _bu_delay("form")
                     continue
         except Exception as exc:
@@ -667,7 +668,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
         _t_email = _StepTimer("填写并提交邮箱")
         _fill_email_for_codex(page, email)
         _t_email.done()
-        logger.info("[Codex][BrowserUse] 已提交邮箱：%s", email)
+        logger.info("[Codex][BrowserUse] 已提交邮箱：%s", redact_email(email))
         _maybe_click_passwordless_after_email(page, email, timeout=18)
     except Exception as exc:
         if _looks_next_step_after_login(page):
@@ -703,7 +704,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
             if any(x in _page_url(page).lower() for x in ("phone", "workspace", "consent", "localhost:1455")):
                 return
             time.sleep(0.4)
-        logger.info("[Codex][BrowserUse] 等待邮箱 OTP：%s（%s/3）", email, attempt)
+        logger.info("[Codex][BrowserUse] 等待邮箱 OTP：%s（%s/3）", redact_email(email), attempt)
         _t_otp_wait = _StepTimer("等待邮箱 OTP")
         try:
             code = _wait_for_fresh_email_otp(otp_provider, email, after_ts=otp_after_ts, used_codes=used_codes, timeout=90)
@@ -1327,7 +1328,7 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
         logger.info(
             "[Codex][%s] 开始授权：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
             provider_label,
-            email,
+            redact_email(email),
             session_info.proxy_country_code or "-",
             session_info.profile_id or "-",
             "yes" if proxy else "no",
@@ -1404,7 +1405,7 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             _t_all.done("success")
             return proto._codex_result(status="success", ok=True, email=email, file_path=str(path), callback_url=callback_url)
     except AccountUnusableError as exc:
-        logger.warning("[Codex][BrowserUse] 账号已废：%s，%s", email, exc.error_code)
+        logger.warning("[Codex][BrowserUse] 账号已废：%s，%s", redact_email(email), exc.error_code)
         return proto._codex_result(
             status="deactivated",
             email=email,
@@ -1486,7 +1487,7 @@ def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str 
                 "[Codex][BrowserUse] CPA callback 返回 Timeout waiting for OAuth callback，重新开启第 %s/%s 轮 Codex 授权：%s",
                 round_no,
                 max_rounds,
-                email,
+                redact_email(email),
             )
         result = _run_browser_use_codex_oauth_once(email=email, otp_provider=otp_provider, proxy=proxy, force=force, cloud_provider=cloud_provider)
         last_result = result

@@ -14,6 +14,7 @@ from config import twofa as _twofa_cfg
 from core.account_export import save_account_data
 from core.email_provider import OtpWaitSession, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
 
 logger = logging.getLogger(__name__)
@@ -1014,7 +1015,7 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
             logger.warning("%s 邮箱写入校验失败，准备重试：attempt=%s/%s state=%s", _log_prefix(driver), attempt, attempts, state)
             time.sleep(0.8)
             continue
-        logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), email)
+        logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), redact_email(email))
         human_delay("form")
         _submit_email_step(driver, email)
         logger.info("%s 已提交邮箱，等待进入密码页或验证码页（%s/%s）", _log_prefix(driver), attempt, attempts)
@@ -1655,7 +1656,7 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             continue
         passwordless = _click_passwordless_signup_if_present(driver)
         if passwordless.get('ok'):
-            logger.info("%s 检测到 password 页，已点击一次性验证码入口：email=%s detail=%s", _log_prefix(driver), email, passwordless)
+            logger.info("%s 检测到 password 页，已点击一次性验证码入口：email=%s detail=%s", _log_prefix(driver), redact_email(email), passwordless)
             wait_end = time.time() + 20
             while time.time() < wait_end:
                 if _is_email_verification_page(driver):
@@ -1671,7 +1672,7 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             logger.info("%s 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：state=%s", _log_prefix(driver), last)
             return None
         password = _registration_password()
-        logger.info("%s 检测到 create-account/password，准备设置密码（%s 位）：email=%s", _log_prefix(driver), len(password), email)
+        logger.info("%s 检测到 create-account/password，准备设置密码（%s 位）：email=%s", _log_prefix(driver), len(password), redact_email(email))
         result = driver.execute_script(r"""
         const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
           && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
@@ -1992,7 +1993,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             driver.set_script_timeout(12)
         except Exception:
             pass
-        logger.info("[Roxy注册] 开始：%s，profile=%s", email, opened.profile_id)
+        logger.info("[Roxy注册] 开始：%s，profile=%s", redact_email(email), opened.profile_id)
 
         otp_after_ts = time.time()
         logger.info("[Roxy注册] 打开登录页：https://chatgpt.com/auth/login")
@@ -2022,24 +2023,29 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         current_otp = otp_code
         otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
         max_otp_attempts = 3
+        resend_used = False
         for otp_attempt in range(1, max_otp_attempts + 1):
             if current_otp is None:
-                logger.info("[Roxy注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
+                logger.info("[Roxy注册][OTP] 等待验证码：%s（第 %s/%s 次）", redact_email(email), otp_attempt, max_otp_attempts)
                 try:
                     current_otp = otp_wait_session.wait(email, after_ts=otp_after_ts)
                 except Exception as exc:
                     if otp_attempt >= max_otp_attempts:
                         raise
                     logger.warning(
-                        "[Roxy注册][OTP] 一直未收到验证码，点击“重新发送电子邮件”后继续等待（下一轮 %s/%s）：%s: %s",
+                        "[Roxy注册][OTP] 一直未收到验证码，继续下一轮等待（%s/%s）：%s: %s",
                         otp_attempt + 1,
                         max_otp_attempts,
                         type(exc).__name__,
                         str(exc)[:180],
                     )
-                    otp_after_ts = time.time()
-                    _click_resend_email_otp(driver, timeout=25)
-                    human_delay("api")
+                    if not resend_used:
+                        resend_used = True
+                        otp_after_ts = time.time()
+                        _click_resend_email_otp(driver, timeout=25)
+                        human_delay("api")
+                    else:
+                        logger.info("[Roxy注册][OTP] 本任务已使用一次重发，不再重复发送")
                     current_otp = None
                     continue
             otp_wait_session.mark_used(current_otp)
@@ -2060,10 +2066,14 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 break
             if otp_attempt >= max_otp_attempts:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
-            logger.warning("[Roxy注册][OTP] 验证码错误/过期，准备重新发送并重新获取验证码（%s/%s）", otp_attempt + 1, max_otp_attempts)
-            otp_after_ts = time.time()
-            _click_resend_email_otp(driver, timeout=25)
-            human_delay("api")
+            logger.warning("[Roxy注册][OTP] 验证码错误/过期，准备重新获取验证码（%s/%s）", otp_attempt + 1, max_otp_attempts)
+            if not resend_used:
+                resend_used = True
+                otp_after_ts = time.time()
+                _click_resend_email_otp(driver, timeout=25)
+                human_delay("api")
+            else:
+                logger.info("[Roxy注册][OTP] 本任务已使用一次重发，不再重复发送")
             current_otp = None
 
         # about-you / profile 信息页：必须完成或确认已有登录态，不能静默跳过。
@@ -2079,7 +2089,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         _check_manual_stop()
         session_info = _fetch_chatgpt_session(driver, timeout=120)
         access_token = session_info["accessToken"]
-        logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
+        logger.info("[Roxy注册] 已拿到 accessToken：%s", redact_email(email))
         _check_manual_stop()
 
         if _twofa_cfg.ENABLE_2FA:

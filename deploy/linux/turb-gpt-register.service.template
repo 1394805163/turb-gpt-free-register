@@ -14,6 +14,7 @@ Environment=__HOST_ENV__
 Environment=__PORT_ENV__
 Environment=PYTHONUNBUFFERED=1
 Environment=MALLOC_ARENA_MAX=2
+UMask=0077
 ExecStart=__GUNICORN_ARG__ --config __GUNICORN_CONFIG_ARG__ webui.app:create_app()
 Restart=on-failure
 RestartSec=5

@@ -25,6 +25,7 @@ from core.account_export import save_account_data
 from core.browser_use_client import BrowserUseClient
 from core.email_provider import OtpWaitSession, resolve_email_source, wait_for_otp
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email
 
 logger = logging.getLogger(__name__)
 
@@ -581,7 +582,7 @@ def _submit_email_until_transition(page, context, email: str, *, attempts: int =
     last_state = "other"
     for attempt in range(1, max(1, attempts) + 1):
         _check_manual_stop()
-        logger.info("[BrowserUse] 提交邮箱尝试 %s/%s：%s", attempt, attempts, email)
+        logger.info("[BrowserUse] 提交邮箱尝试 %s/%s：%s", attempt, attempts, redact_email(email))
         _type_email(page, email, timeout_ms=timeout_ms)
         _check_manual_stop()
         last_state = _wait_after_email_submit_transition(page, context=context, timeout=10 if _fast_mode() else 16)
@@ -774,7 +775,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
             time.sleep(0.15 if _fast_mode() else 0.4)
             continue
         if _click_passwordless_signup_if_present(page):
-            logger.info("[BrowserUse] 检测到密码页，已点击一次性验证码入口：state=%s email=%s", state, email)
+            logger.info("[BrowserUse] 检测到密码页，已点击一次性验证码入口：state=%s email=%s", state, redact_email(email))
             wait_end = time.time() + 20
             while time.time() < wait_end:
                 state_after = _quick_auth_state(page)
@@ -793,7 +794,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
             logger.info("[BrowserUse] 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：url=%s", state_info.get("url") or "-")
             return None
         password = _registration_password()
-        logger.info("[BrowserUse] 检测到密码页，设置密码（%s 位）：%s", len(password), email)
+        logger.info("[BrowserUse] 检测到密码页，设置密码（%s 位）：%s", len(password), redact_email(email))
         ok = _fill_first(
             page,
             [
@@ -1639,7 +1640,7 @@ def _wait_for_otp_with_browser_heartbeat(
         wait_this_round = min(slice_wait, remaining)
         logger.info(
             "[BrowserUse][OTP] 邮箱短轮询：%s，第 %s 轮，最长 %ss（总剩余 %ss）",
-            email,
+            redact_email(email),
             attempt,
             wait_this_round,
             remaining,
@@ -1853,7 +1854,7 @@ def run_browser_use_registration(
     logger.info(
         "[%s] 开始注册：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
         cloud_label,
-        email,
+        redact_email(email),
         session_info_open.proxy_country_code or "-",
         session_info_open.profile_id or "-",
         "yes" if proxy else "no",
@@ -1905,7 +1906,7 @@ def run_browser_use_registration(
             otp_after_ts = time.time()
             _submit_email_until_transition(page, context, email, attempts=2, timeout_ms=20000)
             _t_email.done()
-            logger.info("[BrowserUse] 已提交邮箱：%s", email)
+            logger.info("[BrowserUse] 已提交邮箱：%s", redact_email(email))
             _assert_not_external_idp(page, "提交邮箱后")
             _check_manual_stop()
 
@@ -1942,7 +1943,7 @@ def run_browser_use_registration(
                         timeout_ms=12000 if _fast_mode() else 18000,
                     )
                     _check_manual_stop()
-                    logger.info("[BrowserUse][OTP] 已重新提交邮箱：%s", email)
+                    logger.info("[BrowserUse][OTP] 已重新提交邮箱：%s", redact_email(email))
                     _assert_not_external_idp(page, "重新提交邮箱后")
                     try:
                         pwd = _fill_password_if_present(page, email, timeout=6 if _fast_mode() else 10, context=context)
@@ -1962,6 +1963,7 @@ def run_browser_use_registration(
             current_otp = otp_code
             otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
             max_otp_attempts = 3
+            resend_used = False
             for otp_attempt in range(1, max_otp_attempts + 1):
                 # 等验证码页出现
                 wait_end = time.time() + (20 if _fast_mode() else 45)
@@ -1983,7 +1985,7 @@ def run_browser_use_registration(
                     time.sleep(0.2 if _fast_mode() else 0.4)
 
                 if current_otp is None:
-                    logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", email, otp_attempt, max_otp_attempts)
+                    logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", redact_email(email), otp_attempt, max_otp_attempts)
                     _t_otp_wait = _StepTimer("等待邮箱 OTP")
                     try:
                         current_otp = _wait_for_otp_with_browser_heartbeat(
@@ -2002,13 +2004,17 @@ def run_browser_use_registration(
                         if otp_attempt >= max_otp_attempts:
                             raise
                         logger.warning(
-                            "[BrowserUse][OTP] 本次未收到邮箱验证码，重新触发 OTP 后继续等待（%s/%s）：%s: %s",
+                            "[BrowserUse][OTP] 本次未收到邮箱验证码，继续下一轮等待（%s/%s）：%s: %s",
                             otp_attempt + 1,
                             max_otp_attempts,
                             type(exc).__name__,
                             str(exc)[:180],
                         )
-                        _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500/chrome-error")
+                        if not resend_used:
+                            resend_used = True
+                            _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500/chrome-error")
+                        else:
+                            logger.info("[BrowserUse][OTP] 本任务已使用一次重发，不再重复触发邮箱 OTP")
                         current_otp = None
                         continue
                 otp_wait_session.mark_used(current_otp)
@@ -2030,8 +2036,12 @@ def run_browser_use_registration(
                     break
                 if otp_attempt >= max_otp_attempts:
                     raise RuntimeError("邮箱验证码连续错误/过期")
-                logger.warning("[BrowserUse][OTP] 验证码可能无效，重新触发 OTP（%s/%s）", otp_attempt + 1, max_otp_attempts)
-                _restart_email_otp_flow("验证码错误/过期或页面未跳转，避免点击 resend 导致 500/chrome-error")
+                logger.warning("[BrowserUse][OTP] 验证码可能无效，继续获取 OTP（%s/%s）", otp_attempt + 1, max_otp_attempts)
+                if not resend_used:
+                    resend_used = True
+                    _restart_email_otp_flow("验证码错误/过期或页面未跳转，避免点击 resend 导致 500/chrome-error")
+                else:
+                    logger.info("[BrowserUse][OTP] 本任务已使用一次重发，不再重复触发邮箱 OTP")
                 current_otp = None
 
             logger.info("[BrowserUse] 处理资料页/登录态")
@@ -2047,7 +2057,7 @@ def run_browser_use_registration(
             if not access_token:
                 raise RuntimeError("注册流程结束但未拿到 accessToken")
             create_acknowledged = True
-            logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
+            logger.info("[BrowserUse] 已拿到 accessToken：%s", redact_email(email))
 
             if _twofa_cfg.ENABLE_2FA:
                 logger.warning("[BrowserUse] 当前路径暂不自动设置 2FA，已跳过")

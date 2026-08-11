@@ -8,6 +8,7 @@ import logging
 from urllib.parse import urlencode, urlparse, parse_qs
 
 from core.session import BrowserSession
+from core.log_safety import redact_email
 from config import (
     OPENAI_CLIENT_ID, OPENAI_SCOPE, OPENAI_AUDIENCE, OPENAI_REDIRECT_URI
 )
@@ -143,7 +144,7 @@ def signin_openai(session: BrowserSession, csrf_token: str, email: str) -> str:
         "json": "true",
     })
 
-    logger.info(f"[步骤3] 发起 OAuth Signin 请求, 邮箱: {email}")
+    logger.info("[步骤3] 发起 OAuth Signin 请求, 邮箱: %s", redact_email(email))
     resp = session.post(url, headers=headers, data=body)
     resp.raise_for_status()
 

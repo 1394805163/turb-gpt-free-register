@@ -36,6 +36,7 @@ from urllib.parse import urlencode, urlparse, parse_qs, quote
 from config import codex as _cfg
 from core.session import BrowserSession
 from core.humanize import delay as human_delay
+from core.log_safety import redact_email
 from core.openai_auth import (
     _is_transient_network_error,
     _extract_error_code,
@@ -797,7 +798,7 @@ def _submit_email(session: BrowserSession, email: str) -> None:
         raise RuntimeError(
             f"[Codex] 提交邮箱失败 status={resp.status_code}: {(resp.text or '')[:300]}"
         )
-    logger.info(f"[Codex] 已提交邮箱 {email}，等待邮箱 OTP")
+    logger.info("[Codex] 已提交邮箱 %s，等待邮箱 OTP", redact_email(email))
 
 
 # ============================================================
@@ -1365,7 +1366,7 @@ def run_codex_oauth(
 
     session = BrowserSession(proxy=proxy)
     try:
-        logger.info(f"[Codex] 开始授权（全新 session）：{email}")
+        logger.info("[Codex] 开始授权（全新 session）：%s", redact_email(email))
 
         # 1. 授权地址
         #    默认由 CPA 生成（本地不生成 PKCE/state）；local 模式保留旧代码用于兼容。
@@ -1408,7 +1409,7 @@ def run_codex_oauth(
         email_otp = None
         max_email_otp_attempts = 3
         for email_otp_attempt in range(1, max_email_otp_attempts + 1):
-            logger.info(f"[Codex] 等待邮箱 OTP：{email}（第 {email_otp_attempt}/{max_email_otp_attempts} 次）")
+            logger.info("[Codex] 等待邮箱 OTP：%s（第 %s/%s 次）", redact_email(email), email_otp_attempt, max_email_otp_attempts)
             try:
                 email_otp = otp_provider(email, after_ts=otp_after_ts)
                 break
@@ -1451,7 +1452,7 @@ def run_codex_oauth(
                 submit_payload=submit_payload,
             )
             msg = submit_payload.get("message") or submit_payload.get("status_message") or "CPA callback submitted"
-            logger.info(f"[Codex][CPA] 成功：{email}，{msg}，本地记录={path or 'disabled'}")
+            logger.info("[Codex][CPA] 成功：%s，%s，本地记录=%s", redact_email(email), msg, path or "disabled")
             return _codex_result(
                 status="success",
                 ok=True,
@@ -1476,7 +1477,7 @@ def run_codex_oauth(
                 submit_payload=submit_payload,
             )
             msg = submit_payload.get("message") or submit_payload.get("status_message") or "sub2 callback uploaded"
-            logger.info(f"[Codex][sub2] 成功：{email}，{msg}，本地记录={path or 'disabled'}")
+            logger.info("[Codex][sub2] 成功：%s，%s，本地记录=%s", redact_email(email), msg, path or "disabled")
             return _codex_result(
                 status="success",
                 ok=True,
@@ -1498,8 +1499,11 @@ def run_codex_oauth(
         path = save_codex_credential(storage, effective_email, id_claims.get("plan_type", ""))
 
         logger.info(
-            f"[Codex] 成功：{effective_email}，plan={id_claims.get('plan_type') or 'unknown'}, "
-            f"account_id={id_claims.get('account_id') or 'unknown'}, 已保存到 {path}"
+            "[Codex] 成功：%s，plan=%s, account_id=%s, 已保存到 %s",
+            redact_email(effective_email),
+            id_claims.get("plan_type") or "unknown",
+            id_claims.get("account_id") or "unknown",
+            path,
         )
         return _codex_result(
             status="success",
@@ -1510,7 +1514,7 @@ def run_codex_oauth(
             message=f"plan={id_claims.get('plan_type') or 'unknown'}",
         )
     except AccountUnusableError as exc:
-        logger.warning(f"[Codex] 账号已废（{exc.error_code}）：{email}")
+        logger.warning("[Codex] 账号已废（%s）：%s", exc.error_code, redact_email(email))
         return _codex_result(
             status="deactivated",
             email=email,
@@ -1520,7 +1524,7 @@ def run_codex_oauth(
         if _is_cpa_callback_reauth_error(exc) and _cpa_reauth_round < 2:
             logger.warning(
                 "[Codex][CPA] callback 返回 Timeout waiting for OAuth callback，重新开启第 %s/2 轮 Codex 授权：%s",
-                _cpa_reauth_round + 1, email,
+                _cpa_reauth_round + 1, redact_email(email),
             )
             return run_codex_oauth(
                 email,
@@ -1529,7 +1533,7 @@ def run_codex_oauth(
                 force=force,
                 _cpa_reauth_round=_cpa_reauth_round + 1,
             )
-        logger.warning(f"[Codex] 失败：{email}，{type(exc).__name__}: {str(exc)[:200]}")
+        logger.warning("[Codex] 失败：%s，%s: %s", redact_email(email), type(exc).__name__, str(exc)[:200])
         logger.debug("[Codex] 失败详情:", exc_info=True)
         return _codex_result(
             status="failed",

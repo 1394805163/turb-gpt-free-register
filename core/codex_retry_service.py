@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from core import db
+from core.log_safety import email_fingerprint, redact_email
 from core.pipeline_concurrency import pipeline_limited
 
 logger = logging.getLogger(__name__)
@@ -40,8 +41,7 @@ def _clear_state_locked(key: str) -> None:
 
 
 def log_path(email: str) -> Path:
-    safe = email.replace("/", "_").replace("\\", "_").replace(":", "_")
-    return _LOG_DIR / f"codex-retry-{safe}.log"
+    return _LOG_DIR / f"codex-retry-email-{email_fingerprint(email)}.log"
 
 
 def reserve(email: str) -> bool:
@@ -67,7 +67,7 @@ def reserve(email: str) -> bool:
             if ((not alive) and (status != "retrying" or age > 15 * 60)) or (terminal_status and (stop_req or age > 30)):
                 logger.warning(
                     "[Codex 补跑] 清理脏占位：email=%s status=%s thread_id=%s alive=%s stop_requested=%s age=%.1fs",
-                    email, status or "-", thread_id or "-", alive, stop_req, age,
+                    redact_email(email), status or "-", thread_id or "-", alive, stop_req, age,
                 )
                 _clear_state_locked(key)
             else:
@@ -148,7 +148,7 @@ def request_stop(email: str) -> dict:
                     except Exception:
                         status = ""
                     if status == "stopped":
-                        logger.warning("[Codex 补跑] 停止后延迟释放占位：email=%s thread_id=%s", email, thread_id or "-")
+                        logger.warning("[Codex 补跑] 停止后延迟释放占位：email=%s thread_id=%s", redact_email(email), thread_id or "-")
                         _clear_state_locked(key)
 
         threading.Thread(target=_delayed_release, name=f"codex-stop-release-{key}", daemon=True).start()
@@ -215,7 +215,7 @@ def run_worker(
 
         if batch_label:
             logger.info("[Codex 补跑] 批量任务：%s", batch_label)
-        logger.info("[Codex 补跑] 开始：%s", email)
+        logger.info("[Codex 补跑] 开始：%s", redact_email(email))
         logger.info("[Codex 补跑] 阶段说明：获取授权地址 → 登录邮箱 → 邮箱 OTP → 手机验证 → 捕获 callback → 提交/保存凭证")
         check_stop_requested(email)
         result = run_codex_oauth(email, force=True)
@@ -227,33 +227,33 @@ def run_worker(
         result_status = result.get("status", "failed")
         if result.get("ok"):
             db.update_account_codex_status(email, "success", None)
-            logger.info("[Codex 补跑] %s 成功", email)
+            logger.info("[Codex 补跑] %s 成功", redact_email(email))
         elif result_status == "deactivated":
             db.update_account_codex_status(email, "deactivated", result.get("message"))
-            logger.warning("[Codex 补跑] %s 账号已废: %s", email, result.get("message"))
+            logger.warning("[Codex 补跑] %s 账号已废: %s", redact_email(email), result.get("message"))
         else:
             db.update_account_codex_status(email, result_status, result.get("message"))
-            logger.warning("[Codex 补跑] %s 失败: %s", email, result.get("message"))
+            logger.warning("[Codex 补跑] %s 失败: %s", redact_email(email), result.get("message"))
         return result
     except CodexRetryStopped as exc:
         result = {"status": "stopped", "ok": False, "message": str(exc) or "用户手动停止 Codex 补跑"}
         db.update_account_codex_status(email, "stopped", result["message"])
-        logger.warning("[Codex 补跑] %s 已停止: %s", email, result["message"])
+        logger.warning("[Codex 补跑] %s 已停止: %s", redact_email(email), result["message"])
         return result
     except Exception as exc:
         if is_stop_requested(email):
             result = {"status": "stopped", "ok": False, "message": "用户手动停止 Codex 补跑"}
             db.update_account_codex_status(email, "stopped", result["message"])
-            logger.warning("[Codex 补跑] %s 已停止", email)
+            logger.warning("[Codex 补跑] %s 已停止", redact_email(email))
             return result
         result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {exc}"}
         db.update_account_codex_status(email, "failed", result["message"])
-        logger.exception("[Codex 补跑] %s 异常", email)
+        logger.exception("[Codex 补跑] %s 异常", redact_email(email))
         logger.error("[Codex 补跑] 已结束：异常失败")
         return result
     finally:
         try:
-            logger.info("[Codex 补跑] 结束：%s", email)
+            logger.info("[Codex 补跑] 结束：%s", redact_email(email))
             if fh is not None:
                 root_logger.removeHandler(fh)
                 fh.close()

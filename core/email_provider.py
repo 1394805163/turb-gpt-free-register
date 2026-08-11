@@ -18,6 +18,8 @@ import math
 import time
 from typing import Any, Callable, Iterable
 
+from core.log_safety import redact_email
+
 logger = logging.getLogger(__name__)
 
 _VALID_SOURCES = ("outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "icloud")
@@ -123,7 +125,7 @@ def acquire_email() -> str:
     for source in sources:
         try:
             email = _pick_from_source(source)
-            logger.info(f"[EmailProvider] 使用邮箱来源: {source}, email={email}")
+            logger.info("[EmailProvider] 使用邮箱来源: %s, email=%s", source, redact_email(email))
             return email
         except Exception as exc:
             last_exc = exc
@@ -292,5 +294,5 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
         changed = True
 
     if changed:
-        logger.info("[EmailProvider] 已回收未消耗邮箱: source=%s, email=%s", source, email)
+        logger.info("[EmailProvider] 已回收未消耗邮箱: source=%s, email=%s", source, redact_email(email))
     return changed

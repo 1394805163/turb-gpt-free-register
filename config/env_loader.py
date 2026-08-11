@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -162,9 +163,36 @@ def write_env_values(updates: dict[str, str]) -> list[str]:
             written.append(key)
 
     text = "\n".join(out_lines).rstrip() + "\n"
-    tmp = _ENV_PATH.with_suffix(".env.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(_ENV_PATH)
+    tmp_path: Path | None = None
+    fd: int | None = None
+    try:
+        fd, raw_tmp_path = tempfile.mkstemp(
+            prefix=f".{_ENV_PATH.name}.",
+            suffix=".tmp",
+            dir=str(_ENV_PATH.parent),
+        )
+        tmp_path = Path(raw_tmp_path)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # pragma: no cover - Windows 的 chmod 语义有限，但仍执行私有写入路径
+            os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as tmp_file:
+            fd = None
+            tmp_file.write(text)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, _ENV_PATH)
+        tmp_path = None
+        os.chmod(_ENV_PATH, 0o600)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
 
     # 让当前进程立刻看到新值
     load_env(override=True)

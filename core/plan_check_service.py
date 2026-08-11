@@ -12,6 +12,7 @@ from datetime import datetime
 from config import proxy as proxy_cfg
 from core import db
 from core.chatgpt_plan import check_account_plan
+from core.log_safety import redact_email
 from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_slot
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,7 @@ def _run_plan_check_inner(
             and not bool(result.get("plus_trial_eligible"))
         )
         if should_recheck:
-            logger.info("[Plan] 新账号暂未发现 Plus 试用资格，%.1fs 后复查一次: %s", recheck_delay, email)
+            logger.info("[Plan] 新账号暂未发现 Plus 试用资格，%.1fs 后复查一次: %s", recheck_delay, redact_email(email))
             time.sleep(recheck_delay)
             _wait_for_rate_slot()
             recheck_result = check_account_plan(
@@ -110,7 +111,7 @@ def _run_plan_check_inner(
             else:
                 logger.warning(
                     "[Plan] 新账号资格复查失败，保留首次成功结果: %s, %s",
-                    email,
+                    redact_email(email),
                     recheck_result.get("error") or "未知错误",
                 )
 
@@ -159,7 +160,7 @@ def _run_plan_check_inner(
                     )
             logger.info(
                 "[Plan] 后台查询成功: %s, plan=%s, plus_trial=%s, trigger=%s",
-                email,
+                redact_email(email),
                 result.get("current_plan_type") or "unknown",
                 bool(result.get("plus_trial_eligible")),
                 trigger,
@@ -176,7 +177,7 @@ def _run_plan_check_inner(
                 }, expected_token_fingerprint=expected_token_fingerprint)
             logger.warning(
                 "[Plan] 后台查询失败: %s, trigger=%s, error=%s",
-                email,
+                redact_email(email),
                 trigger,
                 result.get("error") or "未知错误",
             )
@@ -195,7 +196,7 @@ def _run_plan_check_inner(
             )
         except Exception:
             logger.exception("[Plan] 写入后台查询异常状态失败: account_id=%s", account_id)
-        logger.exception("[Plan] 后台查询异常: %s", email)
+        logger.exception("[Plan] 后台查询异常: %s", redact_email(email))
         return result
     finally:
         _QUEUE_SLOTS.release()

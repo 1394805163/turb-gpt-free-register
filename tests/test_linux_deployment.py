@@ -641,6 +641,7 @@ printf 'status=%s\n%s\n' "$status" "$(cat "$work/output")"
                     self.assertNotIn('WorkingDirectory="', unit)
                     self.assertNotIn('EnvironmentFile="', unit)
                     self.assertIn('Environment="HOME=/var/lib/turb-gpt-register"', unit)
+                    self.assertIn("UMask=0077", unit)
                     self.assertIn(
                         f'ExecStart="{app_dir}/.venv/bin/gunicorn" --config '
                         f'"{app_dir}/deploy/linux/gunicorn.conf.py" webui.app:create_app()',
