@@ -11,8 +11,7 @@ SYSTEMCTL_BIN="/usr/bin/systemctl"
 SYSTEMD_ANALYZE_BIN="/usr/bin/systemd-analyze"
 SERVICE_USER=""
 SERVICE_GROUP=""
-SERVICE_HOME=""
-CREATE_TURBGPT=0
+SERVICE_HOME="/var/lib/turb-gpt-register"
 HOST="127.0.0.1"
 PORT="5000"
 START_SERVICE=1
@@ -24,6 +23,12 @@ TEST_ROOT=""
 TEST_MODE=0
 TMP_UNIT=""
 BACKUP_UNIT=""
+PREVIOUS_ENABLED="disabled"
+PREVIOUS_ACTIVE="inactive"
+ID_BIN="/usr/bin/id"
+GETENT_BIN="/usr/bin/getent"
+USERADD_BIN="/usr/sbin/useradd"
+TEST_IDENTITY_COMMANDS=0
 
 usage() {
   cat <<'EOF'
@@ -55,10 +60,9 @@ select_service_user() {
   local current_user
   if [[ -n "$SERVICE_USER" ]]; then return; fi
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then SERVICE_USER="$SUDO_USER"; return; fi
-  current_user="$(id -un)"
+  current_user="$("$ID_BIN" -un)"
   if [[ "$current_user" != root ]]; then SERVICE_USER="$current_user"; return; fi
   SERVICE_USER="turbgpt"
-  CREATE_TURBGPT=1
 }
 validate_inputs() {
   [[ "$APP_DIR" == /* ]] || usage_error "project path must be absolute"
@@ -71,17 +75,23 @@ validate_inputs() {
   [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || usage_error "port must be an integer from 1 to 65535"
 }
 ensure_service_user() {
-  if [[ "$CREATE_TURBGPT" -eq 1 ]] && ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    useradd --system --create-home --home-dir "/home/$SERVICE_USER" --shell /usr/sbin/nologin "$SERVICE_USER"
+  if [[ "$TEST_MODE" -eq 1 && "$TEST_IDENTITY_COMMANDS" -eq 0 ]]; then return; fi
+  if ! "$GETENT_BIN" passwd "$SERVICE_USER" >/dev/null 2>&1; then
+    [[ "$SERVICE_USER" == "turbgpt" ]] || fail "service user does not exist: $SERVICE_USER"
+    "$USERADD_BIN" --system --create-home --home-dir "$SERVICE_HOME" --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
 }
 resolve_service_identity() {
-  if [[ -z "$SERVICE_GROUP" || -z "$SERVICE_HOME" ]]; then
-    local record
-    record="$(getent passwd "$SERVICE_USER" || true)"
+  local record uid
+  if [[ "$TEST_MODE" -eq 1 && "$TEST_IDENTITY_COMMANDS" -eq 0 ]]; then
+    [[ -n "$SERVICE_GROUP" ]] || fail "test mode without identity fixtures requires --service-group"
+  else
+    record="$("$GETENT_BIN" passwd "$SERVICE_USER" || true)"
     [[ -n "$record" ]] || fail "service user does not exist: $SERVICE_USER"
-    [[ -n "$SERVICE_GROUP" ]] || SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
-    [[ -n "$SERVICE_HOME" ]] || SERVICE_HOME="$(printf '%s\n' "$record" | cut -d: -f6)"
+    uid="$("$ID_BIN" -u "$SERVICE_USER")" || fail "cannot resolve service user UID: $SERVICE_USER"
+    [[ "$uid" =~ ^[0-9]+$ ]] || fail "service user UID is invalid: $SERVICE_USER"
+    [[ "$uid" -ne 0 ]] || fail "service user UID 0 would run as root: $SERVICE_USER"
+    [[ -n "$SERVICE_GROUP" ]] || SERVICE_GROUP="$("$ID_BIN" -gn "$SERVICE_USER")"
   fi
   [[ "$SERVICE_HOME" == /* ]] || fail "service HOME must be absolute"
   validate_identity_scalar "service group" "$SERVICE_GROUP"
@@ -156,7 +166,7 @@ render_unit() {
 run_as_service_user() { runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" XDG_CACHE_HOME="$SERVICE_HOME/.cache" "$@"; }
 check_service_user_access() {
   if ! run_as_service_user /bin/sh -c '
-    app_dir="$1"
+    app_dir="$1" service_home="$2"
     cd -- "$app_dir" || exit 1
     test -r "$app_dir/requirements.txt" || exit 1
     test -r "$app_dir/web.py" || exit 1
@@ -167,13 +177,29 @@ check_service_user_access() {
     test -w "$app_dir/logs" || exit 1
     test -w "$app_dir/run" || exit 1
     test -w "$app_dir/data" || exit 1
-  ' sh "$APP_DIR"; then
+    test -d "$service_home" || exit 1
+    test -w "$service_home" || exit 1
+  ' sh "$APP_DIR" "$SERVICE_HOME"; then
     fail "service user cannot traverse/read/write project and runtime directories"
   fi
 }
+prepare_private_directory() {
+  local path="$1" mode owner_uid owner_gid expected_uid expected_gid
+  [[ ! -L "$path" ]] || fail "private runtime directory cannot be a symbolic link: $path"
+  install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$path"
+  mode="$(stat -c '%a' "$path")"
+  owner_uid="$(stat -c '%u' "$path")"
+  owner_gid="$(stat -c '%g' "$path")"
+  expected_uid="$("$ID_BIN" -u "$SERVICE_USER")"
+  expected_gid="$("$ID_BIN" -g "$SERVICE_USER")"
+  [[ "$mode" == "700" && "$owner_uid" == "$expected_uid" && "$owner_gid" == "$expected_gid" ]] || fail "private runtime directory ownership or mode is invalid: $path"
+}
 prepare_service_access() {
   if [[ "$APP_DIR" == /opt/* ]]; then chown -R "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR"; fi
-  install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$APP_DIR/logs" "$APP_DIR/run" "$APP_DIR/data"
+  prepare_private_directory "$SERVICE_HOME"
+  prepare_private_directory "$APP_DIR/logs"
+  prepare_private_directory "$APP_DIR/run"
+  prepare_private_directory "$APP_DIR/data"
   [[ -f "$APP_DIR/.env" && ! -L "$APP_DIR/.env" ]] || fail ".env must be a regular file"
   chown "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR/.env"
   chmod 0600 "$APP_DIR/.env"
@@ -187,7 +213,7 @@ validate_install_prerequisites() {
   [[ -f "$APP_DIR/.env" ]] || fail ".env not found; run bootstrap.sh first"
 }
 configure_test_mode() {
-  [[ "$(id -u)" -ne 0 ]] || usage_error "--test-root is only available to non-root tests"
+  [[ "$(/usr/bin/id -u)" -ne 0 ]] || usage_error "--test-root is only available to non-root tests"
   [[ "$TEST_ROOT" == /* ]] || usage_error "test root must be absolute"
   validate_no_newline "test root" "$TEST_ROOT"
   [[ "$TEST_ROOT" != /etc && "$TEST_ROOT" != /etc/* ]] || usage_error "test root cannot target /etc"
@@ -196,6 +222,13 @@ configure_test_mode() {
   SYSTEMCTL_BIN="$TEST_ROOT/systemctl"
   SYSTEMD_ANALYZE_BIN="$TEST_ROOT/systemd-analyze"
   [[ -d "$UNIT_DIR" && -x "$SYSTEMCTL_BIN" && -x "$SYSTEMD_ANALYZE_BIN" ]] || fail "test root is incomplete"
+  if [[ -e "$TEST_ROOT/id" || -e "$TEST_ROOT/getent" || -e "$TEST_ROOT/useradd" ]]; then
+    ID_BIN="$TEST_ROOT/id"
+    GETENT_BIN="$TEST_ROOT/getent"
+    USERADD_BIN="$TEST_ROOT/useradd"
+    [[ -x "$ID_BIN" && -x "$GETENT_BIN" && -x "$USERADD_BIN" ]] || fail "test identity command fixtures are incomplete"
+    TEST_IDENTITY_COMMANDS=1
+  fi
   TEST_MODE=1
 }
 cleanup() {
@@ -210,33 +243,69 @@ restore_previous_unit() {
     rm -f "$UNIT_PATH"
   fi
 }
+record_previous_service_state() {
+  if "$SYSTEMCTL_BIN" is-enabled --quiet "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    PREVIOUS_ENABLED="enabled"
+  else
+    PREVIOUS_ENABLED="disabled"
+  fi
+  if "$SYSTEMCTL_BIN" is-active --quiet "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+    PREVIOUS_ACTIVE="active"
+  else
+    PREVIOUS_ACTIVE="inactive"
+  fi
+}
+restore_previous_service_state() {
+  local rollback_ok=0
+  if [[ "$PREVIOUS_ENABLED" == "enabled" ]]; then
+    "$SYSTEMCTL_BIN" enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || rollback_ok=1
+  else
+    "$SYSTEMCTL_BIN" disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || rollback_ok=1
+  fi
+  if [[ "$PREVIOUS_ACTIVE" == "active" ]]; then
+    "$SYSTEMCTL_BIN" restart "${SERVICE_NAME}.service" >/dev/null 2>&1 || rollback_ok=1
+  else
+    "$SYSTEMCTL_BIN" stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || rollback_ok=1
+  fi
+  return "$rollback_ok"
+}
+rollback_transaction() {
+  local reason="$1" rollback_ok=0
+  restore_previous_unit || rollback_ok=1
+  "$SYSTEMCTL_BIN" daemon-reload || rollback_ok=1
+  restore_previous_service_state || rollback_ok=1
+  if [[ "$rollback_ok" -eq 0 ]]; then
+    fail "$reason; restored previous unit and service state"
+  fi
+  fail "$reason; rollback was incomplete"
+}
 apply_unit_transaction() {
   [[ -d "$UNIT_DIR" ]] || fail "unit directory does not exist: $UNIT_DIR"
+  record_previous_service_state
   if [[ -f "$UNIT_PATH" ]]; then
     BACKUP_UNIT="$(mktemp "$UNIT_DIR/.${SERVICE_NAME}.backup.XXXXXX.service")"
     cp -p "$UNIT_PATH" "$BACKUP_UNIT"
   fi
   TMP_UNIT="$(mktemp "$UNIT_DIR/.${SERVICE_NAME}.new.XXXXXX.service")"
   render_unit "$TMP_UNIT"
-  if [[ "$(id -u)" -eq 0 ]]; then chown root:root "$TMP_UNIT"; fi
+  if [[ "$(/usr/bin/id -u)" -eq 0 ]]; then chown root:root "$TMP_UNIT"; fi
   chmod 0644 "$TMP_UNIT"
   "$SYSTEMD_ANALYZE_BIN" verify "$TMP_UNIT" || fail "systemd-analyze verify failed; existing unit was not replaced"
   mv -f "$TMP_UNIT" "$UNIT_PATH"
   TMP_UNIT=""
   if ! "$SYSTEMCTL_BIN" daemon-reload; then
-    restore_previous_unit
-    "$SYSTEMCTL_BIN" daemon-reload || true
-    fail "systemd daemon-reload failed; restored previous unit"
+    rollback_transaction "systemd daemon-reload failed"
   fi
   if [[ "$APPLY_UNIT_ONLY" -eq 0 ]]; then
+    if ! "$SYSTEMCTL_BIN" enable "${SERVICE_NAME}.service"; then
+      rollback_transaction "systemd enable failed"
+    fi
     if [[ "$START_SERVICE" -eq 1 ]]; then
-      "$SYSTEMCTL_BIN" enable --now "${SERVICE_NAME}.service" || {
-        restore_previous_unit; "$SYSTEMCTL_BIN" daemon-reload || true; fail "systemd enable failed; restored previous unit";
-      }
-    else
-      "$SYSTEMCTL_BIN" enable "${SERVICE_NAME}.service" || {
-        restore_previous_unit; "$SYSTEMCTL_BIN" daemon-reload || true; fail "systemd enable failed; restored previous unit";
-      }
+      if [[ "$PREVIOUS_ACTIVE" == "active" ]]; then
+        "$SYSTEMCTL_BIN" restart "${SERVICE_NAME}.service" || rollback_transaction "systemd restart failed"
+      else
+        "$SYSTEMCTL_BIN" start "${SERVICE_NAME}.service" || rollback_transaction "systemd start failed"
+      fi
     fi
   fi
   [[ -n "$BACKUP_UNIT" ]] && rm -f "$BACKUP_UNIT"
@@ -271,8 +340,14 @@ select_service_user
 validate_inputs
 if [[ "$RENDER_ONLY" -eq 1 ]]; then
   [[ -z "$TEST_ROOT" ]] || usage_error "--test-root is only valid with --apply-unit-only"
-  [[ "$(id -u)" -ne 0 ]] || usage_error "--render-only is only available to non-root tests"
-  resolve_service_identity
+  [[ "$(/usr/bin/id -u)" -ne 0 ]] || usage_error "--render-only is only available to non-root tests"
+  if [[ -z "$SERVICE_GROUP" ]]; then
+    ensure_service_user
+    resolve_service_identity
+  else
+    validate_identity_scalar "service group" "$SERVICE_GROUP"
+    validate_no_newline "service HOME" "$SERVICE_HOME"
+  fi
   validate_no_newline "render output path" "$RENDER_OUTPUT"
   [[ "$RENDER_OUTPUT" != /etc && "$RENDER_OUTPUT" != /etc/* ]] || usage_error "render output cannot target /etc"
   render_unit "$RENDER_OUTPUT"
@@ -282,7 +357,7 @@ if [[ -n "$TEST_ROOT" ]]; then
   configure_test_mode
 elif [[ "$APPLY_UNIT_ONLY" -eq 1 ]]; then
   usage_error "--apply-unit-only requires --test-root"
-elif [[ "$(id -u)" -ne 0 ]]; then
+elif [[ "$(/usr/bin/id -u)" -ne 0 ]]; then
   fail "root is required to install the systemd service"
 fi
 ensure_service_user

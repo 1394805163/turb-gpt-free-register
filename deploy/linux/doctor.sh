@@ -6,9 +6,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 HOST="127.0.0.1"
 PORT="5000"
+SERVICE_USER=""
+SERVICE_HOME="/var/lib/turb-gpt-register"
 STATUS=0
 
-usage() { printf '%s\n' 'Usage: deploy/linux/doctor.sh [--host HOST] [--port PORT]'; }
+usage() { printf '%s\n' 'Usage: deploy/linux/doctor.sh [--host HOST] [--port PORT] [--service-user USER] [--service-home HOME]'; }
 usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 validate_arguments() {
   [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || usage_error "port must be an integer from 1 to 65535"
@@ -19,9 +21,10 @@ import ipaddress
 import sys
 ipaddress.IPv6Address(sys.argv[1][1:-1])
 PY
-    return
+  else
+    validate_hostname "$HOST" || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
   fi
-  validate_hostname "$HOST" || usage_error "host must be a hostname, IPv4 address, or bracketed IPv6 address"
+  [[ "$SERVICE_HOME" == /* && "$SERVICE_HOME" != *$'\n'* && "$SERVICE_HOME" != *$'\r'* ]] || usage_error "service HOME must be an absolute path without newlines"
 }
 validate_hostname() {
   local host="$1" label
@@ -46,9 +49,14 @@ check() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host|--port)
+    --host|--port|--service-user|--service-home)
       [[ $# -ge 2 && -n "$2" ]] || usage_error "$1 requires a value"
-      if [[ "$1" == --host ]]; then HOST="$2"; else PORT="$2"; fi
+      case "$1" in
+        --host) HOST="$2" ;;
+        --port) PORT="$2" ;;
+        --service-user) SERVICE_USER="$2" ;;
+        --service-home) SERVICE_HOME="$2" ;;
+      esac
       shift 2
       ;;
     -h|--help) usage; exit 0 ;;
@@ -64,10 +72,36 @@ case "$ARCH" in
 esac
 
 VENV_PYTHON="$APP_DIR/.venv/bin/python"
-CLOAK_BINARY="$APP_DIR/.venv/bin/cloakbrowser"
 check "virtual environment Python" test -x "$VENV_PYTHON"
 check ".env exists" test -f "$APP_DIR/.env"
-check "Cloak binary" test -x "$CLOAK_BINARY"
+
+if [[ -z "$SERVICE_USER" ]]; then
+  SERVICE_USER="$(systemctl show --property=User --value "$SERVICE_NAME" 2>/dev/null || true)"
+  [[ -n "$SERVICE_USER" ]] || SERVICE_USER="turbgpt"
+fi
+service_identity_is_non_root() {
+  local uid
+  uid="$(id -u "$SERVICE_USER" 2>/dev/null)" || return 1
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -ne 0 ]]
+}
+run_as_service_user() {
+  local service_uid current_uid
+  service_uid="$(id -u "$SERVICE_USER")" || return 1
+  current_uid="$(id -u)"
+  if [[ "$current_uid" == "$service_uid" ]]; then
+    env HOME="$SERVICE_HOME" XDG_CACHE_HOME="$SERVICE_HOME/.cache" "$@"
+  elif [[ "$current_uid" -eq 0 ]]; then
+    runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" XDG_CACHE_HOME="$SERVICE_HOME/.cache" "$@"
+  else
+    return 1
+  fi
+}
+run_cloak_doctor() {
+  [[ -x "$VENV_PYTHON" ]] || return 1
+  run_as_service_user "$VENV_PYTHON" -m cloakbrowser doctor
+}
+check "service user exists and is non-root" service_identity_is_non_root
+check "Cloak can launch its browser binary" run_cloak_doctor
 
 if systemctl is-active --quiet "$SERVICE_NAME"; then
   printf '[OK] systemd service is active\n'
@@ -75,7 +109,8 @@ else
   printf '[FAIL] systemd service is not active\n' >&2
   STATUS=1
 fi
-if curl --fail --silent --show-error --max-time 5 "http://${HOST}:${PORT}/login" -o /dev/null; then
+HTTP_STATUS="$(curl --silent --show-error --max-time 5 --output /dev/null --write-out '%{http_code}' "http://${HOST}:${PORT}/login" 2>/dev/null || true)"
+if [[ "$HTTP_STATUS" == "200" ]]; then
   printf '[OK] Port and /login: http://%s:%s/login\n' "$HOST" "$PORT"
 else
   printf '[FAIL] Port or /login unavailable: http://%s:%s/login\n' "$HOST" "$PORT" >&2

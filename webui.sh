@@ -32,6 +32,7 @@ OPEN_BROWSER="${OPEN_BROWSER:-0}"
 VERBOSE="${VERBOSE:-0}"
 AUTH_CODE="${AUTH_CODE:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+PROC_ROOT="${PROC_ROOT:-/proc}"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
@@ -65,8 +66,87 @@ read_pid() {
   [[ -f "$PID_FILE" ]] && cat "$PID_FILE" 2>/dev/null || true
 }
 
+read_proc_args() {
+  local cmdline="$1" arg
+  PROC_ARGS=()
+  [[ -r "$cmdline" ]] || return 1
+  while IFS= read -r -d '' arg; do
+    PROC_ARGS+=("$arg")
+  done < "$cmdline"
+  [[ "${#PROC_ARGS[@]}" -gt 0 ]]
+}
+
+proc_environment_matches_endpoint() {
+  local environ="$1" entry host_match=0 port_match=0
+  [[ -r "$environ" ]] || return 1
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == "HOST=$HOST" ]] && host_match=1
+    [[ "$entry" == "PORT=$PORT" ]] && port_match=1
+  done < "$environ"
+  [[ "$host_match" -eq 1 && "$port_match" -eq 1 ]]
+}
+
+proc_cmdline_matches_gunicorn() {
+  local proc_dir="$1" expected_gunicorn expected_config index arg gunicorn_index=-1
+  local gunicorn_match=0 config_match=0 app_match=0
+  expected_gunicorn="$ROOT_DIR/.venv/bin/gunicorn"
+  expected_config="$ROOT_DIR/deploy/linux/gunicorn.conf.py"
+  read_proc_args "$proc_dir/cmdline" || return 1
+  if [[ "${PROC_ARGS[0]}" == "$expected_gunicorn" ]]; then
+    gunicorn_index=0
+  elif [[ "${#PROC_ARGS[@]}" -ge 2 && "${PROC_ARGS[1]}" == "$expected_gunicorn" ]]; then
+    case "${PROC_ARGS[0]}" in
+      "$ROOT_DIR/.venv/bin/python"|"$ROOT_DIR/.venv/bin/python"[0-9]*) gunicorn_index=1 ;;
+    esac
+  fi
+  [[ "$gunicorn_index" -ge 0 ]] || return 1
+  gunicorn_match=1
+  for ((index = gunicorn_index + 1; index < ${#PROC_ARGS[@]}; index++)); do
+    arg="${PROC_ARGS[index]}"
+    [[ "$arg" == "webui.app:create_app()" ]] && app_match=1
+    if [[ "$arg" == "--config" && $((index + 1)) -lt ${#PROC_ARGS[@]} && "${PROC_ARGS[index + 1]}" == "$expected_config" ]]; then
+      config_match=1
+    elif [[ "$arg" == "--config=$expected_config" ]]; then
+      config_match=1
+    fi
+  done
+  [[ "$gunicorn_match" -eq 1 && "$config_match" -eq 1 && "$app_match" -eq 1 ]]
+}
+
+proc_cmdline_matches_legacy() {
+  local proc_dir="$1" expected_entry index arg
+  local entry_match=0 host_match=0 port_match=0
+  expected_entry="$ROOT_DIR/web.py"
+  read_proc_args "$proc_dir/cmdline" || return 1
+  for ((index = 0; index < ${#PROC_ARGS[@]}; index++)); do
+    arg="${PROC_ARGS[index]}"
+    [[ "$arg" == "$expected_entry" ]] && entry_match=1
+    if [[ "$arg" == "--host" && $((index + 1)) -lt ${#PROC_ARGS[@]} && "${PROC_ARGS[index + 1]}" == "$HOST" ]]; then
+      host_match=1
+    fi
+    if [[ "$arg" == "--port" && $((index + 1)) -lt ${#PROC_ARGS[@]} && "${PROC_ARGS[index + 1]}" == "$PORT" ]]; then
+      port_match=1
+    fi
+  done
+  [[ "$entry_match" -eq 1 && "$host_match" -eq 1 && "$port_match" -eq 1 ]]
+}
+
 find_pids_by_port() {
-  pgrep -f "python.*web\.py.*--port[ =]${PORT}" 2>/dev/null || true
+  local proc_dir pid ppid parent_dir
+  for proc_dir in "$PROC_ROOT"/[0-9]*; do
+    [[ -d "$proc_dir" ]] || continue
+    pid="${proc_dir##*/}"
+    if proc_cmdline_matches_gunicorn "$proc_dir" && proc_environment_matches_endpoint "$proc_dir/environ"; then
+      ppid="$(awk '$1 == "PPid:" { print $2; exit }' "$proc_dir/status" 2>/dev/null || true)"
+      parent_dir="$PROC_ROOT/${ppid:-0}"
+      if [[ -d "$parent_dir" ]] && proc_cmdline_matches_gunicorn "$parent_dir" && proc_environment_matches_endpoint "$parent_dir/environ"; then
+        continue
+      fi
+      printf '%s\n' "$pid"
+    elif proc_cmdline_matches_legacy "$proc_dir"; then
+      printf '%s\n' "$pid"
+    fi
+  done
 }
 
 get_python() {
@@ -107,17 +187,20 @@ collect_running_pids() {
 }
 
 cmd_start() {
-  local old_pid py pid
-  old_pid="$(read_pid)"
-  if is_running "$old_pid"; then
-    echo "WebUI 已在运行：PID=$old_pid，地址：http://${HOST}:${PORT}"
+  local py pid
+  local existing_pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && existing_pids+=("$pid")
+  done < <(collect_running_pids)
+  if [[ "${#existing_pids[@]}" -gt 0 ]]; then
+    echo "WebUI 已在运行：PID=${existing_pids[*]}，地址：http://${HOST}:${PORT}"
     return 0
   fi
   rm -f "$PID_FILE"
 
   py="$(get_python)"
 
-  local command=("$py" "web.py" "--host" "$HOST" "--port" "$PORT")
+  local command=("$py" "$ROOT_DIR/web.py" "--host" "$HOST" "--port" "$PORT")
   if [[ -x "$ROOT_DIR/.venv/bin/gunicorn" ]]; then
     export HOST PORT
     command=("$ROOT_DIR/.venv/bin/gunicorn"
