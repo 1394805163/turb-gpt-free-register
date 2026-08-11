@@ -71,7 +71,7 @@ cd /opt/turb-gpt-register
 sudo cp -a .env .env.backup.$(date +%Y%m%d%H%M%S)
 git status --short
 git pull --ff-only
-sudo .venv/bin/python -m pip install -r requirements.txt
+sudo deploy/linux/bootstrap.sh --service-user turbgpt --host 127.0.0.1 --port 5000 --no-start
 sudo systemctl restart turb-gpt-register.service
 sudo deploy/linux/doctor.sh --host 127.0.0.1 --port 5000
 ```
@@ -82,7 +82,7 @@ sudo deploy/linux/doctor.sh --host 127.0.0.1 --port 5000
 cd /opt/turb-gpt-register
 git log -2 --oneline
 git checkout --detach HEAD^
-sudo .venv/bin/python -m pip install -r requirements.txt
+sudo deploy/linux/bootstrap.sh --service-user turbgpt --host 127.0.0.1 --port 5000 --no-start
 sudo systemctl restart turb-gpt-register.service
 sudo deploy/linux/doctor.sh --host 127.0.0.1 --port 5000
 ```

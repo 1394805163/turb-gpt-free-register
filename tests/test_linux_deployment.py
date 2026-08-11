@@ -359,13 +359,37 @@ printf 'status=%s\ncontent=%s\n' "$status" "$(cat "$work/units/turb-gpt-register
 class LinuxDocumentationAndCITests(unittest.TestCase):
     def test_ci_targets_ubuntu_2404(self):
         workflow = read(".github/workflows/linux-ci.yml")
+        for command in (
+            "python-version: '3.12'",
+            "python -m pip install -r requirements.txt",
+            "bash -n deploy/linux/*.sh",
+            "python -m unittest tests.test_linux_deployment -v",
+            "python -m compileall -q .",
+            "python -m unittest discover -s tests -v",
+        ):
+            self.assertIn(command, workflow)
         self.assertIn("runs-on: ubuntu-24.04", workflow)
-        self.assertIn("python -m unittest discover -s tests -v", workflow)
+        self.assertNotIn("cloakbrowser install", workflow)
+        self.assertNotIn("secrets", workflow)
 
     def test_linux_docs_cover_two_gib_operations(self):
         docs = read("LINUX_DEPLOY.md")
         for phrase in ("2 核 2 GB", "1 个 Gunicorn worker", "并发上限为 2", "swap", "journalctl"):
             self.assertIn(phrase, docs)
+
+    def test_upgrade_and_rollback_reinstall_unit_before_restart_and_doctor(self):
+        docs = read("LINUX_DEPLOY.md")
+        section = docs[docs.index("## \u5347\u7ea7\u4e0e\u56de\u6eda"):docs.index("## 2C2G \u6392\u67e5\u6e05\u5355")]
+        blocks = section.split("git checkout --detach HEAD^")
+        self.assertEqual(len(blocks), 2)
+        for block in blocks:
+            install = block.index("bootstrap.sh")
+            no_start = block.index("--no-start", install)
+            restart = block.index("sudo systemctl restart turb-gpt-register.service")
+            doctor = block.index("sudo deploy/linux/doctor.sh")
+            self.assertLess(install, no_start)
+            self.assertLess(no_start, restart)
+            self.assertLess(restart, doctor)
 
 if __name__ == "__main__":
     unittest.main()
