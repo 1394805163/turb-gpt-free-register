@@ -314,7 +314,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
             _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500")
             continue
         used_codes.add(str(code))
-        logger.info("[Codex][Browser] 邮箱 OTP 收到：%s", code)
+        logger.info("[Codex][Browser] 邮箱 OTP 已收到，code_len=%s", len(str(code or "")))
         _wait_for_otp_input(driver, timeout=30)
         _clear_otp_inputs(driver)
         _type_otp(driver, code)
@@ -1110,7 +1110,7 @@ def _do_phone_verification_if_present(driver) -> None:
                     activation_id, sms_provider._cfg.SMS_CODE_WAIT, sms_provider._cfg.SMS_POLL_INTERVAL
                 )
                 sms_code = sms_provider.wait_for_sms_code(activation_id, http)
-                logger.info("[Codex][Browser] 手机 OTP 收到：%s", sms_code)
+                logger.info("[Codex][Browser] 手机 OTP 已收到，code_len=%s", len(str(sms_code or "")))
                 _type_otp(driver, sms_code)
                 logger.info("[Codex][Browser] 已填写手机 OTP")
                 human_delay("otp_input")

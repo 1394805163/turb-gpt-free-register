@@ -68,9 +68,17 @@ def _run_plan_check_inner(
     proxy: str | None,
     timezone_offset_min: str,
 ) -> dict:
+    expected_token_fingerprint = db.token_fingerprint(access_token)
     try:
-        if not db.mark_account_plan_check_running(account_id):
-            return {"ok": False, "error": "账号已删除或套餐查询状态已被重置"}
+        if not db.mark_account_plan_check_running(
+            account_id,
+            expected_token_fingerprint=expected_token_fingerprint,
+        ):
+            return {
+                "ok": False,
+                "stale_result_discarded": True,
+                "error": "账号已删除、Token 已刷新或套餐查询状态已被重置",
+            }
 
         _wait_for_rate_slot()
         result = check_account_plan(
@@ -106,7 +114,18 @@ def _run_plan_check_inner(
                     recheck_result.get("error") or "未知错误",
                 )
 
-        db.update_account_plan_check(acc_id=account_id, result=result)
+        plan_updated = db.update_account_plan_check(
+            acc_id=account_id,
+            result=result,
+            expected_token_fingerprint=expected_token_fingerprint,
+        )
+        if not plan_updated:
+            logger.info(
+                "[Plan] 丢弃旧 Token 的套餐查询结果: account_id=%s token_fp=%s",
+                account_id,
+                expected_token_fingerprint,
+            )
+            return {**result, "stale_result_discarded": True}
         if result.get("ok"):
             live_updated = db.update_account_liveness(account_id, {
                 "ok": True,
@@ -114,12 +133,15 @@ def _run_plan_check_inner(
                 "method": "token",
                 "checked_at": result.get("checked_at"),
                 "access_token": access_token,
-            })
+            }, expected_token_fingerprint=expected_token_fingerprint)
             if live_updated:
                 try:
                     from core.chatgpt2api_push import enqueue_account_push
 
-                    push_queued = enqueue_account_push(account_id)
+                    push_queued = enqueue_account_push(
+                        account_id,
+                        expected_token_fingerprint=expected_token_fingerprint,
+                    )
                     if push_queued.get("accepted"):
                         logger.info("[Plan] Token 快速测活成功，推送已入队: account_id=%s", account_id)
                     elif not push_queued.get("disabled"):
@@ -143,6 +165,15 @@ def _run_plan_check_inner(
                 trigger,
             )
         else:
+            if result.get("needs_live_check") is True:
+                db.update_account_liveness(account_id, {
+                    "ok": False,
+                    "status": "temporary_error",
+                    "method": "token",
+                    "checked_at": result.get("checked_at"),
+                    "needs_live_check": True,
+                    "error": result.get("error") or "当前 Token 需要完整登录刷新",
+                }, expected_token_fingerprint=expected_token_fingerprint)
             logger.warning(
                 "[Plan] 后台查询失败: %s, trigger=%s, error=%s",
                 email,
@@ -157,7 +188,11 @@ def _run_plan_check_inner(
             "error": f"{type(exc).__name__}: {str(exc)[:180]}",
         }
         try:
-            db.update_account_plan_check(acc_id=account_id, result=result)
+            db.update_account_plan_check(
+                acc_id=account_id,
+                result=result,
+                expected_token_fingerprint=expected_token_fingerprint,
+            )
         except Exception:
             logger.exception("[Plan] 写入后台查询异常状态失败: account_id=%s", account_id)
         logger.exception("[Plan] 后台查询异常: %s", email)
@@ -190,7 +225,12 @@ def enqueue_account_plan_check(
     if not _QUEUE_SLOTS.acquire(blocking=False):
         return {"accepted": False, "busy": False, "queue_full": True, "error": "套餐查询队列已满，请稍后重试"}
 
-    if not db.claim_account_plan_check(acc_id=account_id, trigger=trigger):
+    expected_token_fingerprint = db.token_fingerprint(access_token)
+    if not db.claim_account_plan_check(
+        acc_id=account_id,
+        trigger=trigger,
+        expected_token_fingerprint=expected_token_fingerprint,
+    ):
         _QUEUE_SLOTS.release()
         return {"accepted": False, "busy": True, "error": "该账号正在查询套餐"}
 
@@ -211,7 +251,11 @@ def enqueue_account_plan_check(
             "checked_at": datetime.now().isoformat(timespec="seconds"),
             "error": f"套餐查询入队失败: {type(exc).__name__}: {str(exc)[:160]}",
         }
-        db.update_account_plan_check(acc_id=account_id, result=result)
+        db.update_account_plan_check(
+            acc_id=account_id,
+            result=result,
+            expected_token_fingerprint=expected_token_fingerprint,
+        )
         return {"accepted": False, "busy": False, "error": result["error"]}
 
     return {

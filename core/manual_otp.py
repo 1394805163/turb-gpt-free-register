@@ -72,7 +72,7 @@ def submit_manual_otp(email: str, code: str) -> dict:
     with _lock:
         _codes[key].append(code)
         _event_for(key).set()
-    logger.info("[ManualOTP] 已提交验证码：email=%s code=%s", email, code)
+    logger.info("[ManualOTP] 已提交验证码，code_len=%s", len(str(code or "")))
     return {"ok": True, "email": email, "code": code}
 
 

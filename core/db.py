@@ -57,6 +57,11 @@ def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
 
 
+def token_fingerprint(token: str) -> str:
+    """返回可用于并发 CAS 的 Token 短哈希，不暴露 Token 明文。"""
+    return _token_fingerprint(token)
+
+
 def _ensure_storage() -> None:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -673,7 +678,17 @@ def insert_account(
         elif current_token_fingerprint != previous_token_fingerprint:
             # access token 变化后必须重新测活并重新推送，旧幂等指纹不能复用。
             row["pipeline_status"] = "pending"
+            # 旧 Token 的 live 状态不能授权新 Token 直接进入推送；必须先由
+            # 新 Token 的套餐快速检查或完整 OTP 登录重新确认。
+            row["live_check_status"] = "pending"
+            row["live_check_ok"] = False
+            row["live_check_method"] = None
+            row["live_check_error"] = None
+            row["plan_check_status"] = "pending"
+            row["plan_check_ok"] = False
+            row["plan_check_error"] = "Token 已更新，等待重新查询"
             row["push_status"] = "pending"
+            row["push_claim_fingerprint"] = None
             row["push_error"] = None
             row["push_next_retry_at"] = None
 
@@ -831,6 +846,7 @@ def claim_account_plan_check(
     acc_id: int | None = None,
     email: str | None = None,
     trigger: str = "manual",
+    expected_token_fingerprint: str | None = None,
 ) -> bool:
     """原子占用账号的套餐查询；已有未超时查询时返回 False。"""
     with _LOCK:
@@ -845,6 +861,11 @@ def claim_account_plan_check(
             return False
 
         current_status = row.get("plan_check_status")
+        if (
+            expected_token_fingerprint is not None
+            and _token_fingerprint(row.get("access_token") or "") != expected_token_fingerprint
+        ):
+            return False
         if current_status in {"queued", "running"}:
             try:
                 stamp_key = "plan_check_queued_at" if current_status == "queued" else "plan_check_started_at"
@@ -867,12 +888,20 @@ def claim_account_plan_check(
         return True
 
 
-def mark_account_plan_check_running(acc_id: int) -> bool:
+def mark_account_plan_check_running(
+    acc_id: int,
+    expected_token_fingerprint: str | None = None,
+) -> bool:
     """把已排队的套餐查询标记为执行中。"""
     with _LOCK:
         accounts = _load_accounts()
         row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None or row.get("plan_check_status") not in {"queued", "running"}:
+            return False
+        if (
+            expected_token_fingerprint is not None
+            and _token_fingerprint(row.get("access_token") or "") != expected_token_fingerprint
+        ):
             return False
         row["plan_check_status"] = "running"
         row["plan_check_started_at"] = _now()
@@ -902,7 +931,12 @@ def recover_interrupted_plan_checks() -> int:
         return recovered
 
 
-def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None) -> bool:
+def update_account_plan_check(
+    acc_id: int | None = None,
+    email: str | None = None,
+    result: dict | None = None,
+    expected_token_fingerprint: str | None = None,
+) -> bool:
     """更新账号套餐/Plus 试用资格查询结果。"""
     result = result or {}
     with _LOCK:
@@ -917,6 +951,11 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
             return False
 
         ok = bool(result.get("ok"))
+        if (
+            expected_token_fingerprint is not None
+            and _token_fingerprint(row.get("access_token") or "") != expected_token_fingerprint
+        ):
+            return False
         row["plan_check_status"] = "success" if ok else "failed"
         row["plan_check_ok"] = ok
         row["plan_checked_at"] = result.get("checked_at") or _now()
@@ -925,9 +964,10 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
         row["plan_check_error"] = None if ok else result.get("error")
         if ok:
             row["needs_live_check"] = False
-        elif result.get("needs_live_check") is not None:
-            # Token 401 只表示需要完整登录刷新，不等于账号已经死亡。
-            row["needs_live_check"] = bool(result.get("needs_live_check"))
+        elif result.get("needs_live_check") is True:
+            # 只有明确的认证失效才置 True；临时网络错误携带 False 时不得
+            # 清除此前已经确认的完整登录刷新需求。
+            row["needs_live_check"] = True
 
         if result.get("account_id"):
             row["account_id"] = result.get("account_id")
@@ -1278,7 +1318,11 @@ def update_account_note(acc_id: int, note: str) -> bool:
         return True
 
 
-def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
+def update_account_liveness(
+    acc_id: int,
+    result: dict | None = None,
+    expected_token_fingerprint: str | None = None,
+) -> bool:
     """写回账号查活结果；成功时同步刷新最新 access_token 和账号基础信息。"""
     result = result or {}
     with _LOCK:
@@ -1288,6 +1332,11 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
             return False
 
         now = _now()
+        if (
+            expected_token_fingerprint is not None
+            and _token_fingerprint(row.get("access_token") or "") != expected_token_fingerprint
+        ):
+            return False
         ok = bool(result.get("ok"))
         status = str(result.get("status") or ("live" if ok else "temporary_error"))
         if status == "deactivated":  # 兼容旧查活结果
@@ -1337,7 +1386,17 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
             row["dead_candidate_checked_at"] = None
             token = str(result.get("access_token") or "").strip()
             if token:
+                previous_fingerprint = _token_fingerprint(row.get("access_token") or "")
                 row["access_token"] = token
+                if _token_fingerprint(token) != previous_fingerprint:
+                    # Token 刷新后，正在执行的旧套餐查询和推送 claim 均作废。
+                    row["plan_check_status"] = "pending"
+                    row["plan_check_ok"] = False
+                    row["plan_check_error"] = "Token 已刷新，等待重新查询"
+                    row["push_status"] = "pending"
+                    row["push_claim_fingerprint"] = None
+                    row["push_error"] = None
+                    row["push_next_retry_at"] = None
             session = result.get("session") or {}
             user = session.get("user") or {}
             account = session.get("account") or {}
@@ -1365,6 +1424,9 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
                 row["push_status"] = "pending"
                 row["push_error"] = None
                 row["push_next_retry_at"] = None
+        elif result.get("needs_live_check") is True:
+            # 401 只说明当前 Token 需要完整登录刷新，不代表账号死亡。
+            row["needs_live_check"] = True
 
         row["copy_line"] = _account_line(row)
         _save_accounts(rows)
@@ -1382,6 +1444,8 @@ def claim_account_push(acc_id: int, token_fingerprint: str) -> str:
             return "not_live"
         if not str(row.get("access_token") or "").strip():
             return "missing_token"
+        if _token_fingerprint(row.get("access_token") or "") != token_fingerprint:
+            return "stale_token"
         if row.get("push_status") == "pushed" and row.get("push_token_fingerprint") == token_fingerprint:
             return "idempotent"
         if row.get("push_status") in {"queued", "running"} and row.get("push_claim_fingerprint") == token_fingerprint:
@@ -1404,11 +1468,17 @@ def record_account_push_attempt(
     error: str | None = None,
     next_retry_at: str | None = None,
     http_status: int | None = None,
+    token_fingerprint: str | None = None,
 ) -> bool:
     with _LOCK:
         rows = _load_accounts()
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
+            return False
+        if token_fingerprint is not None and (
+            _token_fingerprint(row.get("access_token") or "") != token_fingerprint
+            or row.get("push_claim_fingerprint") != token_fingerprint
+        ):
             return False
         row["push_status"] = "running"
         row["push_attempts"] = int(attempt)
@@ -1435,6 +1505,11 @@ def complete_account_push(
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
             return False
+        if (
+            _token_fingerprint(row.get("access_token") or "") != token_fingerprint
+            or row.get("push_claim_fingerprint") != token_fingerprint
+        ):
+            return False
         now = _now()
         row["push_status"] = "pushed" if success else "push_failed"
         row["pipeline_status"] = "pushed" if success else "push_failed"
@@ -1450,6 +1525,21 @@ def complete_account_push(
         row["updated_at"] = now
         _save_accounts(rows)
         return True
+
+
+def is_account_push_claim_current(acc_id: int, token_fingerprint: str) -> bool:
+    """检查 worker 持有的推送 claim 是否仍对应数据库中的当前 Token。"""
+    with _LOCK:
+        row = next(
+            (r for r in _load_accounts() if int(r.get("id") or 0) == int(acc_id)),
+            None,
+        )
+        return bool(
+            row
+            and _token_fingerprint(row.get("access_token") or "") == token_fingerprint
+            and row.get("push_claim_fingerprint") == token_fingerprint
+            and row.get("push_status") == "running"
+        )
 
 
 def list_push_candidate_ids(limit: int = 500) -> list[int]:

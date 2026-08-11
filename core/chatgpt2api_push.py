@@ -57,7 +57,12 @@ def _account_payload(account: dict) -> dict:
     return payload
 
 
-def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
+def push_account(
+    account_id: int,
+    *,
+    expected_token_fingerprint: str | None = None,
+    sleep_fn=time.sleep,
+) -> dict:
     """同步推送一个已测活账号；用于后台 worker，也便于单元测试。"""
     account_id = int(account_id)
     if not bool(getattr(cfg, "CHATGPT2API_PUSH_ENABLED", False)):
@@ -68,25 +73,16 @@ def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
         return {"ok": False, "status": "missing", "error": "账号不存在"}
     token = str(account.get("access_token") or "").strip()
     fingerprint = token_fingerprint(token)
-    endpoint = _endpoint()
-    admin_key = str(getattr(cfg, "CHATGPT2API_ADMIN_KEY", "") or "").strip()
-    if not endpoint or not admin_key:
-        error = "chatgpt2api_config_incomplete"
-        db.complete_account_push(
-            account_id,
-            success=False,
-            token_fingerprint=fingerprint,
-            attempts=0,
-            error=error,
-        )
-        logger.error(
-            "[chatgpt2api] 配置不完整，已持久化失败 account_id=%s token_fp=%s token_len=%s",
-            account_id,
-            fingerprint,
-            len(token),
-        )
-        return {"ok": False, "status": "push_failed", "error": error}
-
+    if (
+        expected_token_fingerprint is not None
+        and str(expected_token_fingerprint) != fingerprint
+    ):
+        return {
+            "ok": False,
+            "status": "stale_token",
+            "account_id": account_id,
+            "error": "Token 已刷新，丢弃旧推送任务",
+        }
     claim = db.claim_account_push(account_id, fingerprint)
     if claim == "idempotent":
         logger.info("[chatgpt2api] 幂等跳过 account_id=%s token_fp=%s token_len=%s", account_id, fingerprint, len(token))
@@ -95,8 +91,31 @@ def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
         return {"ok": False, "status": "busy", "busy": True, "account_id": account_id}
     if claim == "not_live":
         return {"ok": False, "status": "pending", "error": "账号尚未测活成功"}
+    if claim == "stale_token":
+        return {"ok": False, "status": "stale_token", "error": "Token 已刷新，丢弃旧推送任务"}
     if claim != "claimed":
         return {"ok": False, "status": "push_failed", "error": claim}
+
+    endpoint = _endpoint()
+    admin_key = str(getattr(cfg, "CHATGPT2API_ADMIN_KEY", "") or "").strip()
+    if not endpoint or not admin_key:
+        error = "chatgpt2api_config_incomplete"
+        completed = db.complete_account_push(
+            account_id,
+            success=False,
+            token_fingerprint=fingerprint,
+            attempts=0,
+            error=error,
+        )
+        if not completed:
+            return {"ok": False, "status": "stale_token", "error": "Token 已刷新，丢弃旧推送任务"}
+        logger.error(
+            "[chatgpt2api] 配置不完整，已持久化失败 account_id=%s token_fp=%s token_len=%s",
+            account_id,
+            fingerprint,
+            len(token),
+        )
+        return {"ok": False, "status": "push_failed", "error": error}
 
     max_attempts = max(1, int(getattr(cfg, "CHATGPT2API_MAX_RETRIES", 3) or 3))
     timeout = max(0.1, float(getattr(cfg, "CHATGPT2API_TIMEOUT", 10.0) or 10.0))
@@ -111,19 +130,38 @@ def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
     last_http_status = None
 
     for attempt in range(1, max_attempts + 1):
+        if not db.is_account_push_claim_current(account_id, fingerprint):
+            return {
+                "ok": False,
+                "status": "stale_token",
+                "account_id": account_id,
+                "error": "Token 已刷新，丢弃旧推送任务",
+            }
         response = None
         retryable = False
         try:
             response = requests.post(endpoint, headers=headers, json=body, timeout=timeout)
             last_http_status = int(response.status_code)
             if 200 <= response.status_code < 300 or response.status_code == 409:
-                db.complete_account_push(
+                completed = db.complete_account_push(
                     account_id,
                     success=True,
                     token_fingerprint=fingerprint,
                     attempts=attempt,
                     http_status=response.status_code,
                 )
+                if not completed:
+                    logger.info(
+                        "[chatgpt2api] 推送响应已过期，未覆盖新 Token 状态 account_id=%s token_fp=%s",
+                        account_id,
+                        fingerprint,
+                    )
+                    return {
+                        "ok": False,
+                        "status": "stale_token",
+                        "account_id": account_id,
+                        "error": "Token 已刷新，丢弃旧推送响应",
+                    }
                 logger.info(
                     "[chatgpt2api] 推送成功 account_id=%s token_fp=%s token_len=%s attempts=%s http=%s",
                     account_id, fingerprint, len(token), attempt, response.status_code,
@@ -147,13 +185,21 @@ def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
         if retryable and attempt < max_attempts:
             delay = backoff_base * (2 ** (attempt - 1))
             next_retry_at = (datetime.now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
-            db.record_account_push_attempt(
+            recorded = db.record_account_push_attempt(
                 account_id,
                 attempt=attempt,
                 error=last_error,
                 next_retry_at=next_retry_at,
                 http_status=last_http_status,
+                token_fingerprint=fingerprint,
             )
+            if not recorded:
+                return {
+                    "ok": False,
+                    "status": "stale_token",
+                    "account_id": account_id,
+                    "error": "Token 已刷新，停止旧推送重试",
+                }
             logger.warning(
                 "[chatgpt2api] 临时失败，指数退避 account_id=%s token_fp=%s token_len=%s attempt=%s/%s wait=%.3fs error=%s",
                 account_id, fingerprint, len(token), attempt, max_attempts, delay, last_error,
@@ -162,7 +208,7 @@ def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
             continue
         break
 
-    db.complete_account_push(
+    completed = db.complete_account_push(
         account_id,
         success=False,
         token_fingerprint=fingerprint,
@@ -170,6 +216,13 @@ def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
         error=last_error,
         http_status=last_http_status,
     )
+    if not completed:
+        return {
+            "ok": False,
+            "status": "stale_token",
+            "account_id": account_id,
+            "error": "Token 已刷新，丢弃旧推送结果",
+        }
     logger.error(
         "[chatgpt2api] 推送失败 account_id=%s token_fp=%s token_len=%s attempts=%s error=%s",
         account_id, fingerprint, len(token), attempt, last_error,
@@ -184,22 +237,36 @@ def push_account(account_id: int, *, sleep_fn=time.sleep) -> dict:
     }
 
 
-def _run_queued_push(account_id: int) -> dict:
+def _run_queued_push(
+    account_id: int,
+    expected_token_fingerprint: str | None = None,
+) -> dict:
     try:
         with pipeline_slot("push"):
-            return push_account(account_id)
+            return push_account(
+                account_id,
+                expected_token_fingerprint=expected_token_fingerprint,
+            )
     finally:
         _QUEUE_SLOTS.release()
 
 
-def enqueue_account_push(account_id: int) -> dict:
+def enqueue_account_push(
+    account_id: int,
+    *,
+    expected_token_fingerprint: str | None = None,
+) -> dict:
     """把测活成功账号加入推送队列；队列线程仍受全局 2 槽闸门限制。"""
     if not bool(getattr(cfg, "CHATGPT2API_PUSH_ENABLED", False)):
         return {"accepted": False, "disabled": True, "status": "disabled"}
     if not _QUEUE_SLOTS.acquire(blocking=False):
         return {"accepted": False, "queue_full": True, "error": "推送队列已满"}
     try:
-        _EXECUTOR.submit(_run_queued_push, int(account_id))
+        _EXECUTOR.submit(
+            _run_queued_push,
+            int(account_id),
+            expected_token_fingerprint,
+        )
     except Exception as exc:
         _QUEUE_SLOTS.release()
         return {"accepted": False, "error": type(exc).__name__}
@@ -211,7 +278,14 @@ def resume_pending_pushes(limit: int = 500) -> dict:
     accepted = 0
     skipped = 0
     for account_id in db.list_push_candidate_ids(limit=limit):
-        result = enqueue_account_push(account_id)
+        account = db.get_account(account_id)
+        if not account:
+            skipped += 1
+            continue
+        result = enqueue_account_push(
+            account_id,
+            expected_token_fingerprint=token_fingerprint(account.get("access_token") or ""),
+        )
         if result.get("accepted"):
             accepted += 1
         else:

@@ -238,7 +238,7 @@ def _validate_reauth_otp(session: BrowserSession, code: str) -> str:
     headers = session.get_auth_headers(referer="https://auth.openai.com/email-verification")
     body = json.dumps({"code": code})
 
-    logger.info(f"[2FA] 提交重认证 OTP: {code}")
+    logger.info("[2FA] 提交重认证 OTP，code_len=%s", len(str(code or "")))
     resp = session.post(url, headers=headers, data=body)
     resp.raise_for_status()
     data = resp.json()
@@ -279,14 +279,17 @@ def _enroll_totp(session: BrowserSession, access_token: str) -> tuple[str, str]:
     logger.info("[2FA] 注册 TOTP...")
     resp = session.post(url, headers=headers, data=body)
     if resp.status_code != 200:
-        logger.error(f"[2FA] enroll 失败 {resp.status_code}: {resp.text}")
+        logger.error("[2FA] enroll 失败 status=%s", resp.status_code)
         resp.raise_for_status()
     data = resp.json()
     secret = data.get("secret")
     session_id = data.get("session_id")
     if not secret or not session_id:
-        raise RuntimeError(f"enroll 响应字段缺失: {data}")
-    logger.info(f"[2FA] TOTP secret 已获取: {secret[:4]}...{secret[-4:]}")
+        raise RuntimeError(
+            "enroll 响应字段缺失: secret_present=%s session_id_present=%s"
+            % (bool(secret), bool(session_id))
+        )
+    logger.info("[2FA] TOTP secret 已获取，secret_len=%s", len(secret))
     return secret, session_id
 
 
@@ -312,14 +315,14 @@ def _activate_totp(
         "session_id": session_id,
     })
 
-    logger.info(f"[2FA] 激活 enrollment, code={totp_code}")
+    logger.info("[2FA] 激活 enrollment，code_len=%s", len(totp_code))
     resp = session.post(url, headers=headers, data=body)
     if resp.status_code != 200:
-        logger.error(f"[2FA] activate 失败 {resp.status_code}: {resp.text}")
+        logger.error("[2FA] activate 失败 status=%s", resp.status_code)
         resp.raise_for_status()
     data = resp.json()
     if not data.get("success"):
-        raise RuntimeError(f"激活返回 success=false: {data}")
+        raise RuntimeError("激活返回 success=false")
     return True
 
 
@@ -374,7 +377,7 @@ def setup_2fa(session: BrowserSession, email: str, otp_code: str | None = None) 
     _activate_totp(session, new_token, secret, session_id)
 
     logger.info("=" * 60)
-    logger.info(f"✅ 2FA 设置完成! Secret: {secret[:4]}...{secret[-4:]}")
+    logger.info("✅ 2FA 设置完成，secret_len=%s", len(secret))
     logger.info("=" * 60)
     return secret
 

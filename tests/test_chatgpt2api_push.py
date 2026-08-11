@@ -11,7 +11,8 @@ import requests
 from config import chatgpt2api as push_config
 from core import db
 from core.account_export import fetch_session
-from core.chatgpt2api_push import push_account, token_fingerprint
+from core import chatgpt2api_push
+from core.chatgpt2api_push import enqueue_account_push, push_account, token_fingerprint
 
 
 class Chatgpt2ApiPushTests(unittest.TestCase):
@@ -133,6 +134,122 @@ class Chatgpt2ApiPushTests(unittest.TestCase):
         self.assertEqual(stored["push_status"], "push_failed")
         self.assertEqual(stored["pipeline_status"], "live")
         self.assertIn(self.account_id, db.list_push_candidate_ids())
+
+    def test_push_claim_rejects_a_fingerprint_that_is_not_the_current_token(self):
+        stale_fingerprint = token_fingerprint("previous-token")
+
+        claim = db.claim_account_push(self.account_id, stale_fingerprint)
+
+        self.assertEqual(claim, "stale_token")
+        stored = db.get_account(self.account_id)
+        self.assertNotEqual(stored.get("push_claim_fingerprint"), stale_fingerprint)
+
+    @patch("core.chatgpt2api_push.requests.post")
+    def test_queued_old_token_fingerprint_cannot_push_a_replacement_token(self, post):
+        old_fingerprint = token_fingerprint("secret-access-token")
+        db.insert_account(
+            email="live@example.com",
+            access_token="replacement-token-not-yet-checked",
+            user_id="user-1",
+        )
+
+        result = push_account(
+            self.account_id,
+            expected_token_fingerprint=old_fingerprint,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "stale_token")
+        post.assert_not_called()
+
+    def test_enqueue_carries_expected_token_fingerprint_into_worker(self):
+        expected = token_fingerprint("secret-access-token")
+        with patch.object(chatgpt2api_push, "_EXECUTOR") as executor, patch.object(
+            chatgpt2api_push, "_QUEUE_SLOTS"
+        ) as slots:
+            slots.acquire.return_value = True
+            result = enqueue_account_push(
+                self.account_id,
+                expected_token_fingerprint=expected,
+            )
+
+        self.assertTrue(result["accepted"])
+        executor.submit.assert_called_once_with(
+            chatgpt2api_push._run_queued_push,
+            self.account_id,
+            expected,
+        )
+
+    def test_replaced_token_cannot_reuse_the_previous_tokens_live_status(self):
+        replaced_id = db.insert_account(
+            email="live@example.com",
+            access_token="replacement-token",
+            user_id="user-1",
+        )
+
+        stored = db.get_account(replaced_id)
+        self.assertNotEqual(stored.get("live_check_status"), "live")
+        self.assertEqual(
+            db.claim_account_push(replaced_id, token_fingerprint("replacement-token")),
+            "not_live",
+        )
+
+    def test_old_push_worker_cannot_complete_after_token_refresh(self):
+        old_fingerprint = token_fingerprint("secret-access-token")
+        self.assertEqual(db.claim_account_push(self.account_id, old_fingerprint), "claimed")
+        self.assertTrue(db.update_account_liveness(self.account_id, {
+            "ok": True,
+            "status": "live",
+            "method": "otp",
+            "access_token": "refreshed-secret-token",
+        }))
+        new_fingerprint = token_fingerprint("refreshed-secret-token")
+        self.assertEqual(db.claim_account_push(self.account_id, new_fingerprint), "claimed")
+
+        self.assertFalse(db.complete_account_push(
+            self.account_id,
+            success=True,
+            token_fingerprint=old_fingerprint,
+            attempts=1,
+            http_status=200,
+        ))
+        middle = db.get_account(self.account_id)
+        self.assertEqual(middle["push_status"], "running")
+        self.assertEqual(middle["push_claim_fingerprint"], new_fingerprint)
+        self.assertNotEqual(middle.get("push_token_fingerprint"), old_fingerprint)
+
+        self.assertTrue(db.complete_account_push(
+            self.account_id,
+            success=True,
+            token_fingerprint=new_fingerprint,
+            attempts=1,
+            http_status=200,
+        ))
+        stored = db.get_account(self.account_id)
+        self.assertEqual(stored["push_status"], "pushed")
+        self.assertEqual(stored["push_token_fingerprint"], new_fingerprint)
+
+    @patch("core.chatgpt2api_push.requests.post")
+    def test_push_response_for_old_token_is_reported_as_stale_not_success(self, post):
+        def refresh_token_before_response(*_args, **_kwargs):
+            db.update_account_liveness(self.account_id, {
+                "ok": True,
+                "status": "live",
+                "method": "otp",
+                "access_token": "new-token-during-push",
+            })
+            return self._response(200)
+
+        post.side_effect = refresh_token_before_response
+
+        result = push_account(self.account_id, sleep_fn=lambda _seconds: None)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "stale_token")
+        stored = db.get_account(self.account_id)
+        self.assertEqual(stored["access_token"], "new-token-during-push")
+        self.assertNotEqual(stored.get("push_token_fingerprint"), token_fingerprint("secret-access-token"))
 
     def test_enabled_push_with_incomplete_config_persists_push_failed(self):
         with patch.object(push_config, "CHATGPT2API_BASE_URL", ""), patch.object(

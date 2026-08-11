@@ -67,7 +67,10 @@ class FastLivenessPushTests(unittest.TestCase):
         self.assertEqual(stored["live_check_status"], "live")
         self.assertEqual(stored["live_check_method"], "token")
         self.assertEqual(stored["access_token"], "fixture-access-token")
-        enqueue.assert_called_once_with(self.account_id)
+        enqueue.assert_called_once_with(
+            self.account_id,
+            expected_token_fingerprint=db.token_fingerprint("fixture-access-token"),
+        )
 
     def test_unauthorized_plan_check_requests_login_refresh_without_marking_dead(self):
         enqueue = Mock(return_value={"accepted": True})
@@ -86,7 +89,71 @@ class FastLivenessPushTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         stored = db.get_account(self.account_id)
         self.assertTrue(stored["needs_live_check"])
-        self.assertNotEqual(stored.get("live_check_status"), "confirmed_dead")
+        self.assertEqual(stored["live_check_status"], "temporary_error")
+        self.assertEqual(stored["pipeline_status"], "temporary_error")
+        self.assertNotEqual(stored.get("codex_status"), "deactivated")
+        enqueue.assert_not_called()
+
+    def test_temporary_plan_failure_does_not_clear_existing_login_refresh_requirement(self):
+        db.update_account_liveness(self.account_id, {
+            "ok": False,
+            "status": "temporary_error",
+            "needs_live_check": True,
+            "error": "refresh required",
+        })
+        enqueue = Mock(return_value={"accepted": True})
+
+        self._run_plan_result(
+            {
+                "ok": False,
+                "checked_at": "2026-08-11T10:00:00",
+                "http_status": 503,
+                "needs_live_check": False,
+                "error": "temporary upstream error",
+            },
+            enqueue,
+        )
+
+        stored = db.get_account(self.account_id)
+        self.assertTrue(stored["needs_live_check"])
+        enqueue.assert_not_called()
+
+    def test_stale_plan_worker_cannot_overwrite_a_refreshed_token_or_enqueue_it(self):
+        enqueue = Mock(return_value={"accepted": True})
+        self.assertTrue(db.claim_account_plan_check(acc_id=self.account_id, trigger="manual"))
+
+        def refresh_then_return_old_result(*_args, **_kwargs):
+            self.assertTrue(db.update_account_liveness(self.account_id, {
+                "ok": True,
+                "status": "live",
+                "method": "otp",
+                "access_token": "refreshed-token",
+            }))
+            return {
+                "ok": True,
+                "checked_at": "2026-08-11T10:00:00",
+                "current_plan_type": "plus",
+            }
+
+        with patch.object(plan_check_service, "check_account_plan", side_effect=refresh_then_return_old_result), patch.object(
+            plan_check_service, "_wait_for_rate_slot", return_value=None
+        ), patch.object(plan_check_service, "_QUEUE_SLOTS"), patch(
+            "core.chatgpt2api_push.enqueue_account_push", enqueue
+        ):
+            result = plan_check_service._run_plan_check_inner(
+                account_id=self.account_id,
+                email="alias@icloud.com",
+                access_token="fixture-access-token",
+                trigger="manual",
+                proxy=None,
+                timezone_offset_min="-",
+            )
+
+        stored = db.get_account(self.account_id)
+        self.assertTrue(result.get("stale_result_discarded"))
+        self.assertEqual(stored["access_token"], "refreshed-token")
+        self.assertEqual(stored["live_check_method"], "otp")
+        self.assertNotEqual(stored.get("current_plan_type"), "plus")
         enqueue.assert_not_called()
 
     def test_registration_save_only_queues_token_plan_check_not_otp_login(self):

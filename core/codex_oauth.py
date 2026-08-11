@@ -1425,7 +1425,7 @@ def run_codex_oauth(
                 otp_after_ts = time.time()
                 _submit_email(session, email)
                 human_delay("api")
-        logger.info(f"[Codex] 邮箱 OTP 收到：{email_otp}")
+        logger.info("[Codex] 邮箱 OTP 已收到，code_len=%s", len(str(email_otp or "")))
         human_delay("otp_input")
         _submit_email_otp(session, email_otp)
         human_delay("api")

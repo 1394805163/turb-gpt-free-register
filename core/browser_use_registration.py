@@ -23,7 +23,7 @@ from config import browser_use as _cfg
 from config import twofa as _twofa_cfg
 from core.account_export import save_account_data
 from core.browser_use_client import BrowserUseClient
-from core.email_provider import resolve_email_source, wait_for_otp
+from core.email_provider import OtpWaitSession, resolve_email_source, wait_for_otp
 from core.humanize import delay as human_delay
 
 logger = logging.getLogger(__name__)
@@ -1604,7 +1604,13 @@ def _browser_use_heartbeat(page, context=None, label: str = ""):
 
 
 
-def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: float) -> str:
+def _wait_for_otp_with_browser_heartbeat(
+    page,
+    context,
+    email: str,
+    after_ts: float,
+    otp_wait_session: OtpWaitSession,
+) -> str:
     """短轮询邮箱 OTP；每轮之间触碰页面，避免 Browser Use Cloud 长时间无页面活动被回收。"""
     try:
         from config import email as _email_cfg
@@ -1619,15 +1625,17 @@ def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: fl
     # Graph/REST/IMAP 兜底就被上层判超时；这里放宽到最多 30s，仍在每轮之间做页面心跳。
     slice_wait = max(15, min(30, total_wait))
     slice_settle = max(0, min(settle, 5))
-    deadline = time.time() + total_wait
     last_exc: Exception | None = None
     attempt = 0
 
-    while time.time() < deadline:
+    while True:
         _check_manual_stop()
         attempt += 1
         page = _browser_use_heartbeat(page, context=context, label=f"otp-before-{attempt}")
-        remaining = max(1, int(deadline - time.time()))
+        try:
+            remaining = otp_wait_session.remaining_seconds()
+        except TimeoutError:
+            break
         wait_this_round = min(slice_wait, remaining)
         logger.info(
             "[BrowserUse][OTP] 邮箱短轮询：%s，第 %s 轮，最长 %ss（总剩余 %ss）",
@@ -1637,7 +1645,7 @@ def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: fl
             remaining,
         )
         try:
-            return wait_for_otp(
+            return otp_wait_session.wait(
                 email,
                 after_ts=after_ts,
                 max_wait=wait_this_round,
@@ -1648,8 +1656,6 @@ def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: fl
             last_exc = exc
             if _is_target_closed_error(exc):
                 raise
-            if time.time() >= deadline:
-                break
             logger.info("[BrowserUse][OTP] 本轮未取到验证码，保持云端页面活跃后继续：%s: %s", type(exc).__name__, str(exc)[:220])
             page = _browser_use_heartbeat(page, context=context, label=f"otp-after-{attempt}")
             time.sleep(0.5 if _fast_mode() else 1.0)
@@ -1954,6 +1960,7 @@ def run_browser_use_registration(
                     logger.warning("[BrowserUse][OTP] 重新触发邮箱 OTP 失败，继续按当前页面处理：%s: %s", type(restart_exc).__name__, str(restart_exc)[:180])
 
             current_otp = otp_code
+            otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
             max_otp_attempts = 3
             for otp_attempt in range(1, max_otp_attempts + 1):
                 # 等验证码页出现
@@ -1979,7 +1986,13 @@ def run_browser_use_registration(
                     logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", email, otp_attempt, max_otp_attempts)
                     _t_otp_wait = _StepTimer("等待邮箱 OTP")
                     try:
-                        current_otp = _wait_for_otp_with_browser_heartbeat(page, context, email, after_ts=otp_after_ts)
+                        current_otp = _wait_for_otp_with_browser_heartbeat(
+                            page,
+                            context,
+                            email,
+                            after_ts=otp_after_ts,
+                            otp_wait_session=otp_wait_session,
+                        )
                         page = _pick_live_page(context, page) or page
                         _t_otp_wait.done()
                     except Exception as exc:
@@ -1998,7 +2011,8 @@ def run_browser_use_registration(
                         _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500/chrome-error")
                         current_otp = None
                         continue
-                logger.info("[BrowserUse][OTP] 收到验证码：%s", current_otp)
+                otp_wait_session.mark_used(current_otp)
+                logger.info("[BrowserUse][OTP] 已收到验证码，code_len=%s", len(str(current_otp or "")))
                 _t_otp_submit = _StepTimer("提交邮箱 OTP")
                 _clear_otp_inputs(page)
                 _type_otp(page, current_otp)

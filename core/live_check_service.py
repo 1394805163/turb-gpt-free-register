@@ -87,7 +87,12 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
             _append_log(email, "[查活] 完成：账号正常，已刷新最新 AT/accessToken")
             try:
                 from core.chatgpt2api_push import enqueue_account_push
-                pushed = enqueue_account_push(account_id)
+                pushed = enqueue_account_push(
+                    account_id,
+                    expected_token_fingerprint=db.token_fingerprint(
+                        result.get("access_token") or ""
+                    ),
+                )
                 if pushed.get("accepted"):
                     _append_log(email, "[推送] 测活成功，已进入 chatgpt2api 推送队列")
                 elif not pushed.get("disabled"):

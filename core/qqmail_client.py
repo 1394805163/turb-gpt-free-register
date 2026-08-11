@@ -332,13 +332,16 @@ def fetch_latest_otp(
             if ts > best_ts:
                 if best_otp:
                     logger.info(
-                        f"[QQMail] 发现更晚的 OTP={otp} (ts={raw_ts}), "
-                        f"替换之前的 {best_otp}, 重置 settle 计时"
+                        "[QQMail] 发现更晚的 OTP，code_len=%s ts=%s，替换旧候选并重置 settle",
+                        len(str(otp or "")),
+                        raw_ts,
                     )
                 else:
                     logger.info(
-                        f"[QQMail] 首次锁定 OTP={otp}, ts={raw_ts}, "
-                        f"subject={subject!r}, 等 {settle}s 看是否有更晚邮件..."
+                        "[QQMail] 首次锁定 OTP，code_len=%s ts=%s，等 %ss 看是否有更晚邮件...",
+                        len(str(otp or "")),
+                        raw_ts,
+                        settle,
                     )
                 best_otp = otp
                 best_ts = ts
@@ -350,15 +353,19 @@ def fetch_latest_otp(
         now = time.time()
         if best_otp and settle_until is not None and now >= settle_until:
             logger.info(
-                f"[QQMail] settle 完成，返回 OTP={best_otp}, subject={best_subject!r}"
+                "[QQMail] settle 完成，返回 OTP，code_len=%s",
+                len(str(best_otp or "")),
             )
             return best_otp
 
         remaining = int(deadline - now)
         if best_otp:
             logger.info(
-                f"[QQMail] 已锁定候选 OTP={best_otp}，等 settle 中"
-                f"（剩余 settle ~{int(settle_until - now)}s, 总剩余 {remaining}s）..."
+                "[QQMail] 已锁定候选 OTP，code_len=%s，等 settle 中"
+                "（剩余 settle ~%ss, 总剩余 %ss）...",
+                len(str(best_otp or "")),
+                int(settle_until - now),
+                remaining,
             )
         else:
             logger.info(
@@ -369,7 +376,8 @@ def fetch_latest_otp(
     # 超时但有候选
     if best_otp:
         logger.warning(
-            f"[QQMail] 总超时但已有候选，返回 OTP={best_otp} (subject={best_subject!r})"
+            "[QQMail] 总超时但已有候选，返回 OTP，code_len=%s",
+            len(str(best_otp or "")),
         )
         return best_otp
 

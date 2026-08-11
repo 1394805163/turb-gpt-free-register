@@ -721,7 +721,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
             _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500")
             continue
         used_codes.add(str(code))
-        logger.info("[Codex][BrowserUse] 邮箱 OTP 收到：%s", code)
+        logger.info("[Codex][BrowserUse] 邮箱 OTP 已收到，code_len=%s", len(str(code or "")))
         _t_otp_submit = _StepTimer("提交邮箱 OTP")
         _clear_otp_inputs(page)
         _type_otp(page, code)
@@ -1213,7 +1213,7 @@ def _do_phone_verification_if_present(page) -> None:
             _t_sms = _StepTimer(f"等待手机短信 attempt={attempt}")
             sms_code = sms_provider.wait_for_sms_code(activation_id, http)
             _t_sms.done()
-            logger.info("[Codex][BrowserUse] 手机 OTP 收到：%s", sms_code)
+            logger.info("[Codex][BrowserUse] 手机 OTP 已收到，code_len=%s", len(str(sms_code or "")))
             _clear_otp_inputs(page)
             _type_otp(page, sms_code)
             _bu_delay("otp_input")

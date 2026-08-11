@@ -157,6 +157,22 @@ class ICloudMailboxPoolTests(unittest.TestCase):
 
         self.assertEqual(code, "456789")
 
+    def test_recipient_matching_is_exact_not_header_substring(self):
+        """目标地址只是另一收件人的子串时，绝不能读取其 OTP。"""
+        target = "target@icloud.com"
+        imap = ScriptedIMAP(
+            snapshots=[[b"22"]],
+            messages={b"22": otp_mail("x-target@icloud.com", "456780")},
+        )
+        pool = self.pool()
+
+        with patch.object(pool, "_connect_imap", return_value=imap), patch(
+            "core.icloud_mail_pool.time.sleep", return_value=None
+        ):
+            code = pool.wait_for_code(self.mailbox(target))
+
+        self.assertIsNone(code)
+
     def test_uidvalidity_change_rebuilds_uid_baseline_without_reusing_old_messages(self):
         """抓住回归：邮箱 UID 空间重建后，新 UID 可能小于旧基线，必须重置 UID 状态。"""
         target = "alias@icloud.com"
@@ -192,6 +208,251 @@ class ICloudMailboxPoolTests(unittest.TestCase):
 
         self.assertEqual(code, "678901")
         self.assertEqual(imap.fetch_counts[b"12"], 2)
+
+    def test_imap_connection_timeout_is_bounded_by_remaining_otp_budget(self):
+        target = "alias@icloud.com"
+        imap = ScriptedIMAP(
+            snapshots=[[b"13"]],
+            messages={b"13": otp_mail(target, "679012")},
+        )
+        pool = self.pool(wait_timeout=0.05)
+
+        with patch.object(pool, "_connect_imap", return_value=imap) as connect:
+            code = pool.wait_for_code(self.mailbox(target))
+
+        self.assertEqual(code, "679012")
+        timeout = connect.call_args.kwargs["request_timeout"]
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 0.051)
+
+    def test_connect_login_and_select_each_rebind_the_same_deadline(self):
+        class FakeClock:
+            def __init__(self):
+                self.now = 300.0
+
+            def monotonic(self):
+                return self.now
+
+            def advance(self, seconds=0.01):
+                self.now += seconds
+
+        clock = FakeClock()
+        constructor_timeouts: list[float] = []
+        socket_timeouts: list[float] = []
+
+        class FakeSocket:
+            timeout = 30.0
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+                socket_timeouts.append(timeout)
+
+        class HandshakeIMAP:
+            def __init__(self):
+                self.sock = FakeSocket()
+
+            def login(self, _username, _password):
+                clock.advance(min(0.01, self.sock.timeout))
+                return "OK", []
+
+            def select(self, _mailbox, readonly=True):
+                clock.advance(min(0.01, self.sock.timeout))
+                return "OK", []
+
+            def logout(self):
+                return "BYE", []
+
+        def construct(_host, _port, *, timeout):
+            constructor_timeouts.append(timeout)
+            clock.advance(min(0.01, timeout))
+            return HandshakeIMAP()
+
+        pool = self.pool(
+            imap_username="main@icloud.com",
+            imap_password="fixture-password",
+            request_timeout=30,
+        )
+        with patch("core.icloud_mail_pool.imaplib.IMAP4_SSL", side_effect=construct), patch(
+            "core.icloud_mail_pool.time.monotonic", side_effect=clock.monotonic
+        ):
+            imap = pool._connect_imap(deadline=300.05)
+
+        self.assertIsInstance(imap, HandshakeIMAP)
+        self.assertEqual(len(constructor_timeouts), 1)
+        self.assertEqual(len(socket_timeouts), 2)
+        all_timeouts = constructor_timeouts + socket_timeouts
+        self.assertTrue(all(a > b for a, b in zip(all_timeouts, all_timeouts[1:])))
+        self.assertTrue(all(0 < timeout <= 0.051 for timeout in all_timeouts))
+
+    def test_logout_uses_remaining_budget_and_expired_deadline_aborts_socket(self):
+        class FakeClock:
+            def __init__(self, now):
+                self.now = now
+
+            def monotonic(self):
+                return self.now
+
+        clock = FakeClock(400.024)
+
+        class FakeSocket:
+            def __init__(self):
+                self.timeout = 30.0
+                self.closed = False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def close(self):
+                self.closed = True
+
+        class ClosingIMAP:
+            def __init__(self):
+                self.sock = FakeSocket()
+                self.logout_calls = 0
+
+            def logout(self):
+                self.logout_calls += 1
+                clock.now += min(0.01, self.sock.timeout)
+                return "BYE", []
+
+        pool = self.pool()
+        before_deadline = ClosingIMAP()
+        with patch("core.icloud_mail_pool.time.monotonic", side_effect=clock.monotonic):
+            pool._close_imap(before_deadline, deadline=400.025)
+
+        self.assertEqual(before_deadline.logout_calls, 1)
+        self.assertLessEqual(clock.now, 400.025 + 1e-9)
+
+        expired = ClosingIMAP()
+        clock.now = 400.025
+        with patch("core.icloud_mail_pool.time.monotonic", side_effect=clock.monotonic):
+            pool._close_imap(expired, deadline=400.025)
+
+        self.assertEqual(expired.logout_calls, 0)
+        self.assertTrue(expired.sock.closed)
+
+    def test_each_imap_io_rebinds_socket_to_the_decreasing_total_budget(self):
+        """NOOP、SEARCH 和每次 FETCH 都必须重新使用同一个总截止时间。"""
+        target = "alias@icloud.com"
+
+        class FakeClock:
+            def __init__(self):
+                self.now = 100.0
+
+            def monotonic(self):
+                return self.now
+
+            def advance(self, seconds=0.01):
+                self.now += seconds
+
+        clock = FakeClock()
+
+        class FakeSocket:
+            def __init__(self):
+                self.timeout = 30.0
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+        class TimedIMAP(ScriptedIMAP):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.sock = FakeSocket()
+
+            def noop(self):
+                result = super().noop()
+                clock.advance(min(0.01, self.sock.timeout))
+                return result
+
+            def uid(self, command, *args):
+                result = super().uid(command, *args)
+                clock.advance(min(0.01, self.sock.timeout))
+                return result
+
+        imap = TimedIMAP(
+            snapshots=[[b"60", b"61"]],
+            messages={
+                b"60": otp_mail(target, "634567"),
+                b"61": otp_mail("other@icloud.com", "623456"),
+            },
+        )
+        pool = self.pool(wait_timeout=0.08, request_timeout=30)
+        bound_timeouts: list[float] = []
+
+        with patch.object(pool, "_connect_imap", return_value=imap), patch.object(
+            pool,
+            "_bound_socket_timeout",
+            side_effect=lambda _imap, timeout: bound_timeouts.append(timeout),
+        ), patch("core.icloud_mail_pool.time.monotonic", side_effect=clock.monotonic):
+            code = pool.wait_for_code(self.mailbox(target))
+
+        self.assertEqual(code, "634567")
+        self.assertGreaterEqual(len(bound_timeouts), 4)
+        self.assertTrue(all(a > b for a, b in zip(bound_timeouts, bound_timeouts[1:])))
+        self.assertTrue(all(0 < timeout <= 0.08 for timeout in bound_timeouts))
+
+    def test_budget_exhaustion_stops_fetching_and_sleep_cannot_cross_deadline(self):
+        target = "alias@icloud.com"
+
+        class FakeClock:
+            def __init__(self):
+                self.now = 200.0
+                self.sleeps: list[float] = []
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.sleeps.append(seconds)
+                self.now += seconds
+
+            def advance(self, seconds=0.01):
+                self.now += seconds
+
+        clock = FakeClock()
+
+        class FakeSocket:
+            def __init__(self):
+                self.timeout = 30.0
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+        class TimedIMAP(ScriptedIMAP):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.sock = FakeSocket()
+
+            def noop(self):
+                result = super().noop()
+                clock.advance(min(0.01, self.sock.timeout))
+                return result
+
+            def uid(self, command, *args):
+                result = super().uid(command, *args)
+                clock.advance(min(0.01, self.sock.timeout))
+                return result
+
+        imap = TimedIMAP(
+            snapshots=[[b"70", b"71", b"72"]],
+            messages={
+                b"70": otp_mail("other-a@icloud.com", "712345"),
+                b"71": otp_mail("other-b@icloud.com", "723456"),
+                b"72": otp_mail("other-c@icloud.com", "734567"),
+            },
+        )
+        pool = self.pool(wait_timeout=0.025, wait_interval=5, request_timeout=30)
+
+        with patch.object(pool, "_connect_imap", return_value=imap), patch(
+            "core.icloud_mail_pool.time.monotonic", side_effect=clock.monotonic
+        ), patch("core.icloud_mail_pool.time.sleep", side_effect=clock.sleep):
+            code = pool.wait_for_code(self.mailbox(target))
+
+        fetches = [call for call in imap.uid_calls if call[0] == "fetch"]
+        self.assertIsNone(code)
+        self.assertEqual(len(fetches), 1)
+        self.assertTrue(all(seconds <= 0.025 for seconds in clock.sleeps))
+        self.assertLessEqual(clock.now, 200.025 + 1e-9)
 
     def test_pool_claim_and_success_state_are_persistent(self):
         with tempfile.TemporaryDirectory() as tmp:

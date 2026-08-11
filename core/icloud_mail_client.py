@@ -211,7 +211,7 @@ def fetch_latest_otp(
     max_wait: int | None = None,
     poll_interval: int | None = None,
     used_codes: set[str] | None = None,
-    otp_state: dict[str, set] | None = None,
+    otp_state: dict[str, Any] | None = None,
     **_kwargs: Any,
 ) -> str:
     state = otp_state if otp_state is not None else {}
@@ -231,8 +231,14 @@ def fetch_latest_otp(
         "_seen_message_ids": seen_message_ids,
         "_seen_code_hashes": seen_code_hashes,
         "_used_code_hashes": used_code_hashes,
+        "_last_uid": int(state.get("last_uid") or 0),
+        "_uidvalidity": str(state.get("uidvalidity") or ""),
     }
-    code = _pool(wait_timeout=max_wait, wait_interval=poll_interval).wait_for_code(mailbox)
+    try:
+        code = _pool(wait_timeout=max_wait, wait_interval=poll_interval).wait_for_code(mailbox)
+    finally:
+        state["last_uid"] = int(mailbox.get("_last_uid") or 0)
+        state["uidvalidity"] = str(mailbox.get("_uidvalidity") or "")
     if not code:
         raise TimeoutError(f"iCloud OTP wait timed out for {mailbox['address']}")
     return code

@@ -14,11 +14,55 @@ EMAIL_SOURCE 支持单个或多个来源：
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
 import logging
-from typing import Iterable
+import math
+import time
+from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
 _VALID_SOURCES = ("outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "icloud")
+
+
+class OtpWaitSession:
+    """在多次重发之间共享去重状态，并让所有轮次共用一个总等待预算。"""
+
+    def __init__(self, max_wait: int | None = None, wait_fn: Callable[..., str] | None = None) -> None:
+        if max_wait is None:
+            try:
+                from config import email as _email_cfg
+                max_wait = int(getattr(_email_cfg, "OTP_MAX_WAIT", 120) or 120)
+            except Exception:
+                max_wait = 120
+        self.max_wait = max(1, int(max_wait))
+        self.deadline = time.monotonic() + self.max_wait
+        self.used_codes: set[str] = set()
+        self.otp_state: dict[str, Any] = {}
+        self._wait_fn = wait_fn
+
+    def remaining_seconds(self) -> int:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"OTP 总等待已达到 {self.max_wait} 秒")
+        return max(1, int(math.ceil(remaining)))
+
+    def wait(self, email: str, after_ts: float, **kwargs: Any) -> str:
+        requested = kwargs.pop("max_wait", None)
+        remaining = self.remaining_seconds()
+        effective_wait = remaining if requested is None else min(remaining, max(1, int(requested)))
+        wait_fn = self._wait_fn or wait_for_otp
+        return wait_fn(
+            email,
+            after_ts=after_ts,
+            max_wait=effective_wait,
+            used_codes=self.used_codes,
+            otp_state=self.otp_state,
+            **kwargs,
+        )
+
+    def mark_used(self, code: str | None) -> None:
+        value = str(code or "").strip()
+        if value:
+            self.used_codes.add(value)
 
 
 def parse_email_sources(value=None) -> list[str]:
@@ -131,7 +175,7 @@ def wait_for_otp(
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
     used_codes: set[str] | None = None,
-    otp_state: dict[str, set] | None = None,
+    otp_state: dict[str, Any] | None = None,
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 

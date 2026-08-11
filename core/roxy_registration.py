@@ -12,7 +12,7 @@ from pathlib import Path
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
 from core.account_export import save_account_data
-from core.email_provider import wait_for_otp, resolve_email_source
+from core.email_provider import OtpWaitSession, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
 
@@ -2020,30 +2020,16 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         _check_manual_stop()
 
         current_otp = otp_code
+        otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
         max_otp_attempts = 3
         for otp_attempt in range(1, max_otp_attempts + 1):
             if current_otp is None:
                 logger.info("[Roxy注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
                 try:
-                    current_otp = wait_for_otp(email, after_ts=otp_after_ts)
+                    current_otp = otp_wait_session.wait(email, after_ts=otp_after_ts)
                 except Exception as exc:
                     if otp_attempt >= max_otp_attempts:
                         raise
-                    # 兜底：OpenAI 重发验证码时常常是同一封邮件（时间戳不变），
-                    # after_ts 过滤会把它当成旧邮件忽略。先宽松取最新一条验证码，
-                    # 取到就直接用它重试提交，避免误点“重新发送”后死等。
-                    fallback_otp = None
-                    try:
-                        fallback_otp = wait_for_otp(email, after_ts=0.0, max_wait=15, poll_interval=3)
-                    except Exception:
-                        fallback_otp = None
-                    if fallback_otp:
-                        logger.info(
-                            "[Roxy注册][OTP] 取码接口超时但宽松取到最新验证码，直接重试提交：%s (fallback)",
-                            fallback_otp,
-                        )
-                        current_otp = fallback_otp
-                        continue
                     logger.warning(
                         "[Roxy注册][OTP] 一直未收到验证码，点击“重新发送电子邮件”后继续等待（下一轮 %s/%s）：%s: %s",
                         otp_attempt + 1,
@@ -2056,7 +2042,8 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                     human_delay("api")
                     current_otp = None
                     continue
-            logger.info("[Roxy注册][OTP] 收到验证码：%s", current_otp)
+            otp_wait_session.mark_used(current_otp)
+            logger.info("[Roxy注册][OTP] 已收到验证码，code_len=%s", len(str(current_otp or "")))
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             logger.info("[Roxy注册][OTP] 已填写邮箱验证码")
