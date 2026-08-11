@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from config import proxy
+from config import cloakbrowser, proxy, roxybrowser
 from core import account_liveness, cloakbrowser_driver, live_check_service, resin_proxy_status
 from webui import config_editor
 
@@ -146,6 +146,8 @@ class MihomoUsProxyTests(unittest.TestCase):
             proxy, "MIHOMO_US_FALLBACK_ENABLED", True
         ), patch.object(proxy, "MIHOMO_TRANSPARENT_ROUTING", True), patch.object(
             proxy, "MIHOMO_CONTROLLER_URL", "http://192.168.6.1:9090"
+        ), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+            cloakbrowser, "CLOAK_USE_PROXY", True
         ), patch.object(resin_proxy_status, "_tcp_reachable", return_value=True):
             status = resin_proxy_status.registration_proxy_status(check_tcp=True)
         self.assertTrue(status["ready"])

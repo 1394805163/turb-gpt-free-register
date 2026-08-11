@@ -151,10 +151,25 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
     def test_render_only_escapes_specifiers_backslashes_and_quotes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             app_dir = '/opt/100% "quoted"\\path with space'
-            unit = self.render_unit(app_dir, Path(temp_dir) / "rendered.service")
+            service_home = '/home/100% "quoted"\\home with space'
+            unit = self.render_unit(
+                app_dir,
+                Path(temp_dir) / "rendered.service",
+                service_home,
+            )
         escaped_path = r'/opt/100%%\x20\x22quoted\x22\x5cpath\x20with\x20space'
         self.assertIn(f"WorkingDirectory={escaped_path}", unit)
         self.assertIn(f"EnvironmentFile={escaped_path}/.env", unit)
+        self.assertIn(
+            r'Environment="HOME=/home/100%% \"quoted\"\\home with space"',
+            unit.splitlines(),
+        )
+        self.assertIn(
+            r'ExecStart="/opt/100%% \"quoted\"\\path with space/.venv/bin/gunicorn" '
+            r'--config "/opt/100%% \"quoted\"\\path with space/deploy/linux/gunicorn.conf.py" '
+            r'webui.app:create_app()',
+            unit.splitlines(),
+        )
         self.assertNotIn('WorkingDirectory="', unit)
         self.assertNotIn('EnvironmentFile="', unit)
         self.assertNotIn('WorkingDirectory=/opt/100% ', unit)
