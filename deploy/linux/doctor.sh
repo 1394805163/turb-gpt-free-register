@@ -10,7 +10,7 @@ SERVICE_USER=""
 SERVICE_HOME="/var/lib/turb-gpt-register"
 STATUS=0
 
-usage() { printf '%s\n' 'Usage: deploy/linux/doctor.sh [--host HOST] [--port PORT] [--service-user USER] [--service-home HOME]'; }
+usage() { printf '%s\n' 'Usage: deploy/linux/doctor.sh [--host HOST] [--port PORT] [--service-user USER]'; }
 usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 validate_arguments() {
   [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT >= 1 && PORT <= 65535)) || usage_error "port must be an integer from 1 to 65535"
@@ -49,13 +49,12 @@ check() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host|--port|--service-user|--service-home)
+    --host|--port|--service-user)
       [[ $# -ge 2 && -n "$2" ]] || usage_error "$1 requires a value"
       case "$1" in
         --host) HOST="$2" ;;
         --port) PORT="$2" ;;
         --service-user) SERVICE_USER="$2" ;;
-        --service-home) SERVICE_HOME="$2" ;;
       esac
       shift 2
       ;;
@@ -75,10 +74,16 @@ VENV_PYTHON="$APP_DIR/.venv/bin/python"
 check "virtual environment Python" test -x "$VENV_PYTHON"
 check ".env exists" test -f "$APP_DIR/.env"
 
-if [[ -z "$SERVICE_USER" ]]; then
-  SERVICE_USER="$(systemctl show --property=User --value "$SERVICE_NAME" 2>/dev/null || true)"
-  [[ -n "$SERVICE_USER" ]] || SERVICE_USER="turbgpt"
+UNIT_SERVICE_USER="$(systemctl show --property=User --value "$SERVICE_NAME" 2>/dev/null || true)"
+if [[ -z "$UNIT_SERVICE_USER" ]]; then
+  printf '[FAIL] systemd unit User is missing or empty\n' >&2
+  exit 1
 fi
+if [[ -n "$SERVICE_USER" && "$SERVICE_USER" != "$UNIT_SERVICE_USER" ]]; then
+  printf '[FAIL] requested service user does not match systemd unit User\n' >&2
+  exit 1
+fi
+SERVICE_USER="$UNIT_SERVICE_USER"
 service_identity_is_non_root() {
   local uid
   uid="$(id -u "$SERVICE_USER" 2>/dev/null)" || return 1
@@ -86,8 +91,10 @@ service_identity_is_non_root() {
 }
 run_as_service_user() {
   local service_uid current_uid
-  service_uid="$(id -u "$SERVICE_USER")" || return 1
-  current_uid="$(id -u)"
+  service_uid="$(id -u "$SERVICE_USER" 2>/dev/null)" || return 1
+  [[ "$service_uid" =~ ^[0-9]+$ && "$service_uid" -ne 0 ]] || return 1
+  current_uid="$(id -u 2>/dev/null)" || return 1
+  [[ "$current_uid" =~ ^[0-9]+$ ]] || return 1
   if [[ "$current_uid" == "$service_uid" ]]; then
     env HOME="$SERVICE_HOME" XDG_CACHE_HOME="$SERVICE_HOME/.cache" "$@"
   elif [[ "$current_uid" -eq 0 ]]; then
@@ -97,11 +104,24 @@ run_as_service_user() {
   fi
 }
 run_cloak_doctor() {
+  local checker_status
   [[ -x "$VENV_PYTHON" ]] || return 1
-  run_as_service_user "$VENV_PYTHON" -m cloakbrowser doctor
+  [[ -f "$SCRIPT_DIR/check_cloak_doctor.py" ]] || return 1
+  set +o pipefail
+  run_as_service_user "$VENV_PYTHON" -m cloakbrowser doctor --json \
+    | /usr/bin/python3 "$SCRIPT_DIR/check_cloak_doctor.py"
+  checker_status="${PIPESTATUS[1]}"
+  set -o pipefail
+  return "$checker_status"
 }
-check "service user exists and is non-root" service_identity_is_non_root
-check "Cloak can launch its browser binary" run_cloak_doctor
+if service_identity_is_non_root; then
+  printf '[OK] service user exists and is non-root\n'
+  check "Cloak can launch its browser binary" run_cloak_doctor
+else
+  printf '[FAIL] service user exists and is non-root\n' >&2
+  STATUS=1
+  printf '[FAIL] Cloak launch skipped because service identity is invalid\n' >&2
+fi
 
 if systemctl is-active --quiet "$SERVICE_NAME"; then
   printf '[OK] systemd service is active\n'

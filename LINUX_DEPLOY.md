@@ -11,9 +11,9 @@ cd /opt/turb-gpt-register
 sudo deploy/linux/bootstrap.sh --service-user turbgpt --host 127.0.0.1 --port 5000 --no-start
 ```
 
-`bootstrap.sh` 支持 `--service-user USER`、`--service-home HOME`、`--host HOST`、`--port PORT`、`--no-start`、`--print-service-user` 和 `--help`。默认监听 `127.0.0.1:5000`，服务状态 HOME 固定为 `/var/lib/turb-gpt-register`；只有明确需要时才用 `--service-home` 覆盖。不传 `--service-user` 时优先使用 `SUDO_USER`，否则使用当前普通用户；root 直接执行时选择并创建 `turbgpt`。显式选择尚不存在的 `turbgpt` 也会创建该系统账号，其他不存在的显式用户会报错。脚本不会改写交互用户原有 HOME。
+`bootstrap.sh` 支持 `--service-user USER`、`--host HOST`、`--port PORT`、`--no-start`、`--print-service-user` 和 `--help`。默认监听 `127.0.0.1:5000`，服务状态 HOME 固定为 `/var/lib/turb-gpt-register`。不传 `--service-user` 时优先使用 `SUDO_USER`，否则使用当前普通用户；root 直接执行时选择并创建 `turbgpt`。显式选择尚不存在的 `turbgpt` 也会创建该系统账号，其他不存在的显式用户会报错。脚本不会改写交互用户原有 HOME。
 
-脚本会安装 Python 系统依赖、创建 `.venv`、安装 `requirements.txt`、安装 Chromium 系统库，并以服务用户及状态 HOME 执行 Cloak 安装和完整 `python -m cloakbrowser doctor`（包含真实 binary 启动），最后生成 systemd 服务。`--no-start` 仍会安装并 enable unit，但不会启动或重启服务。
+脚本会安装 Python 系统依赖、创建 `.venv`、安装 `requirements.txt`、安装 Chromium 系统库，并以服务用户及固定状态 HOME 执行 Cloak 安装和完整 `python -m cloakbrowser doctor --json`。JSON 会交给 `deploy/linux/check_cloak_doctor.py` 校验，只有 `binary.installed`、`launch.tested`、`launch.ok` 都严格为 `true` 才算通过，不能只依赖 Cloak CLI 退出码。最后脚本生成 systemd 服务；`--no-start` 仍会安装并 enable unit，但不会启动或重启服务。
 
 首次运行会在 `.env` 不存在时从 `.env.example` 创建 `.env`，之后保留现有 `.env`。部署前编辑密钥、WebUI 认证码和驱动配置：
 
@@ -38,11 +38,11 @@ printf '/swapfile none swap sw 0 0\n' | sudo tee -a /etc/fstab
 
 ## 手动安装或重渲染 systemd
 
-`install-systemd.sh` 支持以下实际参数：`--service-user`、`--service-group`、`--service-home`、`--app-dir`、`--host`、`--port`、`--no-start`、`--render-only FILE`、`--check-access-only`、`--apply-unit-only` 和 `--help`。完整安装示例：
+`install-systemd.sh` 支持以下实际参数：`--service-user`、`--service-group`、`--app-dir`、`--host`、`--port`、`--no-start`、`--render-only FILE`、`--check-access-only`、`--apply-unit-only` 和 `--help`。完整安装示例：
 
 ```bash
 sudo deploy/linux/install-systemd.sh --app-dir /opt/turb-gpt-register \
-  --service-user turbgpt --service-group turbgpt --service-home /var/lib/turb-gpt-register \
+  --service-user turbgpt --service-group turbgpt \
   --host 127.0.0.1 --port 5000
 ```
 
@@ -60,7 +60,7 @@ sudo journalctl -u turb-gpt-register.service -f
 sudo deploy/linux/doctor.sh --host 127.0.0.1 --port 5000
 ```
 
-`doctor.sh` 会以 unit 中的服务用户和 `/var/lib/turb-gpt-register` HOME 执行完整 `python -m cloakbrowser doctor`，实际启动 Cloak binary，并检查架构、`.venv/bin/python`、`.env`、systemd 状态、`/login` 精确 HTTP 200 和 cgroup memory。它需要在已安装服务的主机上运行；端口或 `/login` 不可达时先看 `journalctl`。
+`doctor.sh` 必须从 unit 读取到非空、非 UID 0 的 `User`，然后以该用户和 `/var/lib/turb-gpt-register` HOME 执行完整 `python -m cloakbrowser doctor --json`，并用 `check_cloak_doctor.py` 严格确认 binary 已安装且真实启动探针成功。随后检查架构、`.venv/bin/python`、`.env`、systemd 状态、`/login` 精确 HTTP 200 和 cgroup memory。它需要在已安装服务的主机上运行；端口或 `/login` 不可达时先看 `journalctl`。
 
 ## 升级与回滚
 
@@ -105,7 +105,7 @@ sudo deploy/linux/doctor.sh --host 127.0.0.1 --port 5000
 ## 2C2G 排查清单
 
 - **OOM 或频繁重启**：查看 `journalctl -u turb-gpt-register.service`、`systemctl status`、`free -h`、`swapon --show`，以及 `/sys/fs/cgroup/system.slice/turb-gpt-register.service/memory.current`（实际 cgroup 路径以 `systemctl show -p ControlGroup` 为准）。unit 设置 `MemoryHigh=1700M`、`TasksMax=512`、`MALLOC_ARENA_MAX=2`；2C2G 保持总并发为 2，不建议提高。
-- **Cloak 启动失败**：确认 `sudo -u turbgpt -- env HOME=/var/lib/turb-gpt-register XDG_CACHE_HOME=/var/lib/turb-gpt-register/.cache /opt/turb-gpt-register/.venv/bin/python -m cloakbrowser doctor` 能实际启动 binary，并核对状态 HOME 与 Chromium 系统库；随后查看完整 journal。CI 不执行 binary 安装。
+- **Cloak 启动失败**：在项目目录运行 `sudo -u turbgpt -- env HOME=/var/lib/turb-gpt-register XDG_CACHE_HOME=/var/lib/turb-gpt-register/.cache /opt/turb-gpt-register/.venv/bin/python -m cloakbrowser doctor --json | python3 deploy/linux/check_cloak_doctor.py`，确认 JSON 中 binary 已安装且 launch 探针实际成功，并核对固定状态 HOME 与 Chromium 系统库；随后查看完整 journal。CI 不执行 binary 安装。
 - **端口不可达**：确认 unit 的 `Environment="HOST=..."` 与 `Environment="PORT=..."`，运行 `ss -ltnp | grep ':5000'` 和 `test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:5000/login)" = 200`，再看代理、防火墙和 `doctor.sh`。
 - **Chromium 进程过多**：检查 `pgrep -af 'chrom|cloak'`、`ps -eo pid,ppid,rss,cmd --sort=-rss | head`，停止残留任务后再重启服务；不要用增加 worker 的方式处理。
 

@@ -22,7 +22,6 @@ usage() {
 
 选项:
   --service-user USER  运行服务的普通用户
-  --service-home HOME  服务状态 HOME（默认: /var/lib/turb-gpt-register）
   --host HOST          WebUI 监听地址（默认: 127.0.0.1）
   --port PORT          WebUI 监听端口（默认: 5000）
   --no-start           安装后不启动服务
@@ -79,11 +78,10 @@ resolve_service_identity() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --service-user|--service-home|--host|--port|--identity-test-root)
+    --service-user|--host|--port|--identity-test-root)
       require_value "$1" "${2:-}"
       case "$1" in
         --service-user) SERVICE_USER="$2" ;;
-        --service-home) SERVICE_HOME="$2" ;;
         --host) HOST="$2" ;;
         --port) PORT="$2" ;;
         --identity-test-root) IDENTITY_TEST_ROOT="$2" ;;
@@ -119,6 +117,7 @@ if [[ "$RESOLVE_SERVICE_USER_ONLY" -eq 1 ]]; then
 fi
 [[ -f "$APP_DIR/requirements.txt" ]] || fail "找不到 requirements.txt"
 [[ -f "$APP_DIR/.env.example" ]] || fail "找不到 .env.example"
+[[ -f "$SCRIPT_DIR/check_cloak_doctor.py" ]] || fail "找不到 Cloak doctor JSON 校验器"
 
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
@@ -137,6 +136,16 @@ esac
 
 run_as_service_user() {
   runuser -u "$SERVICE_USER" -- env HOME="$SERVICE_HOME" XDG_CACHE_HOME="$SERVICE_HOME/.cache" "$@"
+}
+
+run_cloak_doctor() {
+  local checker_status
+  set +o pipefail
+  run_as_service_user "$VENV_PYTHON" -m cloakbrowser doctor --json \
+    | /usr/bin/python3 "$SCRIPT_DIR/check_cloak_doctor.py"
+  checker_status="${PIPESTATUS[1]}"
+  set -o pipefail
+  return "$checker_status"
 }
 
 prepare_private_directory() {
@@ -195,9 +204,9 @@ run_as_service_user "$VENV_PYTHON" -m pip install -r "$APP_DIR/requirements.txt"
 # install-deps 只安装 Chromium 所需的系统库，不下载 Playwright Chromium。
 "$VENV_PYTHON" -m playwright install-deps chromium
 run_as_service_user "$VENV_PYTHON" -m cloakbrowser install
-run_as_service_user "$VENV_PYTHON" -m cloakbrowser doctor
+run_cloak_doctor || fail "Cloak browser binary 启动校验失败"
 run_as_service_user test -x "$APP_DIR/.venv/bin/gunicorn" || fail "服务用户无法执行 Gunicorn"
-INSTALL_ARGS=(--service-user "$SERVICE_USER" --service-home "$SERVICE_HOME" --host "$HOST" --port "$PORT")
+INSTALL_ARGS=(--service-user "$SERVICE_USER" --host "$HOST" --port "$PORT")
 if [[ "$NO_START" -eq 1 ]]; then INSTALL_ARGS+=(--no-start); fi
 "$SCRIPT_DIR/install-systemd.sh" "${INSTALL_ARGS[@]}"
 printf 'Ubuntu 原生部署完成。\n'

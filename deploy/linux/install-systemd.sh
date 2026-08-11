@@ -35,7 +35,6 @@ usage() {
 Usage: sudo deploy/linux/install-systemd.sh [options]
   --service-user USER
   --service-group GROUP
-  --service-home HOME
   --app-dir DIR
   --host HOST
   --port PORT
@@ -232,16 +231,32 @@ configure_test_mode() {
   TEST_MODE=1
 }
 cleanup() {
-  [[ -n "$TMP_UNIT" ]] && rm -f "$TMP_UNIT"
-  [[ -n "$BACKUP_UNIT" ]] && rm -f "$BACKUP_UNIT"
+  if [[ -n "$TMP_UNIT" ]] && ! rm -f -- "$TMP_UNIT"; then
+    printf 'ERROR: failed to remove temporary unit: %s\n' "$TMP_UNIT" >&2
+  fi
+  if [[ -n "$BACKUP_UNIT" ]]; then
+    printf 'ERROR: preserved unrestored unit backup at: %s\n' "$BACKUP_UNIT" >&2
+  fi
+}
+validate_unit_destination() {
+  [[ -d "$UNIT_DIR" ]] || fail "unit directory does not exist: $UNIT_DIR"
+  [[ ! -L "$UNIT_PATH" ]] || fail "existing unit is a symbolic link; refusing to replace it: $UNIT_PATH"
+  [[ ! -e "$UNIT_PATH" || -f "$UNIT_PATH" ]] || fail "existing unit is not a regular file: $UNIT_PATH"
 }
 restore_previous_unit() {
   if [[ -n "$BACKUP_UNIT" ]]; then
-    mv -f "$BACKUP_UNIT" "$UNIT_PATH"
+    if ! mv -f -- "$BACKUP_UNIT" "$UNIT_PATH"; then
+      printf 'ERROR: failed to restore previous unit; backup preserved at: %s\n' "$BACKUP_UNIT" >&2
+      return 1
+    fi
     BACKUP_UNIT=""
   else
-    rm -f "$UNIT_PATH"
+    if ! rm -f -- "$UNIT_PATH"; then
+      printf 'ERROR: failed to remove newly installed unit: %s\n' "$UNIT_PATH" >&2
+      return 1
+    fi
   fi
+  return 0
 }
 record_previous_service_state() {
   if "$SYSTEMCTL_BIN" is-enabled --quiet "${SERVICE_NAME}.service" >/dev/null 2>&1; then
@@ -271,27 +286,33 @@ restore_previous_service_state() {
 }
 rollback_transaction() {
   local reason="$1" rollback_ok=0
-  restore_previous_unit || rollback_ok=1
-  "$SYSTEMCTL_BIN" daemon-reload || rollback_ok=1
-  restore_previous_service_state || rollback_ok=1
+  if ! restore_previous_unit; then rollback_ok=1; fi
+  if ! "$SYSTEMCTL_BIN" daemon-reload; then rollback_ok=1; fi
+  if ! restore_previous_service_state; then rollback_ok=1; fi
   if [[ "$rollback_ok" -eq 0 ]]; then
     fail "$reason; restored previous unit and service state"
   fi
   fail "$reason; rollback was incomplete"
 }
 apply_unit_transaction() {
-  [[ -d "$UNIT_DIR" ]] || fail "unit directory does not exist: $UNIT_DIR"
-  record_previous_service_state
-  if [[ -f "$UNIT_PATH" ]]; then
-    BACKUP_UNIT="$(mktemp "$UNIT_DIR/.${SERVICE_NAME}.backup.XXXXXX.service")"
-    cp -p "$UNIT_PATH" "$BACKUP_UNIT"
-  fi
+  validate_unit_destination
   TMP_UNIT="$(mktemp "$UNIT_DIR/.${SERVICE_NAME}.new.XXXXXX.service")"
   render_unit "$TMP_UNIT"
   if [[ "$(/usr/bin/id -u)" -eq 0 ]]; then chown root:root "$TMP_UNIT"; fi
   chmod 0644 "$TMP_UNIT"
   "$SYSTEMD_ANALYZE_BIN" verify "$TMP_UNIT" || fail "systemd-analyze verify failed; existing unit was not replaced"
-  mv -f "$TMP_UNIT" "$UNIT_PATH"
+  record_previous_service_state
+  if [[ -f "$UNIT_PATH" ]]; then
+    BACKUP_UNIT="$(mktemp "$UNIT_DIR/.${SERVICE_NAME}.backup.XXXXXX.service")"
+    if ! cp -p -- "$UNIT_PATH" "$BACKUP_UNIT"; then
+      rm -f -- "$BACKUP_UNIT" || true
+      BACKUP_UNIT=""
+      fail "failed to back up existing systemd unit"
+    fi
+  fi
+  if ! mv -f -- "$TMP_UNIT" "$UNIT_PATH"; then
+    fail "failed to install new systemd unit"
+  fi
   TMP_UNIT=""
   if ! "$SYSTEMCTL_BIN" daemon-reload; then
     rollback_transaction "systemd daemon-reload failed"
@@ -308,18 +329,19 @@ apply_unit_transaction() {
       fi
     fi
   fi
-  [[ -n "$BACKUP_UNIT" ]] && rm -f "$BACKUP_UNIT"
+  if [[ -n "$BACKUP_UNIT" ]] && ! rm -f -- "$BACKUP_UNIT"; then
+    fail "installed service but failed to remove unit backup: $BACKUP_UNIT"
+  fi
   BACKUP_UNIT=""
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --service-user|--service-group|--service-home|--app-dir|--host|--port|--render-only|--test-root)
+    --service-user|--service-group|--app-dir|--host|--port|--render-only|--test-root)
       require_value "$1" "${2:-}"
       case "$1" in
         --service-user) SERVICE_USER="$2" ;;
         --service-group) SERVICE_GROUP="$2" ;;
-        --service-home) SERVICE_HOME="$2" ;;
         --app-dir) APP_DIR="$2" ;;
         --host) HOST="$2" ;;
         --port) PORT="$2" ;;
@@ -360,6 +382,7 @@ elif [[ "$APPLY_UNIT_ONLY" -eq 1 ]]; then
 elif [[ "$(/usr/bin/id -u)" -ne 0 ]]; then
   fail "root is required to install the systemd service"
 fi
+if [[ "$CHECK_ACCESS_ONLY" -eq 0 ]]; then validate_unit_destination; fi
 ensure_service_user
 resolve_service_identity
 if [[ "$CHECK_ACCESS_ONLY" -eq 1 ]]; then check_service_user_access; exit 0; fi
