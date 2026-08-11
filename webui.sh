@@ -66,7 +66,7 @@ read_pid() {
 }
 
 find_pids_by_port() {
-  pgrep -f "python.*web\.py.*--port[ =]${PORT}" 2>/dev/null || true
+  pgrep -f "gunicorn.*gunicorn\.conf\.py|python.*web\.py.*--port[ =]${PORT}" 2>/dev/null || true
 }
 
 get_python() {
@@ -117,25 +117,31 @@ cmd_start() {
 
   py="$(get_python)"
 
-  local args=("web.py" "--host" "$HOST" "--port" "$PORT")
-  if [[ "$OPEN_BROWSER" == "1" || "$OPEN_BROWSER" == "true" ]]; then
-    args+=("--open-browser")
-  fi
-  if [[ "$VERBOSE" == "1" || "$VERBOSE" == "true" ]]; then
-    args+=("--verbose")
-  fi
-  if [[ -n "$AUTH_CODE" ]]; then
-    args+=("--auth-code" "$AUTH_CODE")
-  fi
-  if [[ -n "$EXTRA_ARGS" ]]; then
-    # shellcheck disable=SC2206
-    local extra_parts=($EXTRA_ARGS)
-    args+=("${extra_parts[@]}")
+  local command=("$py" "web.py" "--host" "$HOST" "--port" "$PORT")
+  if [[ -x "$ROOT_DIR/.venv/bin/gunicorn" ]]; then
+    command=("$ROOT_DIR/.venv/bin/gunicorn"
+      --config "$ROOT_DIR/deploy/linux/gunicorn.conf.py"
+      "webui.app:create_app()")
+  else
+    if [[ "$OPEN_BROWSER" == "1" || "$OPEN_BROWSER" == "true" ]]; then
+      command+=("--open-browser")
+    fi
+    if [[ "$VERBOSE" == "1" || "$VERBOSE" == "true" ]]; then
+      command+=("--verbose")
+    fi
+    if [[ -n "$AUTH_CODE" ]]; then
+      command+=("--auth-code" "$AUTH_CODE")
+    fi
+    if [[ -n "$EXTRA_ARGS" ]]; then
+      # shellcheck disable=SC2206
+      local extra_parts=($EXTRA_ARGS)
+      command+=("${extra_parts[@]}")
+    fi
   fi
 
   echo "启动 WebUI：http://${HOST}:${PORT}"
   echo "日志文件：$LOG_FILE"
-  nohup "$py" "${args[@]}" >> "$LOG_FILE" 2>&1 &
+  nohup "${command[@]}" >> "$LOG_FILE" 2>&1 &
   pid=$!
   echo "$pid" > "$PID_FILE"
 
