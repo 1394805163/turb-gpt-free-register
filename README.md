@@ -1,7 +1,7 @@
 # Turb GPT Free Register
 
 Windows 本地原生运行请参阅 [LOCAL_NATIVE.md](LOCAL_NATIVE.md)。提供 Python 3.12 独立环境以及初始化、启动、停止、状态一键脚本，不需要 Docker。
-Ubuntu 24.04 原生部署请参阅 [LINUX_DEPLOY.md](LINUX_DEPLOY.md)，包含 `/opt` 安装、systemd 运维和 2C2G 低内存配置说明。
+Ubuntu 24.04 原生部署可直接按 [服务器部署操作手册](SERVER_DEPLOY_UBUNTU24.md) 执行；实现细节和运维原理参阅 [LINUX_DEPLOY.md](LINUX_DEPLOY.md)。
 
 ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目支持三套注册驱动：
 
