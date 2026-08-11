@@ -356,5 +356,16 @@ printf 'status=%s\ncontent=%s\n' "$status" "$(cat "$work/units/turb-gpt-register
         self.assertEqual(result.stdout.count("CALL:daemon-reload"), 2, result.stdout + result.stderr)
 
 
+class LinuxDocumentationAndCITests(unittest.TestCase):
+    def test_ci_targets_ubuntu_2404(self):
+        workflow = read(".github/workflows/linux-ci.yml")
+        self.assertIn("runs-on: ubuntu-24.04", workflow)
+        self.assertIn("python -m unittest discover -s tests -v", workflow)
+
+    def test_linux_docs_cover_two_gib_operations(self):
+        docs = read("LINUX_DEPLOY.md")
+        for phrase in ("2 核 2 GB", "1 个 Gunicorn worker", "并发上限为 2", "swap", "journalctl"):
+            self.assertIn(phrase, docs)
+
 if __name__ == "__main__":
     unittest.main()
