@@ -50,9 +50,12 @@ jobs:
           trap cleanup EXIT
           .venv/bin/gunicorn --config deploy/linux/gunicorn.conf.py "webui.app:create_app()" &
           master_pid=$!
+          status=""
           for attempt in {1..50}; do
-            if curl --fail --silent --show-error "http://${HOST}:${PORT}/login" -o /dev/null; then
-              break
+            if status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "http://${HOST}:${PORT}/login")"; then
+              if test "$status" = "200"; then
+                break
+              fi
             fi
             if ! kill -0 "$master_pid" 2>/dev/null; then
               echo "Gunicorn master exited before /login became ready" >&2
@@ -60,7 +63,7 @@ jobs:
             fi
             sleep 0.2
           done
-          curl --fail --silent --show-error "http://${HOST}:${PORT}/login" -o /dev/null
+          test "$status" = "200"
           worker_pids="$(pgrep -P "$master_pid")"
           [[ -n "$worker_pids" ]]
           [[ "$(wc -w <<< "$worker_pids")" -eq 1 ]]

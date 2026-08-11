@@ -174,7 +174,7 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name != "nt" and shutil.which("systemd-analyze"),
-        "?? Linux systemd-analyze",
+        "需要 Linux systemd-analyze",
     )
     def test_rendered_unit_passes_systemd_analyze_verify_when_available(self):
         with tempfile.TemporaryDirectory(prefix="turb gpt ") as temp_dir:
@@ -199,7 +199,7 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0 and shutil.which("runuser"),
-        "?? root ? runuser ???????????",
+        "需要 root 和 runuser 才能验证权限检查",
     )
     def test_access_check_rejects_project_untraversable_by_service_user(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -242,7 +242,7 @@ class LinuxDeploymentInstallerTests(unittest.TestCase):
 
     def test_bootstrap_keeps_utf8_chinese_messages(self):
         script = read("deploy/linux/bootstrap.sh")
-        self.assertNotIn("??", script)
+        self.assertNotRegex(script, r"\?{2,}")
         self.assertIn("\u7528\u6cd5: sudo deploy/linux/bootstrap.sh", script)
         self.assertIn("Ubuntu \u539f\u751f\u90e8\u7f72\u5b8c\u6210", script)
 
@@ -416,7 +416,7 @@ class RepositoryHygieneTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(tracked.returncode, 0, tracked.stderr)
-        with self.subTest("HAR ??????? Git ??"):
+        with self.subTest("HAR 不得被 Git 跟踪"):
             self.assertEqual(tracked.stdout.splitlines(), [])
         ignored = subprocess.run(
             ["git", "check-ignore", "-q", "Default-all-domains-regression.json"],
@@ -427,7 +427,7 @@ class RepositoryHygieneTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
-        with self.subTest("HAR ??????? .gitignore ??"):
+        with self.subTest("HAR 模式必须被 .gitignore 忽略"):
             self.assertEqual(ignored.returncode, 0, ignored.stderr)
 
 
@@ -438,7 +438,9 @@ class LinuxGunicornSmokeContractTests(unittest.TestCase):
             ".venv/bin/gunicorn",
             "--config deploy/linux/gunicorn.conf.py",
             "webui.app:create_app()",
-            "curl --fail",
+            'status="$(curl',
+            "--write-out '%{http_code}'",
+            'test "$status" = "200"',
             'master_pid=$!',
             'worker_pids="$(pgrep -P "$master_pid")"',
             'kill -TERM "$master_pid"',
@@ -453,6 +455,28 @@ class LinuxGunicornSmokeContractTests(unittest.TestCase):
                 self.assertIn(command, workflow)
         self.assertNotIn("cloakbrowser install", workflow)
         self.assertNotIn("playwright install", workflow)
+
+
+class Utf8HarNoticeTests(unittest.TestCase):
+    def test_round_one_har_notices_are_utf8_without_bom_or_repeated_question_marks(self):
+        notice = "HAR \u662f\u672c\u5730\u5ffd\u7565\u8f93\u5165\uff0c\u4ed3\u5e93\u53ea\u4fdd\u7559\u8131\u654f\u5206\u6790\u7ed3\u8bba\u3002"
+        for relative_path in (
+            ".gitignore",
+            "config/browser.py",
+            "docs/protocol_fingerprint_har_analysis.md",
+            "tests/test_linux_deployment.py",
+        ):
+            with self.subTest(relative_path=relative_path):
+                data = (ROOT / relative_path).read_bytes()
+                self.assertFalse(data.startswith(b"\xef\xbb\xbf"))
+                self.assertNotRegex(data.decode("utf-8"), r"\?{2,}")
+        for relative_path in (
+            ".gitignore",
+            "config/browser.py",
+            "docs/protocol_fingerprint_har_analysis.md",
+        ):
+            with self.subTest(notice_path=relative_path):
+                self.assertIn(notice, read(relative_path))
 
 
 if __name__ == "__main__":
