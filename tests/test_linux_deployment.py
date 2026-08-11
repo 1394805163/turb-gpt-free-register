@@ -58,7 +58,17 @@ root="$(cd "$(dirname "$0")" && pwd -P)"
 state="$root/state"
 printf '%s\n' "$*" >> "$state/calls"
 case "${1:-}" in
-  is-enabled) test -f "$state/enabled" ;;
+  is-enabled)
+    if [[ -f "$state/enabled-output" ]]; then
+      enabled_state="$(cat "$state/enabled-output")"
+      printf '%s\n' "$enabled_state"
+      case "$enabled_state" in
+        enabled|enabled-runtime|linked|linked-runtime) exit 0 ;;
+        *) exit 1 ;;
+      esac
+    fi
+    test -f "$state/enabled"
+    ;;
   is-active) test -f "$state/active" ;;
   daemon-reload) ;;
   enable)
@@ -899,6 +909,34 @@ printf 'status=%s\nbefore=%s\nafter=%s\ncalls=%s\n%s\n' "$status" "$before" "$af
                 self.assertIn(expected_target, result.stdout)
         self.assertGreaterEqual(supported, 1, "当前文件系统不支持任何符号链接夹具")
 
+    def test_installer_rejects_runtime_mask_and_link_states_before_writing_unit(self):
+        for enabled_state in ("masked-runtime", "linked-runtime"):
+            with self.subTest(enabled_state=enabled_state):
+                result = run_bash_snippet(
+                    STATEFUL_SYSTEMD_FIXTURE
+                    + f'''
+printf '%s\n' '{enabled_state}' > "$work/state/enabled-output"
+set +e
+deploy/linux/install-systemd.sh --test-root "$work" --app-dir "$work/app" \\
+  --service-user turbgpt --service-group turbgpt >"$work/output" 2>&1
+status=$?
+set -e
+printf 'status=%s\nunit=%s\nnew_files=%s\n--calls--\n%s\n--output--\n%s\n' \\
+  "$status" "$(test -e "$work/units/turb-gpt-register.service" && echo yes || echo no)" \\
+  "$(find "$work/units" -maxdepth 1 -name '.turb-gpt-register.new.*.service' | wc -l)" \\
+  "$(cat "$work/state/calls")" "$(cat "$work/output")"
+'''
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("status=1", result.stdout)
+                self.assertIn("unit=no", result.stdout)
+                self.assertIn("new_files=0", result.stdout)
+                calls = result.stdout.split("--calls--", 1)[1].split("--output--", 1)[0]
+                self.assertIn("is-enabled", calls)
+                self.assertNotIn("daemon-reload", calls)
+                self.assertNotIn("enable turb-gpt-register.service", calls)
+                self.assertIn(enabled_state, result.stdout)
+
     def test_restore_mv_failure_preserves_backup_and_reports_its_path(self):
         result = run_bash_snippet(
             STATEFUL_SYSTEMD_FIXTURE
@@ -1071,6 +1109,18 @@ class LinuxDocumentationAndCITests(unittest.TestCase):
         self.assertNotRegex(docs, r"自定义.{0,12}HOME|HOME.{0,12}覆盖")
         self.assertIn("cloakbrowser doctor --json", docs)
         self.assertIn("check_cloak_doctor.py", docs)
+
+    def test_internal_systemd_test_options_have_accurate_help_and_are_not_production_docs(self):
+        help_result = run_bash("deploy/linux/install-systemd.sh", "--help")
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertRegex(help_result.stdout, r"--test-root DIR[^\n]*may be used alone")
+        self.assertRegex(help_result.stdout, r"--apply-unit-only[^\n]*requires --test-root")
+        self.assertNotRegex(help_result.stdout, r"--test-root DIR[^\n]*requires --apply-unit-only")
+        docs = read("LINUX_DEPLOY.md")
+        production_args = docs.split("生产部署参数包括：", 1)[1].split("。", 1)[0]
+        self.assertNotIn("--test-root", production_args)
+        self.assertNotIn("--apply-unit-only", production_args)
+        self.assertIn("`--test-root` 与 `--apply-unit-only` 仅供仓库内部非 root 测试夹具使用", docs)
 
     def test_upgrade_and_rollback_reinstall_unit_before_restart_and_doctor(self):
         docs = read("LINUX_DEPLOY.md")

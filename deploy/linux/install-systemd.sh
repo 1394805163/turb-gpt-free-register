@@ -41,8 +41,8 @@ Usage: sudo deploy/linux/install-systemd.sh [options]
   --no-start
   --render-only FILE
   --check-access-only
-  --apply-unit-only
-  --test-root DIR      Internal test seam; requires --apply-unit-only
+  --test-root DIR      Internal non-root test seam; may be used alone
+  --apply-unit-only    Internal test modifier; requires --test-root
 EOF
 }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -259,7 +259,20 @@ restore_previous_unit() {
   return 0
 }
 record_previous_service_state() {
-  if "$SYSTEMCTL_BIN" is-enabled --quiet "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+  local enabled_state enabled_status
+  if enabled_state="$("$SYSTEMCTL_BIN" is-enabled "${SERVICE_NAME}.service" 2>/dev/null)"; then
+    enabled_status=0
+  else
+    enabled_status=$?
+  fi
+  [[ "$enabled_state" != *$'\n'* && "$enabled_state" != *$'\r'* ]] \
+    || fail "systemd is-enabled returned an invalid multi-line state"
+  case "$enabled_state" in
+    masked|masked-runtime|linked|linked-runtime)
+      fail "refusing to replace unit with systemd is-enabled state: $enabled_state"
+      ;;
+  esac
+  if [[ "$enabled_status" -eq 0 ]]; then
     PREVIOUS_ENABLED="enabled"
   else
     PREVIOUS_ENABLED="disabled"
@@ -296,12 +309,12 @@ rollback_transaction() {
 }
 apply_unit_transaction() {
   validate_unit_destination
+  record_previous_service_state
   TMP_UNIT="$(mktemp "$UNIT_DIR/.${SERVICE_NAME}.new.XXXXXX.service")"
   render_unit "$TMP_UNIT"
   if [[ "$(/usr/bin/id -u)" -eq 0 ]]; then chown root:root "$TMP_UNIT"; fi
   chmod 0644 "$TMP_UNIT"
   "$SYSTEMD_ANALYZE_BIN" verify "$TMP_UNIT" || fail "systemd-analyze verify failed; existing unit was not replaced"
-  record_previous_service_state
   if [[ -f "$UNIT_PATH" ]]; then
     BACKUP_UNIT="$(mktemp "$UNIT_DIR/.${SERVICE_NAME}.backup.XXXXXX.service")"
     if ! cp -p -- "$UNIT_PATH" "$BACKUP_UNIT"; then
@@ -361,7 +374,7 @@ done
 select_service_user
 validate_inputs
 if [[ "$RENDER_ONLY" -eq 1 ]]; then
-  [[ -z "$TEST_ROOT" ]] || usage_error "--test-root is only valid with --apply-unit-only"
+  [[ -z "$TEST_ROOT" ]] || usage_error "--test-root cannot be combined with --render-only"
   [[ "$(/usr/bin/id -u)" -ne 0 ]] || usage_error "--render-only is only available to non-root tests"
   if [[ -z "$SERVICE_GROUP" ]]; then
     ensure_service_user

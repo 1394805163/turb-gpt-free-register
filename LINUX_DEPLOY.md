@@ -38,7 +38,7 @@ printf '/swapfile none swap sw 0 0\n' | sudo tee -a /etc/fstab
 
 ## 手动安装或重渲染 systemd
 
-`install-systemd.sh` 支持以下实际参数：`--service-user`、`--service-group`、`--app-dir`、`--host`、`--port`、`--no-start`、`--render-only FILE`、`--check-access-only`、`--apply-unit-only` 和 `--help`。完整安装示例：
+`install-systemd.sh` 的生产部署参数包括：`--service-user`、`--service-group`、`--app-dir`、`--host`、`--port`、`--no-start`、`--render-only FILE`、`--check-access-only` 和 `--help`。`--test-root` 与 `--apply-unit-only` 仅供仓库内部非 root 测试夹具使用，不属于生产部署接口。完整安装示例：
 
 ```bash
 sudo deploy/linux/install-systemd.sh --app-dir /opt/turb-gpt-register \
