@@ -139,4 +139,3 @@ systemd 停止时先向 Gunicorn 发送 SIGTERM，并给后台任务最多 45 �
 - 空闲时只有一套 Gunicorn worker 和项目线程池。
 - 同时提交 2 个任务时峰值并发不超过 2；第 3 个任务等待，不创建第 3 个浏览器会话。
 - 重启服务后没有遗留 Cloak/Chromium 进程。
-
