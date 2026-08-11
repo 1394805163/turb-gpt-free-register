@@ -87,7 +87,13 @@ sudo systemctl restart turb-gpt-register.service
 sudo deploy/linux/doctor.sh --host 127.0.0.1 --port 5000
 ```
 
-确认问题已定位后回到分支并重新执行 `git pull --ff-only`。若升级包含 systemd 模板变化，重新运行 `bootstrap.sh --no-start` 或 `install-systemd.sh` 使 unit 生效。
+确认问题已定位后回到分支并重新执行 `git pull --ff-only`。若升级包含 systemd 模板变化，必须按以下顺序重新安装 unit、重启服务并检查；`--no-start` 只完成 unit 安装，不会让已运行进程立即采用新 unit：
+
+```bash
+sudo deploy/linux/bootstrap.sh --service-user turbgpt --host 127.0.0.1 --port 5000 --no-start
+sudo systemctl restart turb-gpt-register.service
+sudo deploy/linux/doctor.sh --host 127.0.0.1 --port 5000
+```
 
 ## 2C2G 排查清单
 

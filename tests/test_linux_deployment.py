@@ -391,5 +391,17 @@ class LinuxDocumentationAndCITests(unittest.TestCase):
             self.assertLess(no_start, restart)
             self.assertLess(restart, doctor)
 
+    def test_followup_unit_guidance_states_install_restart_doctor_order(self):
+        docs = read("LINUX_DEPLOY.md")
+        start = docs.index("\u786e\u8ba4\u95ee\u9898")
+        end = docs.index("## 2C2G \u6392\u67e5\u6e05\u5355")
+        guidance = docs[start:end]
+        install = guidance.index("\u91cd\u65b0\u5b89\u88c5 unit")
+        restart = guidance.index("sudo systemctl restart turb-gpt-register.service")
+        doctor = guidance.index("sudo deploy/linux/doctor.sh")
+        self.assertLess(install, restart)
+        self.assertLess(restart, doctor)
+
+
 if __name__ == "__main__":
     unittest.main()
