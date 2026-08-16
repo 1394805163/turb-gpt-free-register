@@ -2092,7 +2092,7 @@
         </label>
         <label class="jobs-tb-field">并发线程数
           <span class="el-input-number">
-            <input id="regWorkersV2" type="number" min="1" max="2" value="2" inputmode="numeric">
+            <input id="regWorkersV2" type="number" min="1" max="2" value="1" inputmode="numeric">
             <button type="button" class="el-input-number__increase" data-step-for="regWorkersV2" data-step="1" aria-label="增加">
               <svg viewBox="0 0 24 24"><polyline points="6 14 12 8 18 14"/></svg>
             </button>
@@ -2698,6 +2698,8 @@ $$('nav button').forEach(b => b.addEventListener('click', () => activateTab(b.da
 
 // ---------- 概览 ----------
 async function loadSummary() {
+  if (loadSummary.inFlight) return;
+  loadSummary.inFlight = true;
   try {
     const s = await api('/api/summary');
     $('#statAccounts').textContent = s.accounts;
@@ -2706,6 +2708,7 @@ async function loadSummary() {
     $('#statUsed').textContent = s.outlook_used;
     $('#statFailed').textContent = s.outlook_failed;
   } catch(e) {}
+  finally { loadSummary.inFlight = false; }
 }
 
 // ---------- 注册 / 任务 ----------
@@ -2775,7 +2778,7 @@ async function startRegistrationFromInputs(countEl, workersEl, startBtn) {
     return;
   }
   const count = parseInt((countEl?.value || '1'), 10);
-  const workers = Math.max(1, Math.min(2, parseInt((workersEl?.value || '2'), 10)));
+  const workers = Math.max(1, Math.min(2, parseInt((workersEl?.value || '1'), 10)));
   const activeCount = Number(JOB_STATUS_COUNTS.active || 0);
   if (activeCount > 0) {
     const ok = confirm(
@@ -2962,6 +2965,10 @@ function updateJobsSelectionUi(pageRows = null) {
 }
 
 async function refreshJobs() {
+  // 浏览器切后台或网络抖动时，禁止多个刷新请求叠加；否则旧请求会占满
+  // Gunicorn gthread，页面会表现为整块“载入中”。
+  if (refreshJobs.inFlight) return;
+  refreshJobs.inFlight = true;
   try {
     const p = PAGERS.jobs;
     const res = await api(`/api/jobs?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}`);
@@ -2978,6 +2985,7 @@ async function refreshJobs() {
     }
     loadSummary();
   } catch(e) {}
+  finally { refreshJobs.inFlight = false; }
 }
 
 let modalScrollY = 0;
@@ -3173,14 +3181,23 @@ function openLog(jobId) {
 }
 async function pollLog() {
   if (activeLogJob == null) return;
+  if (pollLog.inFlight) return;
+  pollLog.inFlight = true;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
   try {
-    const r = await api(`/api/jobs/${activeLogJob}/log`);
+    const r = await api(`/api/jobs/${activeLogJob}/log`, {signal: controller.signal});
     const c = $('#logContent');
     const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
     c.textContent = r.log || '(暂无日志)';
     if (atBottom) c.scrollTop = c.scrollHeight;
     if (r.job && ['success','failed','stopped','cancelled'].includes(r.job.status)) clearInterval(logTimer);
-  } catch(e) {}
+  } catch(e) {
+    $('#logContent').textContent = `日志加载失败：${e.name === 'AbortError' ? '请求超过8秒' : e.message}；正在自动重试…`;
+  } finally {
+    clearTimeout(timeoutId);
+    pollLog.inFlight = false;
+  }
 }
 
 // ---------- 账号 ----------
@@ -6389,8 +6406,8 @@ document.addEventListener('click', (e) => {
 // ---------- 初始化 ----------
 loadSummary();
 activateTab(localStorage.getItem('gpt_console_active_tab') || 'register', false);
-jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidden')) refreshJobs(); }, 3000);
-setInterval(loadSummary, 5000);
+jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidden')) refreshJobs(); }, 5000);
+setInterval(loadSummary, 8000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 2000);
 </script>
 </body>

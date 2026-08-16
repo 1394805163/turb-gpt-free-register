@@ -2,6 +2,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from config import proxy
 
@@ -52,6 +53,39 @@ class ProxyFileConfigTests(unittest.TestCase):
 
         self.assertEqual(result, configured)
         self.assertIsNone(loaded_from)
+
+    def test_get_proxy_pool_hot_reloads_atomic_file_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "verified.txt"
+            source.write_text("http://192.0.2.31:8031\n", encoding="utf-8")
+            with patch.object(proxy, "PROXY_POOL_FILE", str(source)), patch.object(
+                proxy, "REGISTRATION_PROXY_REQUIRED", True
+            ):
+                first = proxy.get_proxy_pool()
+                replacement = source.with_suffix(".tmp")
+                replacement.write_text(
+                    "http://192.0.2.32:8032\nhttp://192.0.2.33:8033\n",
+                    encoding="utf-8",
+                )
+                replacement.replace(source)
+                second = proxy.get_proxy_pool()
+
+        self.assertEqual(first, ["http://192.0.2.31:8031"])
+        self.assertEqual(second, [
+            "http://192.0.2.32:8032",
+            "http://192.0.2.33:8033",
+        ])
+
+    def test_get_proxy_pool_required_gate_does_not_fallback_when_file_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "verified.txt"
+            source.write_text("# no qualified nodes\n", encoding="utf-8")
+            with patch.object(proxy, "PROXY_POOL_FILE", str(source)), patch.object(
+                proxy, "REGISTRATION_PROXY_REQUIRED", True
+            ):
+                result = proxy.get_proxy_pool()
+
+        self.assertEqual(result, [])
 
 
 if __name__ == "__main__":

@@ -877,8 +877,18 @@ def claim_account_plan_check(
                 pass
 
         now = _now()
+        trigger_name = str(trigger or "manual")
+        if trigger_name.startswith("auto_retry"):
+            try:
+                retry_count = int(row.get("plan_check_auto_retry_count") or 0) + 1
+            except (TypeError, ValueError):
+                retry_count = 1
+            row["plan_check_auto_retry_count"] = retry_count
+        else:
+            # 手动请求和新注册请求都开始新的自动重试预算。
+            row["plan_check_auto_retry_count"] = 0
         row["plan_check_status"] = "queued"
-        row["plan_check_trigger"] = str(trigger or "manual")
+        row["plan_check_trigger"] = trigger_name
         row["plan_check_queued_at"] = now
         row["plan_check_started_at"] = None
         row["plan_check_completed_at"] = None
@@ -924,11 +934,87 @@ def recover_interrupted_plan_checks() -> int:
             row["plan_check_ok"] = False
             row["plan_check_error"] = "WebUI 重启导致套餐查询中断，请重新查询"
             row["plan_check_completed_at"] = now
+            # 注册成功后的自动套餐检查必须在重启后重新入队；手动检查仍由用户决定是否重试。
+            trigger = str(row.get("plan_check_trigger") or "")
+            row["plan_check_recovery_pending"] = (
+                trigger == "registration_auto" or trigger.startswith("auto_retry")
+            )
             row["updated_at"] = now
             recovered += 1
         if recovered:
             _save_accounts(accounts)
         return recovered
+
+
+def list_stale_plan_checks(limit: int = 500) -> list[dict]:
+    """返回超过运行阈值、可由后台重新入队的套餐查询。"""
+    with _LOCK:
+        now = datetime.now()
+        result: list[dict] = []
+        for row in _load_accounts():
+            status = str(row.get("plan_check_status") or "")
+            if status not in {"queued", "running"}:
+                continue
+            stamp_key = "plan_check_queued_at" if status == "queued" else "plan_check_started_at"
+            try:
+                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+            except (TypeError, ValueError):
+                continue
+            stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if status == "queued" else _PLAN_CHECK_STALE_SECONDS
+            if (now - started_at).total_seconds() < stale_after:
+                continue
+            token = str(row.get("access_token") or "").strip()
+            if not token:
+                continue
+            try:
+                auto_retry_count = int(row.get("plan_check_auto_retry_count") or 0)
+            except (TypeError, ValueError):
+                auto_retry_count = 0
+            result.append({
+                "id": int(row.get("id") or 0),
+                "email": str(row.get("email") or ""),
+                "access_token": token,
+                "status": status,
+                "auto_retry_count": auto_retry_count,
+            })
+            if len(result) >= max(1, int(limit)):
+                break
+        return result
+
+
+def list_recovered_registration_plan_checks(limit: int = 500) -> list[dict]:
+    """返回因重启中断、需要自动重试的注册后套餐检查。"""
+    with _LOCK:
+        result: list[dict] = []
+        for row in _load_accounts():
+            if not row.get("plan_check_recovery_pending"):
+                continue
+            token = str(row.get("access_token") or "").strip()
+            if not token:
+                continue
+            result.append({
+                "id": int(row.get("id") or 0),
+                "email": str(row.get("email") or ""),
+                "access_token": token,
+            })
+            if len(result) >= max(1, int(limit)):
+                break
+        return result
+
+
+def clear_recovered_registration_plan_check(acc_id: int, expected_token_fingerprint: str | None = None) -> bool:
+    """在自动重试成功入队后清除恢复标记；入队失败时保留以便下次重启继续恢复。"""
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None or not row.get("plan_check_recovery_pending"):
+            return False
+        if expected_token_fingerprint is not None and _token_fingerprint(row.get("access_token") or "") != expected_token_fingerprint:
+            return False
+        row["plan_check_recovery_pending"] = False
+        row["updated_at"] = _now()
+        _save_accounts(rows)
+        return True
 
 
 def update_account_plan_check(
@@ -963,6 +1049,7 @@ def update_account_plan_check(
         row["plan_check_http_status"] = result.get("http_status")
         row["plan_check_error"] = None if ok else result.get("error")
         if ok:
+            row["plan_check_auto_retry_count"] = 0
             row["needs_live_check"] = False
         elif result.get("needs_live_check") is True:
             # 只有明确的认证失效才置 True；临时网络错误携带 False 时不得
@@ -2482,6 +2569,34 @@ def get_job(job_id: int) -> dict | None:
     with _LOCK:
         row = next((r for r in _load_jobs() if int(r.get("id") or 0) == int(job_id)), None)
         return dict(row) if row else None
+
+
+def recover_interrupted_registration_jobs() -> int:
+    """服务启动时收敛上次进程遗留的注册任务状态。
+
+    注册线程池只存在于当前进程；服务被重启后历史任务不可能继续执行。running/
+    stopping 标记为 stopped，pending 标记为 cancelled，避免前端永久显示活动任务，
+    也避免用户误以为排队任务仍会自动启动。
+    """
+    with _LOCK:
+        rows = _load_jobs()
+        now = _now()
+        recovered = 0
+        for row in rows:
+            status = row.get("status")
+            if status not in ("running", "stopping", "pending"):
+                continue
+            row["status"] = "cancelled" if status == "pending" else "stopped"
+            row["error_message"] = (
+                "WebUI/注册机重启，原排队实例已取消；可按需重新提交"
+                if status == "pending"
+                else "WebUI/注册机重启，原运行实例已回收；可按需重试"
+            )
+            row["completed_at"] = now
+            recovered += 1
+        if recovered:
+            _save_jobs(rows)
+        return recovered
 
 
 def get_successful_retry_for_job(job_id: int) -> dict | None:

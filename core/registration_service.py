@@ -10,10 +10,16 @@
     → 创建 5 个任务，丢入线程池，立即返回 [job_dict, ...]
 """
 import logging
+import multiprocessing as mp
+import os
+import signal
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from queue import Empty
 from typing import Any
 
 from core import codex_retry_service, db
@@ -23,7 +29,7 @@ from core.pipeline_concurrency import pipeline_slot
 logger = logging.getLogger(__name__)
 
 # 全局线程池，最大并发数（WebUI 每次提交时可按最新 workers 重建）
-_DEFAULT_MAX_WORKERS = 2
+_DEFAULT_MAX_WORKERS = 1
 _MIN_MAX_WORKERS = 1
 _MAX_MAX_WORKERS = 2
 _executor: ThreadPoolExecutor | None = None
@@ -36,10 +42,199 @@ _STOP_EVENTS: dict[int, threading.Event] = {}
 _ACTIVE_JOBS: set[int] = set()
 _STOP_LOCK = threading.Lock()
 _THREAD_CTX = threading.local()
+_ACTIVE_BROWSER_DRIVERS: dict[int, object] = {}
+_ACTIVE_REGISTRATION_PROCESSES: dict[int, mp.Process] = {}
+_ACTIVE_BROWSER_LOCK = threading.RLock()
+
+# 一台 1.6 GiB 内存主机上，一个 CloakBrowser 通常会占用数百 MiB；两个浏览器
+# 同时启动会迅速把页面渲染、Gunicorn 请求线程和 Swap 一起拖慢。线程池仍可保留
+# 排队能力，但实际浏览器阶段只允许一个任务占用资源槽，避免 WebUI 被浏览器抢空。
+_REGISTRATION_BROWSER_SLOTS = threading.BoundedSemaphore(1)
+_JOB_TIMEOUT_DEFAULT_SECONDS = 15 * 60
 
 
 class StopRequested(RuntimeError):
     """用户手动停止注册任务。"""
+
+
+class RegistrationJobTimeout(TimeoutError):
+    """注册子进程超过总时限，已被父任务终止。"""
+
+
+def register_active_browser(job_id: int, driver: object) -> None:
+    """登记任务当前浏览器，供停止/总时长看门狗主动释放阻塞的 RPC。"""
+    if not driver:
+        return
+    with _ACTIVE_BROWSER_LOCK:
+        _ACTIVE_BROWSER_DRIVERS[int(job_id)] = driver
+
+
+def unregister_active_browser(job_id: int, driver: object | None = None) -> None:
+    """移除任务浏览器登记；driver 参数用于避免旧实例误删新实例。"""
+    with _ACTIVE_BROWSER_LOCK:
+        current = _ACTIVE_BROWSER_DRIVERS.get(int(job_id))
+        if driver is None or current is driver:
+            _ACTIVE_BROWSER_DRIVERS.pop(int(job_id), None)
+
+
+def _register_active_registration_process(job_id: int, process: mp.Process) -> None:
+    with _ACTIVE_BROWSER_LOCK:
+        _ACTIVE_REGISTRATION_PROCESSES[int(job_id)] = process
+
+
+def _unregister_active_registration_process(job_id: int, process: mp.Process | None = None) -> None:
+    with _ACTIVE_BROWSER_LOCK:
+        current = _ACTIVE_REGISTRATION_PROCESSES.get(int(job_id))
+        if process is None or current is process:
+            _ACTIVE_REGISTRATION_PROCESSES.pop(int(job_id), None)
+
+
+def _terminate_registration_process(process: mp.Process, reason: str) -> None:
+    """Terminate the isolated registration process and its browser descendants."""
+    # ``Process.close()`` can race with the watchdog timer: the task may have
+    # finished while the timer is already dispatching cleanup.  Accessing
+    # ``pid``/``is_alive`` on a closed multiprocessing object raises
+    # ``ValueError``; cleanup must remain idempotent in that case.
+    try:
+        pid = process.pid
+    except (AttributeError, ValueError):
+        logger.info("[Service] 注册子进程已由任务收尾（%s），跳过重复清理", reason)
+        return
+    if not pid:
+        return
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        pgid = None
+    try:
+        if pgid and pgid != os.getpgrp():
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        logger.warning("[Service] 终止注册子进程失败（%s）：%s", reason, exc)
+        try:
+            process.terminate()
+        except Exception:
+            pass
+    try:
+        process.join(timeout=5)
+    except (AttributeError, ValueError):
+        logger.info("[Service] 注册子进程清理期间已关闭（%s，pid=%s）", reason, pid)
+        return
+    try:
+        alive = process.is_alive()
+    except (AttributeError, ValueError):
+        alive = False
+    if alive:
+        try:
+            pgid = os.getpgid(pid)
+            if pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            process.join(timeout=3)
+        except (AttributeError, ValueError):
+            pass
+    logger.warning("[Service] 注册子进程已终止（%s，pid=%s）", reason, pid)
+
+
+def _force_close_active_browser(job_id: int, reason: str) -> None:
+    """停止任务时优先终止隔离子进程，旧浏览器登记仅作兼容兜底。"""
+    with _ACTIVE_BROWSER_LOCK:
+        process = _ACTIVE_REGISTRATION_PROCESSES.get(int(job_id))
+    if process is not None:
+        threading.Thread(
+            target=_terminate_registration_process,
+            args=(process, reason),
+            name=f"reg-process-stop-{job_id}",
+            daemon=True,
+        ).start()
+        _append_job_log(job_id, f"看门狗已终止注册子进程（{reason}）。")
+        return
+    with _ACTIVE_BROWSER_LOCK:
+        driver = _ACTIVE_BROWSER_DRIVERS.get(int(job_id))
+    if not driver:
+        _append_job_log(job_id, f"看门狗未找到活动浏览器实例（{reason}），继续结束任务。")
+        logger.warning("[Service] 任务 #%s %s，但没有登记中的浏览器实例", job_id, reason)
+        return
+
+    def _close() -> None:
+        try:
+            driver.quit()
+            _append_job_log(job_id, f"看门狗已请求关闭当前浏览器（{reason}）。")
+            logger.warning("[Service] 已关闭任务 #%s 的浏览器实例（%s）", job_id, reason)
+        except Exception as exc:
+            _append_job_log(job_id, f"看门狗关闭浏览器调用异常（{reason}）：{type(exc).__name__}。")
+            logger.warning("[Service] 关闭任务 #%s 浏览器失败（%s）：%s", job_id, reason, exc)
+
+    threading.Thread(target=_close, name=f"reg-browser-stop-{job_id}", daemon=True).start()
+
+
+def _acquire_registration_browser_slot(job_id: int) -> bool:
+    """等待浏览器资源槽；排队期间可响应停止/取消，不会永久卡住线程。"""
+    while True:
+        if is_stop_requested(job_id):
+            return False
+        if _REGISTRATION_BROWSER_SLOTS.acquire(timeout=1.0):
+            return True
+
+
+@contextmanager
+def _registration_browser_slot(job_id: int):
+    """限制 CloakBrowser 实例数量；等待槽位时不占用全局流水线槽。"""
+    acquired = _acquire_registration_browser_slot(job_id)
+    if not acquired:
+        raise StopRequested(f"任务 #{job_id} 在等待浏览器资源槽时被停止")
+    try:
+        yield
+    finally:
+        _REGISTRATION_BROWSER_SLOTS.release()
+
+
+def _job_timeout_seconds() -> int:
+    try:
+        value = int(os.getenv("REGISTRATION_JOB_TIMEOUT_SECONDS", str(_JOB_TIMEOUT_DEFAULT_SECONDS)))
+    except (TypeError, ValueError):
+        value = _JOB_TIMEOUT_DEFAULT_SECONDS
+    return max(180, min(3600, value))
+
+
+def _start_job_watchdog(job_id: int) -> threading.Timer:
+    """给单个注册任务设置总时长上限，避免代理轮换/页面等待无限占用线程。"""
+    timeout = _job_timeout_seconds()
+
+    def _expire() -> None:
+        job = db.get_job(job_id)
+        if not job or job.get("status") not in ("running", "stopping"):
+            return
+        with _STOP_LOCK:
+            event = _STOP_EVENTS.get(int(job_id))
+            if event is not None:
+                event.set()
+        db.update_job(
+            job_id,
+            status="stopping",
+            error=f"自动超时：单任务已运行超过 {timeout} 秒，正在清理浏览器",
+        )
+        _append_job_log(job_id, f"自动看门狗：超过 {timeout} 秒，已发送停止信号并清理当前浏览器。")
+        _force_close_active_browser(job_id, f"自动超时 {timeout}s")
+        logger.warning("[Service] 注册任务 #%s 达到总时长上限 %ss", job_id, timeout)
+
+    timer = threading.Timer(timeout, _expire)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def _activate_job(job_id: int) -> None:
@@ -87,7 +282,7 @@ def _append_job_log(job_id: int, message: str) -> None:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%H:%M:%S")
         with Path(log_file).open("a", encoding="utf-8") as f:
-            f.write(f"{ts} [WARNING] [manual-stop] {message}\n")
+            f.write(f"{ts} [WARNING] [job-control] {message}\n")
     except Exception:
         pass
 
@@ -163,11 +358,15 @@ def _should_disable_failed_registration_email(error: object) -> bool:
     text = str(error or "")
     if not text:
         return False
+    # 只有服务明确返回账号停用/删除时才永久停用邮箱。
+    # 网络、CF、OTP 超时、登录页跳转或资料页暂时性错误均回收到 available，
+    # 避免一次瞬时故障耗尽 iCloud/邮箱池。已确认落盘的账号仍由数据库状态保护，不会被回收。
+    lowered = text.lower()
     return (
-        _is_final_session_access_token_timeout(text)
-        or "邮箱提交后进入登录密码页" in text
-        or "auth.openai.com/log-in/password" in text
-        or "/log-in/password" in text
+        "account_deactivated" in lowered
+        or "account_deleted" in lowered
+        or "account_banned" in lowered
+        or "deleted or deactivated" in lowered
     )
 
 
@@ -257,6 +456,11 @@ class _JobLogContext:
         self.handler: logging.FileHandler | None = None
 
     def __enter__(self):
+        # Gunicorn 直接加载 app factory 时根 logger 默认是 WARNING；显式打开业务 INFO，
+        # 让浏览器启动、代理轮换和页面阶段能实时写进任务日志。
+        logging.getLogger("core").setLevel(logging.INFO)
+        logging.getLogger("main").setLevel(logging.INFO)
+        logging.getLogger(__name__).setLevel(logging.INFO)
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
         self.handler = logging.FileHandler(self.log_path, encoding="utf-8")
         self.handler.setLevel(logging.INFO)
@@ -274,6 +478,101 @@ class _JobLogContext:
         if self.handler is not None:
             self.handler.close()
             logging.getLogger().removeHandler(self.handler)
+
+
+def _registration_process_entry(
+    result_queue,
+    log_file: str,
+    email: str,
+    name: str,
+    birthday: str,
+) -> None:
+    """Run browser automation in a process that can be forcefully reaped."""
+    try:
+        os.setsid()
+    except Exception:
+        pass
+    try:
+        with _JobLogContext(log_file):
+            from main import run_registration
+
+            logging.getLogger(__name__).info("[注册子进程] 已启动，浏览器调用与 WebUI 进程隔离")
+            result = run_registration(email=email, name=name, birthday=birthday)
+        result_queue.put({"kind": "result", "result": result})
+    except BaseException as exc:
+        try:
+            result_queue.put({
+                "kind": "error",
+                "error": f"{type(exc).__name__}: {exc}"[:1000],
+            })
+        except Exception:
+            pass
+
+
+def _run_registration_isolated(job_id: int, log_file: str, email: str, name: str, birthday: str) -> dict:
+    """Wait for a registration child while keeping stop/timeout handling in the parent."""
+    context = mp.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_registration_process_entry,
+        args=(result_queue, log_file, email, name, birthday),
+        name=f"registration-{job_id}",
+    )
+    process.daemon = False
+    process.start()
+    _register_active_registration_process(job_id, process)
+    timeout = _job_timeout_seconds()
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            job = db.get_job(job_id) or {}
+            if is_stop_requested(job_id):
+                # db.get_job exposes the persisted field as error_message.
+                # Reading the old ``error`` key made watchdog timeouts look
+                # like manual stops and selected the wrong terminal status.
+                reason = str(job.get("error_message") or job.get("error") or "用户手动停止")
+                _terminate_registration_process(process, reason)
+                if reason.startswith("自动超时"):
+                    raise RegistrationJobTimeout(reason)
+                raise StopRequested(reason)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reason = f"自动超时：注册子进程超过 {timeout} 秒，已终止并清理浏览器"
+                _terminate_registration_process(process, reason)
+                raise RegistrationJobTimeout(reason)
+            try:
+                message = result_queue.get(timeout=min(0.5, remaining))
+            except Empty:
+                if not process.is_alive():
+                    process.join(timeout=1)
+                    raise RuntimeError(
+                        f"注册子进程异常退出（exitcode={process.exitcode}），任务已收敛"
+                    )
+                continue
+            if not isinstance(message, dict):
+                raise RuntimeError("注册子进程返回了无效结果")
+            if message.get("kind") == "error":
+                raise RuntimeError(str(message.get("error") or "注册子进程失败"))
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("注册子进程未返回有效注册结果")
+            process.join(timeout=3)
+            return result
+    finally:
+        _unregister_active_registration_process(job_id, process)
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
+        if process.is_alive():
+            _terminate_registration_process(process, "父任务收尾")
+        else:
+            process.join(timeout=1)
+        try:
+            process.close()
+        except Exception:
+            pass
 
 
 def _run_one_job_inner(job_id: int, log_file: str) -> None:
@@ -294,16 +593,17 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
         return
 
     db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+    _append_job_log(job_id, "任务已进入运行状态，正在领取邮箱并启动浏览器；后续会逐条记录代理轮换和页面阶段。")
+    watchdog = _start_job_watchdog(job_id)
 
     email: str | None = None
     try:
         with _JobLogContext(log_file):
-            from main import run_registration
             log_logger.info(f"[Job {job_id}] 开始注册任务")
             email, name, birthday = _prepare_registration_args()
             db.update_job(job_id, email=email)
             check_stop_requested()
-            result = run_registration(email=email, name=name, birthday=birthday)
+            result = _run_registration_isolated(job_id, log_file, email, name, birthday)
             if is_stop_requested(job_id):
                 _release_unconsumed_job_email(email, "用户手动停止")
                 db.update_job(
@@ -341,13 +641,27 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
                 else:
                     _release_unconsumed_job_email(email_to_handle, str(err))
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
-    except StopRequested as exc:
+    except RegistrationJobTimeout as exc:
         _release_unconsumed_job_email(email, str(exc))
-        log_logger.warning(f"[Job {job_id}] 已停止: {exc}")
+        log_logger.error(f"[Job {job_id}] 自动超时并已清理子进程: {exc}")
         db.update_job(
             job_id,
-            status="stopped",
-            error="用户手动停止",
+            status="failed",
+            error=str(exc)[:500],
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+    except StopRequested as exc:
+        _release_unconsumed_job_email(email, str(exc))
+        current = db.get_job(job_id) or {}
+        reason = str(current.get("error_message") or str(exc))
+        auto_timeout = reason.startswith("自动超时") or str(exc).startswith("自动超时")
+        terminal_status = "failed" if auto_timeout else "stopped"
+        terminal_error = reason[:500] if auto_timeout else "用户手动停止"
+        log_logger.warning(f"[Job {job_id}] {'自动超时' if auto_timeout else '已停止'}: {reason}")
+        db.update_job(
+            job_id,
+            status=terminal_status,
+            error=terminal_error,
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
     except Exception as exc:
@@ -357,11 +671,19 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
         else:
             _release_unconsumed_job_email(email, err_text)
         if is_stop_requested(job_id):
-            log_logger.warning(f"[Job {job_id}] 停止中捕获异常，按停止处理: {type(exc).__name__}: {exc}")
+            current = db.get_job(job_id) or {}
+            reason = str(current.get("error_message") or str(exc))
+            auto_timeout = reason.startswith("自动超时")
+            terminal_status = "failed" if auto_timeout else "stopped"
+            terminal_error = reason[:500] if auto_timeout else "用户手动停止"
+            log_logger.warning(
+                f"[Job {job_id}] {'自动超时' if auto_timeout else '停止'}中捕获异常，收敛任务: "
+                f"{type(exc).__name__}: {exc}"
+            )
             db.update_job(
                 job_id,
-                status="stopped",
-                error="用户手动停止",
+                status=terminal_status,
+                error=terminal_error,
                 completed_at=datetime.now().isoformat(timespec="seconds"),
             )
             return
@@ -373,6 +695,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
     finally:
+        watchdog.cancel()
         _deactivate_job(job_id)
 
 
@@ -388,8 +711,16 @@ def _run_one_job(job_id: int, log_file: str) -> None:
 
     # inner 内会再次做取消检查，覆盖排队等待槽位期间发生的取消。
     # 注册完成只负责非阻塞地把首测/套餐查询加入队列，不等待下游，避免嵌套占槽死锁。
-    with pipeline_slot("registration"):
-        return _run_one_job_inner(job_id, log_file)
+    # 先等浏览器资源槽，再占用全局流水线槽；排队任务不会阻塞其它轻量后台任务。
+    try:
+        with _registration_browser_slot(job_id):
+            with pipeline_slot("registration"):
+                return _run_one_job_inner(job_id, log_file)
+    except StopRequested as exc:
+        now = datetime.now().isoformat(timespec="seconds")
+        db.update_job(job_id, status="stopped", error="用户手动停止", completed_at=now)
+        _append_job_log(job_id, f"任务在等待浏览器资源槽时停止：{exc}")
+        logger.info("[Job %s] %s", job_id, exc)
 
 
 def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int) -> None:

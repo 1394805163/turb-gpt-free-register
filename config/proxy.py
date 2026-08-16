@@ -2,7 +2,7 @@
 """
 代理池配置
 
-每次注册随机抽取一个代理，保证不同 sid 之间彼此独立，避免风控关联。
+每次注册按打乱后的无重复轮换顺序抽取代理，保证一轮内不重复使用身份。
 
 协议说明：
     - http:// / https://   HTTP(S) 代理
@@ -13,6 +13,7 @@ from config.env_loader import apply_env_overrides
 import logging
 import random
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -130,9 +131,107 @@ PLAN_CHECK_MIN_INTERVAL = 0.4
 PLAN_CHECK_JITTER = 0.3
 
 
+_PROXY_ROTATION_LOCK = threading.Lock()
+_PROXY_ROTATION_SIGNATURE: tuple[str, ...] = ()
+_PROXY_ROTATION_QUEUE: list[str] = []
+_PROXY_ROTATION_INDEX = 0
+_REGISTRATION_PROXY_LEASE_LOCK = threading.Lock()
+_REGISTRATION_PROXY_LEASES: set[str] = set()
+_PROXY_FILE_CACHE_LOCK = threading.Lock()
+_PROXY_FILE_CACHE_SIGNATURE: tuple[str, int, int] | None = None
+_PROXY_FILE_CACHE: list[str] = []
+_CONFIGURED_PROXY_POOL: list[str] = []
+
+
+def get_proxy_pool() -> list[str]:
+    """Return the latest proxy file contents without restarting the WebUI.
+
+    Resin replaces its export atomically.  Cache by path/mtime/size so normal
+    requests do not repeatedly parse the file, while the next registration
+    immediately sees a refreshed pool.  When the Resin gate is required, a
+    missing/empty file deliberately returns an empty list instead of silently
+    falling back to the host's local/direct route.
+    """
+    configured_path = str(PROXY_POOL_FILE or "").strip()
+    if not configured_path:
+        return list(_CONFIGURED_PROXY_POOL or PROXY_POOL or [])
+    path = Path(configured_path).expanduser()
+    if not path.is_absolute():
+        path = (_PROJECT_ROOT / path).resolve()
+    try:
+        stat = path.stat()
+        signature = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        signature = (str(path), -1, -1)
+
+    global _PROXY_FILE_CACHE_SIGNATURE, _PROXY_FILE_CACHE
+    with _PROXY_FILE_CACHE_LOCK:
+        if signature != _PROXY_FILE_CACHE_SIGNATURE:
+            _PROXY_FILE_CACHE = load_proxy_pool_file(path) if signature[1] >= 0 else []
+            _PROXY_FILE_CACHE_SIGNATURE = signature
+        file_pool = list(_PROXY_FILE_CACHE)
+    if file_pool:
+        return file_pool
+    if bool(REGISTRATION_PROXY_REQUIRED):
+        return []
+    return list(_CONFIGURED_PROXY_POOL or PROXY_POOL or [])
+
+
 def pick_proxy() -> str:
-    """从代理池中随机抽取一个代理 URL；池为空时返回空串（即不使用代理）。"""
-    return random.choice(PROXY_POOL) if PROXY_POOL else ""
+    """打乱后逐个轮换代理；一轮耗尽前不重复，池为空时返回空串。"""
+    global _PROXY_ROTATION_SIGNATURE, _PROXY_ROTATION_QUEUE, _PROXY_ROTATION_INDEX
+    pool = tuple(get_proxy_pool())
+    if not pool:
+        return ""
+    with _PROXY_ROTATION_LOCK:
+        if pool != _PROXY_ROTATION_SIGNATURE:
+            _PROXY_ROTATION_SIGNATURE = pool
+            _PROXY_ROTATION_QUEUE = list(pool)
+            random.shuffle(_PROXY_ROTATION_QUEUE)
+            _PROXY_ROTATION_INDEX = 0
+        selected = _PROXY_ROTATION_QUEUE[_PROXY_ROTATION_INDEX]
+        _PROXY_ROTATION_INDEX += 1
+        if _PROXY_ROTATION_INDEX >= len(_PROXY_ROTATION_QUEUE):
+            random.shuffle(_PROXY_ROTATION_QUEUE)
+            if len(_PROXY_ROTATION_QUEUE) > 1 and _PROXY_ROTATION_QUEUE[0] == selected:
+                _PROXY_ROTATION_QUEUE[0], _PROXY_ROTATION_QUEUE[1] = (
+                    _PROXY_ROTATION_QUEUE[1],
+                    _PROXY_ROTATION_QUEUE[0],
+                )
+            _PROXY_ROTATION_INDEX = 0
+        return selected
+
+
+def acquire_registration_proxy(*, excluded: set[str] | None = None, preferred: str | None = None) -> str:
+    """Lease one proxy identity for a registration attempt.
+
+    Active registrations never share the same identity, and one registration
+    can exclude identities it has already tried during the current run.
+    """
+    blocked = set(excluded or ())
+    pool = get_proxy_pool()
+    candidates = len(pool) + (1 if preferred and preferred not in pool else 0)
+    with _REGISTRATION_PROXY_LEASE_LOCK:
+        if preferred and preferred not in blocked and preferred not in _REGISTRATION_PROXY_LEASES:
+            _REGISTRATION_PROXY_LEASES.add(preferred)
+            return preferred
+        for _ in range(candidates):
+            candidate = pick_proxy()
+            if not candidate:
+                break
+            if candidate in blocked or candidate in _REGISTRATION_PROXY_LEASES:
+                continue
+            _REGISTRATION_PROXY_LEASES.add(candidate)
+            return candidate
+    return ""
+
+
+def release_registration_proxy(proxy: str | None) -> None:
+    value = str(proxy or "").strip()
+    if not value:
+        return
+    with _REGISTRATION_PROXY_LEASE_LOCK:
+        _REGISTRATION_PROXY_LEASES.discard(value)
 
 
 def is_us_node_name(node_name: str) -> bool:
@@ -227,7 +326,7 @@ def pick_registration_proxy() -> dict:
 
 
 # 兼容入口：默认每次进程启动随机选一个，作为本次注册全程的固定代理
-PROXY = pick_proxy()
+PROXY = PROXY_POOL[0] if PROXY_POOL else ""
 
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {
@@ -253,7 +352,8 @@ apply_env_overrides(globals(), {
     'PLAN_CHECK_MIN_INTERVAL': 'float',
     'PLAN_CHECK_JITTER': 'float',
 })
+_CONFIGURED_PROXY_POOL = list(PROXY_POOL or [])
 PROXY_POOL, PROXY_POOL_LOADED_FROM = resolve_proxy_pool(PROXY_POOL, PROXY_POOL_FILE)
 if PROXY_POOL_LOADED_FROM:
     logger.info("已从验证结果文件加载 %s 个代理: %s", len(PROXY_POOL), PROXY_POOL_LOADED_FROM)
-PROXY = pick_proxy()
+PROXY = PROXY_POOL[0] if PROXY_POOL else ""

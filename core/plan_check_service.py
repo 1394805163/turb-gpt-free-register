@@ -40,6 +40,10 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="plan-ch
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
 _RATE_LOCK = threading.Lock()
 _NEXT_REQUEST_AT = 0.0
+_STATE_LOCK = threading.Lock()
+_IN_FLIGHT: set[int] = set()
+_RETRY_SCHEDULED: set[int] = set()
+_WATCHDOG_STARTED = False
 
 
 def _wait_for_rate_slot() -> None:
@@ -58,6 +62,109 @@ def _wait_for_rate_slot() -> None:
 
 def _registration_recheck_delay() -> float:
     return _float_setting("PLAN_CHECK_REGISTRATION_RECHECK_DELAY", 2.0, 0.0, 30.0)
+
+
+def _auto_retry_max() -> int:
+    return _int_setting("PLAN_CHECK_AUTO_RETRY_MAX", 2, 0, 5)
+
+
+def _auto_retry_delay() -> float:
+    return _float_setting("PLAN_CHECK_AUTO_RETRY_DELAY", 5.0, 0.5, 60.0)
+
+
+def _schedule_auto_retry(
+    *,
+    account_id: int,
+    email: str,
+    access_token: str,
+    result: dict,
+) -> None:
+    """临时网络失败自动退避重试；认证失效仍交给完整查活。"""
+    if not bool(result.get("retryable")) or result.get("needs_live_check") is True:
+        return
+    max_retries = _auto_retry_max()
+    if max_retries <= 0:
+        return
+    account = db.get_account(account_id) or {}
+    try:
+        retry_count = int(account.get("plan_check_auto_retry_count") or 0)
+    except (TypeError, ValueError):
+        retry_count = 0
+    if retry_count >= max_retries:
+        return
+    with _STATE_LOCK:
+        if account_id in _RETRY_SCHEDULED:
+            return
+        _RETRY_SCHEDULED.add(account_id)
+
+    delay = _auto_retry_delay()
+
+    def _retry() -> None:
+        try:
+            current = db.get_account(account_id) or {}
+            current_token = str(current.get("access_token") or "").strip()
+            expected = db.token_fingerprint(access_token)
+            if not current_token or db.token_fingerprint(current_token) != expected:
+                return
+            queued = enqueue_account_plan_check(
+                account_id=account_id,
+                email=str(current.get("email") or email),
+                access_token=current_token,
+                trigger=f"auto_retry_{retry_count + 1}",
+                proxy=None,
+                timezone_offset_min="-",
+            )
+            if queued.get("accepted"):
+                logger.info(
+                    "[Plan] 临时失败已自动重试: account_id=%s retry=%s/%s",
+                    account_id,
+                    retry_count + 1,
+                    max_retries,
+                )
+            elif not queued.get("busy"):
+                logger.warning(
+                    "[Plan] 自动重试未入队: account_id=%s error=%s",
+                    account_id,
+                    queued.get("error") or queued.get("status") or "unknown",
+                )
+        finally:
+            with _STATE_LOCK:
+                _RETRY_SCHEDULED.discard(account_id)
+
+    timer = threading.Timer(delay, _retry)
+    timer.daemon = True
+    timer.start()
+
+
+def _watchdog_loop() -> None:
+    """回收进程重载后遗留的 queued/running 状态并自动恢复。"""
+    while True:
+        try:
+            for item in db.list_stale_plan_checks(limit=100):
+                account_id = int(item.get("id") or 0)
+                with _STATE_LOCK:
+                    active = account_id in _IN_FLIGHT
+                if active:
+                    continue
+                _schedule_auto_retry(
+                    account_id=account_id,
+                    email=str(item.get("email") or ""),
+                    access_token=str(item.get("access_token") or ""),
+                    result={"retryable": True},
+                )
+        except Exception:
+            logger.exception("[Plan] 后台超时回收检查失败")
+        time.sleep(20.0)
+
+
+def _start_watchdog() -> None:
+    global _WATCHDOG_STARTED
+    with _STATE_LOCK:
+        if _WATCHDOG_STARTED:
+            return
+        _WATCHDOG_STARTED = True
+    thread = threading.Thread(target=_watchdog_loop, name="plan-check-watchdog", daemon=True)
+    thread.start()
 
 
 def _run_plan_check_inner(
@@ -181,12 +288,19 @@ def _run_plan_check_inner(
                 trigger,
                 result.get("error") or "未知错误",
             )
+            _schedule_auto_retry(
+                account_id=account_id,
+                email=email,
+                access_token=access_token,
+                result=result,
+            )
         return result
     except Exception as exc:
         result = {
             "ok": False,
             "checked_at": datetime.now().isoformat(timespec="seconds"),
             "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+            "retryable": True,
         }
         try:
             db.update_account_plan_check(
@@ -196,6 +310,12 @@ def _run_plan_check_inner(
             )
         except Exception:
             logger.exception("[Plan] 写入后台查询异常状态失败: account_id=%s", account_id)
+        _schedule_auto_retry(
+            account_id=account_id,
+            email=email,
+            access_token=access_token,
+            result=result,
+        )
         logger.exception("[Plan] 后台查询异常: %s", redact_email(email))
         return result
     finally:
@@ -204,8 +324,15 @@ def _run_plan_check_inner(
 
 def _run_plan_check(**kwargs) -> dict:
     """注册后套餐查询与注册、测活、推送共用全局两个工作槽。"""
-    with pipeline_slot("plan_check"):
-        return _run_plan_check_inner(**kwargs)
+    account_id = int(kwargs.get("account_id") or 0)
+    with _STATE_LOCK:
+        _IN_FLIGHT.add(account_id)
+    try:
+        with pipeline_slot("plan_check"):
+            return _run_plan_check_inner(**kwargs)
+    finally:
+        with _STATE_LOCK:
+            _IN_FLIGHT.discard(account_id)
 
 
 def enqueue_account_plan_check(
@@ -236,6 +363,8 @@ def enqueue_account_plan_check(
         return {"accepted": False, "busy": True, "error": "该账号正在查询套餐"}
 
     try:
+        with _STATE_LOCK:
+            _IN_FLIGHT.add(account_id)
         _EXECUTOR.submit(
             _run_plan_check,
             account_id=account_id,
@@ -246,6 +375,8 @@ def enqueue_account_plan_check(
             timezone_offset_min=str(timezone_offset_min or "-"),
         )
     except Exception as exc:
+        with _STATE_LOCK:
+            _IN_FLIGHT.discard(account_id)
         _QUEUE_SLOTS.release()
         result = {
             "ok": False,
@@ -276,4 +407,10 @@ def queue_settings() -> dict:
         "shared_pipeline_limit": PIPELINE_MAX_CONCURRENCY,
         "min_interval": _float_setting("PLAN_CHECK_MIN_INTERVAL", 0.4, 0.0, 30.0),
         "jitter": _float_setting("PLAN_CHECK_JITTER", 0.3, 0.0, 30.0),
+        "auto_retry_max": _auto_retry_max(),
+        "auto_retry_delay": _auto_retry_delay(),
+        "watchdog_interval": 20.0,
     }
+
+
+_start_watchdog()

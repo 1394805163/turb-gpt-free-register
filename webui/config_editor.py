@@ -92,6 +92,26 @@ EDITABLE_FIELDS = [
         "label": "Cloak超时", "help": "页面和元素等待超时时间，秒",
     },
     {
+        "key": "CLOAK_LOGIN_PAGE_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
+        "label": "登录页超时", "help": "登录页导航上限，超时会关闭当前浏览器并轮换代理",
+    },
+    {
+        "key": "CLOAK_EMAIL_STEP_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
+        "label": "登录进入下一步超时", "help": "邮箱提交后进入密码页/验证码页的最长等待秒数",
+    },
+    {
+        "key": "CLOAK_PROFILE_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
+        "label": "资料页超时", "help": "姓名/生日资料页的最长等待秒数",
+    },
+    {
+        "key": "CLOAK_SESSION_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
+        "label": "登录态超时", "help": "资料提交后等待 accessToken 的最长秒数",
+    },
+    {
+        "key": "CLOAK_OTP_SUBMIT_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
+        "label": "OTP提交超时", "help": "验证码提交后等待页面状态变化的最长秒数",
+    },
+    {
         "key": "CLOAK_KEEP_BROWSER_OPEN", "file": "cloakbrowser.py", "type": "bool", "group": "CloakBrowser",
         "label": "保留Cloak浏览器", "help": "调试时开启，任务结束后不自动关闭",
     },
@@ -306,6 +326,10 @@ EDITABLE_FIELDS = [
     {
         "key": "OTP_MAX_WAIT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "OTP 最长等待(秒)", "help": "等待验证码邮件的最长秒数，超时判失败",
+    },
+    {
+        "key": "OTP_SINGLE_WAIT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "OTP 单轮等待(秒)", "help": "一次取码轮询的最长秒数，多轮重发仍受 OTP 最长等待总预算限制",
     },
     {
         "key": "OTP_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",

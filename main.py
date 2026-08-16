@@ -6,6 +6,7 @@ ChatGPT 协议注册全流程入口
 import sys
 import argparse
 import logging
+import os
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -199,15 +200,109 @@ def run_registration(
             batch_dir=batch_dir,
         )
     if driver_mode in ("cloak", "cloakbrowser"):
-        from core.cloakbrowser_registration import run_cloak_registration
-        return run_cloak_registration(
-            email=email,
-            name=name,
-            birthday=birthday or generate_random_birthday(),
-            proxy=proxy,
-            otp_code=otp_code,
-            batch_dir=batch_dir,
-        )
+        from config import cloakbrowser as _cloak_cfg
+        from config import proxy as _proxy_cfg
+        from core.cloakbrowser_registration import is_proxy_rejection_error, run_cloak_registration
+
+        pool_size = len(_proxy_cfg.get_proxy_pool())
+        # 可恢复失败继续轮换；配置为 0 或负数表示最多无重复走完当前代理池。
+        configured_attempts = int(getattr(_cloak_cfg, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0) or 0)
+        max_attempts = pool_size if configured_attempts <= 0 else min(configured_attempts, pool_size or 1)
+        max_attempts = max(1, max_attempts)
+        from core.registration_preflight import preflight_proxy
+        last_result = None
+        attempted_proxies: set[str] = set()
+        attempted_exit_ips: set[str] = set()
+        attempt = 0
+        while attempt < max_attempts:
+            try:
+                from core.registration_service import check_stop_requested
+                check_stop_requested()
+            except ImportError:
+                pass
+            selected_proxy = _proxy_cfg.acquire_registration_proxy(
+                excluded=attempted_proxies,
+                preferred=proxy if attempt == 1 else None,
+            )
+            if not selected_proxy:
+                last_result = {"success": False, "email": email, "error": "当前无可分配的新代理身份"}
+                break
+            attempted_proxies.add(selected_proxy)
+            try:
+                required_country = str(os.getenv("REGISTRATION_REQUIRED_COUNTRY", "US") or "").strip().upper()
+                # 轮换任务必须以当前真实出口为准，不能复用跨任务的短缓存结果。
+                preflight = preflight_proxy(selected_proxy, require_country=required_country, force=True)
+                next_attempt = attempt + 1
+                logger.info(
+                    "[Cloak注册][预检] attempt=%s/%s ok=%s country=%s latency_ms=%s reason=%s",
+                    next_attempt, max_attempts, preflight.get("ok"), preflight.get("country") or "?",
+                    preflight.get("latency_ms") or 0, preflight.get("reason") or "-",
+                )
+                if not preflight.get("ok"):
+                    last_result = {"success": False, "email": email, "error": f"代理预检失败: {preflight.get('reason') or 'unknown'}"}
+                    continue
+                exit_ip = str(preflight.get("ip") or "").strip().lower()
+                if exit_ip and exit_ip in attempted_exit_ips:
+                    logger.warning(
+                        "[Cloak注册][代理轮换] 检测到重复真实出口 IP=%s，跳过该 Resin 身份，不消耗浏览器尝试次数",
+                        exit_ip,
+                    )
+                    last_result = {"success": False, "email": email, "error": "重复真实出口 IP，已跳过"}
+                    continue
+                if exit_ip:
+                    attempted_exit_ips.add(exit_ip)
+                attempt = next_attempt
+                logger.warning("[Cloak注册][代理轮换] 开始尝试 %s/%s（代理身份已隐藏）", attempt, max_attempts)
+                last_result = run_cloak_registration(
+                    email=email,
+                    name=name,
+                    birthday=birthday or generate_random_birthday(),
+                    proxy=selected_proxy,
+                    otp_code=otp_code,
+                    batch_dir=batch_dir,
+                    defer_email_release=True,
+                )
+                # 看门狗/用户停止可能在浏览器 RPC 内触发；不要再进入下一代理尝试。
+                try:
+                    from core.registration_service import check_stop_requested
+                    check_stop_requested()
+                except ImportError:
+                    pass
+                if bool((last_result or {}).get("success")):
+                    return last_result
+                error = str((last_result or {}).get("error") or "")
+                lowered_error = error.lower()
+                terminal_email_error = any(marker in lowered_error for marker in (
+                    "account_deactivated",
+                    "deleted or deactivated",
+                    "otp_delivery_timeout",
+                    "用户手动停止",
+                ))
+                if terminal_email_error:
+                    try:
+                        from core.email_provider import release_email
+                        release_email(email, status="failed", note=f"注册终止: {error[:180]}")
+                    except Exception:
+                        pass
+                    return last_result
+                if attempt < max_attempts:
+                    reason = "ChatGPT/Cloudflare 拒绝" if is_proxy_rejection_error(error) else "当前任务可恢复失败"
+                    logger.warning("[Cloak注册][代理轮换] %s，关闭当前浏览器并切换下一个代理", reason)
+            finally:
+                _proxy_cfg.release_registration_proxy(selected_proxy)
+
+        try:
+            from core.email_provider import release_email
+            release_email(email, status="available", note="代理轮换耗尽，邮箱退回可用池")
+        except Exception:
+            pass
+        if isinstance(last_result, dict):
+            last_result["error"] = (
+                f"代理池轮换实际唯一出口 {len(attempted_exit_ips)} 个"
+                f"（检查 Resin 身份 {len(attempted_proxies)} 个）仍未完成注册: "
+                f"{last_result.get('error') or ''}"
+            )[:500]
+        return last_result or {"success": False, "email": email, "error": "代理池轮换耗尽"}
     if driver_mode in ("browser_use", "browseruse", "browser-use", "bu"):
         from core.browser_use_registration import run_browser_use_registration
         return run_browser_use_registration(

@@ -356,6 +356,28 @@ def check_account_plan(
 
     last_result: dict | None = None
     for attempt in range(1, attempts + 1):
+        if attempt > 1 and proxy is None:
+            try:
+                route = resolve_plan_check_route(None)
+                route_meta = {k: v for k, v in route.items() if k != "proxy"}
+                logger.info(
+                    "套餐查询重试已轮换 Resin 身份，第 %s/%s 次，route=%s",
+                    attempt,
+                    attempts,
+                    route_meta.get("network_route") or "unknown",
+                )
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "checked_at": now_iso(),
+                    "http_status": None,
+                    "error": f"套餐查询重试轮换代理失败: {exc}",
+                    "retryable": False,
+                    "attempt_count": attempt,
+                    "max_attempts": attempts,
+                    **route_meta,
+                    **{k: v for k, v in claims.items() if k != "payload"},
+                }
         env = None
         resp = None
         try:

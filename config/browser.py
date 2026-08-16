@@ -84,6 +84,12 @@ COUNTRY_LOCALE_PROFILE_MAP = {
     "JP": "jp", "CN": "cn", "HK": "hk", "TW": "tw", "US": "us", "CA": "us",
     "SG": "sg", "GB": "gb", "AU": "gb", "DE": "de", "FR": "fr", "NL": "nl",
 }
+COUNTRY_CODE_ALIASES = {
+    "UNITED STATES": "US",
+    "UNITED STATES OF AMERICA": "US",
+    "USA": "US",
+    "U.S.": "US",
+}
 
 BROWSER_LOCALE_PROFILES = {
     "jp": {"navigator_language": "ja-JP", "navigator_languages": ["ja-JP"], "accept_language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7", "timezone_iana": "Asia/Tokyo", "timezone_offset_minutes": 9 * 60, "timezone_name": "Japan Standard Time"},
@@ -128,7 +134,8 @@ def _offset_minutes_for_timezone(tz_name: str, default: int) -> int:
 def _locale_profile_key_from_geo(geo: dict | None) -> str:
     if not geo or not AUTO_BROWSER_LOCALE_FROM_IP:
         return BROWSER_LOCALE_PROFILE
-    country = str(geo.get("country") or geo.get("country_code") or "").upper()
+    country = str(geo.get("country") or geo.get("country_code") or "").strip().upper()
+    country = COUNTRY_CODE_ALIASES.get(country, country)
     return COUNTRY_LOCALE_PROFILE_MAP.get(country, BROWSER_LOCALE_PROFILE)
 
 

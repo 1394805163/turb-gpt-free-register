@@ -54,6 +54,15 @@ def _account_payload(account: dict) -> dict:
     """发送完整账号对象；仅移除前端计算字段，保留认证与账号元数据。"""
     payload = dict(account)
     payload.pop("copy_line", None)
+    # chatgpt2api 的 source_type 表示账号进入号池的路径，而 email_source
+    # 仍保留邮箱供应方（icloud/outlook 等）。两者不能混用。
+    payload["source_type"] = "register"
+    payload["type"] = str(
+        payload.get("current_plan_type")
+        or payload.get("plan_type")
+        or payload.get("type")
+        or "free"
+    ).strip().lower()
     return payload
 
 

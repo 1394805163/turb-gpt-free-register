@@ -13,7 +13,7 @@ from webui.app import create_app
 
 class ResinRegistrationGateTests(unittest.TestCase):
     def test_status_requires_nonempty_pool_and_reachable_endpoint(self):
-        with patch.object(proxy_config, "PROXY_POOL", []), patch.object(
+        with patch.object(proxy_config, "get_proxy_pool", return_value=[]), patch.object(
             proxy_config, "REGISTRATION_PROXY_REQUIRED", True, create=True
         ):
             status = registration_proxy_status(check_tcp=False)

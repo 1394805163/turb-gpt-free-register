@@ -212,9 +212,36 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    recovered_registration_jobs = db.recover_interrupted_registration_jobs()
+    if recovered_registration_jobs:
+        logger.warning("已回收 %s 个因 WebUI 重启遗留的注册任务状态", recovered_registration_jobs)
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
+    # 注册成功后的自动套餐检查不能因 WebUI 重启停在 failed；重新入队成功后才清除恢复标记。
+    try:
+        from core.plan_check_service import enqueue_account_plan_check
+        from core.db import token_fingerprint
+
+        for candidate in db.list_recovered_registration_plan_checks():
+            expected = token_fingerprint(candidate["access_token"])
+            queued = enqueue_account_plan_check(
+                account_id=candidate["id"],
+                email=candidate["email"],
+                access_token=candidate["access_token"],
+                # 保留 registration_auto 标记，若本次恢复查询再次被重启打断，下一次启动仍会自动恢复。
+                trigger="registration_auto",
+            )
+            if queued.get("accepted"):
+                db.clear_recovered_registration_plan_check(candidate["id"], expected)
+                logger.info("已重新入队注册后套餐查询: account_id=%s", candidate["id"])
+            else:
+                logger.warning(
+                    "注册后套餐查询恢复入队失败: account_id=%s error=%s",
+                    candidate["id"], queued.get("error") or queued.get("status") or "unknown",
+                )
+    except Exception:
+        logger.exception("恢复注册后套餐查询队列失败")
     recovered_extract_links = db.recover_interrupted_extract_links()
     if recovered_extract_links:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
@@ -2162,17 +2189,25 @@ def create_app(auth_code: str | None = None) -> Flask:
         from config import email as _email_cfg
         manual_otp_required = not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
         rows = db.list_jobs(limit=fetch_limit)
-        for row in rows:
-            row["manual_otp_required"] = manual_otp_required
-            row.update(svc.get_retry_info(row))
         if paged or page_arg is not None or page_size_arg is not None:
+            # 先分页再计算重试信息。旧逻辑会对全部历史任务逐条调用
+            # get_retry_info()，其中还会重复读取注册任务/账号 JSON；前端每 3 秒
+            # 轮询时，在浏览器高负载下会把 Gunicorn 请求线程拖满，表现为 WebUI
+            # 和日志接口一起超时。状态统计只依赖原始行，当前页才需要完整按钮状态。
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             result = _paginate_items(rows, page=page, page_size=page_size)
-            result["items"] = [_compact_job_for_list(r) for r in (result.get("items") or [])]
+            page_rows = result.get("items") or []
+            for row in page_rows:
+                row["manual_otp_required"] = manual_otp_required
+                row.update(svc.get_retry_info(row))
+            result["items"] = [_compact_job_for_list(r) for r in page_rows]
             result["status_counts"] = _job_status_counts(rows)
             result["compact"] = True
             return jsonify(result)
+        for row in rows:
+            row["manual_otp_required"] = manual_otp_required
+            row.update(svc.get_retry_info(row))
         return jsonify(rows)
 
     @app.get("/api/registration/proxy-status")
@@ -2201,7 +2236,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         # workers 控制本次新提交任务使用的线程池；若和上次不同，服务层会为新任务切换到新池。
         try:
-            workers = max(1, min(2, int(data.get("workers", 2))))
+            workers = max(1, min(2, int(data.get("workers", 1))))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "workers 非法"}), 400
 

@@ -101,6 +101,19 @@ class CloakElement:
         except Exception:
             return ""
 
+    @property
+    def text(self) -> str:
+        """Selenium-compatible visible text used by OTP/button helpers."""
+        try:
+            if self.locator is not None:
+                return str(self.locator.inner_text(timeout=1500) or "")
+            return str(self.handle.inner_text() or "")
+        except Exception:
+            try:
+                return str(self._eval("el => el.innerText || el.textContent || ''") or "")
+            except Exception:
+                return ""
+
     def send_keys(self, *values: str) -> None:
         # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a')。
         text = "".join(str(v or "") for v in values)
@@ -308,7 +321,14 @@ class CloakSeleniumDriver:
             msg = str(exc)
             if "Execution context was destroyed" in msg or "navigation" in msg.lower():
                 logger.info("[Cloak] JS 执行后页面发生跳转，忽略返回值读取失败：%s", msg[:160])
-                return {"ok": True, "reason": "navigation_after_script"}
+                # 保留当前 Playwright page.url；上层状态机据此区分正常跨域跳转
+                # 与长期无法完成的空白导航，而不是把两者都记成 unknown。
+                return {
+                    "ok": True,
+                    "reason": "navigation_after_script",
+                    "url": str(getattr(page, "url", "") or ""),
+                    "inputs": [],
+                }
             raise
         finally:
             try:

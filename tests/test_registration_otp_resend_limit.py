@@ -64,6 +64,47 @@ class RegistrationOtpResendLimitTests(unittest.TestCase):
         full_alias_logged = ALIAS in "\n".join(captured.output)
         self.assertFalse(full_alias_logged)
 
+    def test_cloak_stalled_submit_retries_same_code_without_entering_profile_early(self):
+        module = cloakbrowser_registration
+        driver = Mock()
+        opened = SimpleNamespace(profile_id="cloak-profile", raw={})
+        submit = Mock()
+        wait_after_submit = Mock(side_effect=["stalled", "accepted"])
+        with ExitStack() as stack:
+            for item in (
+                patch.object(module, "build_cloak_driver", return_value=(driver, opened)),
+                patch.object(module, "_assert_login_gate_not_blocked"),
+                patch.object(module, "_maybe_accept"),
+                patch.object(module, "_check_manual_stop"),
+                patch.object(module, "_submit_email_and_wait_next", return_value="otp"),
+                patch.object(module, "OtpWaitSession", return_value=SimpleNamespace(wait=Mock(return_value="123456"), mark_used=Mock())),
+                patch.object(module, "_clear_otp_inputs"),
+                patch.object(module, "_type_otp"),
+                patch.object(module, "_click_continue", submit),
+                patch.object(module, "_wait_after_email_otp_submit", wait_after_submit),
+                patch.object(module, "_complete_profile_page", return_value=False),
+                patch.object(module, "_fetch_chatgpt_session", return_value={"accessToken": "fixture-token"}),
+                patch.object(module, "save_account_data", return_value=1),
+                patch.object(module, "resolve_email_source", return_value="icloud"),
+                patch.object(module, "human_delay"),
+                patch.object(module._cfg, "CLOAK_KEEP_BROWSER_OPEN", False),
+                patch.object(module._twofa_cfg, "ENABLE_2FA", False),
+                patch("config.codex.ENABLE_CODEX_AUTO", False),
+            ):
+                stack.enter_context(item)
+            result = module.run_cloak_registration(ALIAS, "Fixture", "1990-01-01")
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(submit.call_count, 2)
+        self.assertEqual(wait_after_submit.call_count, 2)
+
+    def test_otp_page_without_transition_is_stalled_not_accepted(self):
+        module = roxy_registration
+        driver = Mock()
+        with patch.object(module, "_is_email_verification_page", return_value=True):
+            outcome = module._wait_after_email_otp_submit(driver, timeout=0)
+        self.assertEqual(outcome, "stalled")
+
     def test_roxy_failure_failure_success_resends_only_once(self):
         module = roxy_registration
         client = Mock()

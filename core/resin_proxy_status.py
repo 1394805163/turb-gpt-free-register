@@ -43,7 +43,7 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
     from config import cloakbrowser as cloak_cfg
     from config import roxybrowser as registration_cfg
 
-    pool = list(getattr(cfg, "PROXY_POOL", []) or [])
+    pool = cfg.get_proxy_pool()
     required = bool(getattr(cfg, "REGISTRATION_PROXY_REQUIRED", False))
     mihomo_enabled = bool(getattr(cfg, "MIHOMO_US_FALLBACK_ENABLED", False)) and not required
     transparent = mihomo_enabled and bool(getattr(cfg, "MIHOMO_TRANSPARENT_ROUTING", False))
@@ -114,7 +114,7 @@ def test_registration_proxy(*, target_url: str = "https://auth.openai.com/") -> 
 
     selection = {}
     if bool(getattr(cfg, "REGISTRATION_PROXY_REQUIRED", False)):
-        pool = list(getattr(cfg, "PROXY_POOL", []) or [])
+        pool = cfg.get_proxy_pool()
         if not pool:
             return {"ok": False, "error": "Resin 合格代理池为空", **registration_proxy_status(check_tcp=False)}
         selected = pool[0]

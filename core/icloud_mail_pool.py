@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import imaplib
 import json
+import os
 import re
+import secrets
+import stat
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
@@ -55,7 +59,35 @@ class ICloudMailboxPool:
 
     def _save(self, state: dict[str, dict[str, str]]) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+        previous = None
+        try:
+            previous = self.state_file.stat()
+        except FileNotFoundError:
+            pass
+        temp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.state_file.parent,
+                prefix=f".{self.state_file.name}.",
+                delete=False,
+            ) as handle:
+                temp_name = handle.name
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp_name, stat.S_IMODE(previous.st_mode) if previous else 0o600)
+            if previous and os.geteuid() == 0:
+                os.chown(temp_name, previous.st_uid, previous.st_gid)
+            os.replace(temp_name, self.state_file)
+        finally:
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
 
     @staticmethod
     def _available(item: dict[str, str] | None) -> bool:
@@ -80,9 +112,13 @@ class ICloudMailboxPool:
             raise RuntimeError("iCloud 隐藏邮箱池为空")
         with self.lock:
             state = self._load()
-            address = next((item for item in addresses if self._available(state.get(item))), "")
-            if not address:
+            candidates = [item for item in addresses if self._available(state.get(item))]
+            if not candidates:
                 raise RuntimeError(f"iCloud 邮箱池暂无可用邮箱（共 {len(addresses)} 个）")
+            # Hide My Email aliases are not quality-ordered. Random selection prevents
+            # a run of historical/deactivated aliases at the head of an imported file
+            # from starving the registration pipeline.
+            address = secrets.choice(candidates)
             current = dict(state.get(address) or {})
             current.update({"state": "in_use", "reason": "", "updated_at": datetime.now(timezone.utc).isoformat()})
             state[address] = current
