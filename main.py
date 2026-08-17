@@ -229,9 +229,10 @@ def run_registration(
                 break
             attempted_proxies.add(selected_proxy)
             try:
-                required_country = str(os.getenv("REGISTRATION_REQUIRED_COUNTRY", "US") or "").strip().upper()
-                # 轮换任务必须以当前真实出口为准，不能复用跨任务的短缓存结果。
-                preflight = preflight_proxy(selected_proxy, require_country=required_country, force=True)
+                # Exit country is recorded for routing quality analysis, not
+                # used as a registration gate.  A route must still pass the
+                # connectivity and duplicate-egress checks below.
+                preflight = preflight_proxy(selected_proxy, require_country="", force=True)
                 next_attempt = attempt + 1
                 logger.info(
                     "[Cloak注册][预检] attempt=%s/%s ok=%s country=%s latency_ms=%s reason=%s",
@@ -243,9 +244,10 @@ def run_registration(
                     continue
                 exit_ip = str(preflight.get("ip") or "").strip().lower()
                 if exit_ip and exit_ip in attempted_exit_ips:
+                    exit_fingerprint = __import__("hashlib").sha256(exit_ip.encode()).hexdigest()[:10]
                     logger.warning(
-                        "[Cloak注册][代理轮换] 检测到重复真实出口 IP=%s，跳过该 Resin 身份，不消耗浏览器尝试次数",
-                        exit_ip,
+                        "[Cloak注册][代理轮换] 检测到重复真实出口 fp=%s，跳过该 Resin 身份，不消耗浏览器尝试次数",
+                        exit_fingerprint,
                     )
                     last_result = {"success": False, "email": email, "error": "重复真实出口 IP，已跳过"}
                     continue

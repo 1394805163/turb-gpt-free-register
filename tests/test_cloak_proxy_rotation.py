@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import unittest
 from unittest.mock import patch
 
@@ -71,6 +72,33 @@ class CloakProxyRotationTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(len(browser_attempts), 2)
         self.assertEqual(len(set(browser_attempts)), 2)
+
+    def test_preflight_allows_any_country_after_network_check(self):
+        browser_attempts = []
+
+        def register(**kwargs):
+            browser_attempts.append(kwargs["proxy"])
+            return {"success": True, "email": kwargs["email"], "account_id": "fixture"}
+
+        with patch.dict(
+            os.environ,
+            {
+                "REGISTRATION_ALLOWED_COUNTRIES": "JP,US",
+                "REGISTRATION_REQUIRED_COUNTRY": "US",
+            },
+        ), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+            cloakbrowser, "CLOAK_PROXY_ROTATION_ATTEMPTS", 1
+        ), patch.object(proxy, "get_proxy_pool", return_value=self.pool), patch(
+            "core.registration_preflight.preflight_proxy",
+            return_value={"ok": True, "country": "KR", "ip": "198.51.100.20"},
+        ) as preflight, patch(
+            "core.cloakbrowser_registration.run_cloak_registration", side_effect=register
+        ):
+            result = registration_main.run_registration("fixture@example.test", "Fixture", "1990-01-01")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(browser_attempts), 1)
+        self.assertEqual(preflight.call_args.kwargs["require_country"], "")
 
 
 if __name__ == "__main__":
