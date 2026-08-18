@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
 from config import cloakbrowser as _cfg
@@ -48,6 +50,39 @@ def _unregister_active_browser(driver) -> None:
             _service.unregister_active_browser(int(job_id), driver)
     except Exception:
         pass
+
+
+def _close_driver_async(driver, label: str) -> None:
+    def _close() -> None:
+        try:
+            driver.quit()
+            logger.warning("[Cloak注册] 阶段超时，已关闭浏览器：%s", label)
+        except Exception as exc:
+            logger.warning("[Cloak注册] 阶段超时关闭浏览器失败：%s: %s", label, exc)
+
+    threading.Thread(target=_close, name="cloak-stage-stop", daemon=True).start()
+
+
+@contextmanager
+def _stage_deadline(driver, label: str, seconds: int):
+    """Give synchronous browser calls a wall-clock deadline independent of Selenium."""
+    expired = threading.Event()
+    timeout = max(1, int(seconds))
+
+    def _expire() -> None:
+        expired.set()
+        logger.warning("[Cloak注册] 阶段超过 %ss：%s，主动关闭浏览器并结束当前任务", timeout, label)
+        _close_driver_async(driver, label)
+
+    timer = threading.Timer(timeout, _expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+    if expired.is_set():
+        raise TimeoutError(f"execution_stage_timeout: {label} > {timeout}s")
 
 
 _PROXY_REJECTION_MARKERS = (
@@ -120,20 +155,22 @@ def run_cloak_registration(
         logger.info("[Cloak注册] 打开登录页：https://chatgpt.com/auth/login")
         normal_timeout = int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90)
         login_timeout = max(8, min(normal_timeout, int(getattr(_cfg, "CLOAK_LOGIN_PAGE_TIMEOUT", 25) or 25)))
-        driver.set_page_load_timeout(login_timeout)
-        try:
-            driver.get("https://chatgpt.com/auth/login")
-        finally:
-            driver.set_page_load_timeout(normal_timeout)
-        human_delay("navigate")
-        _assert_login_gate_not_blocked(driver)
-        _maybe_accept(driver)
-        _check_manual_stop()
+        with _stage_deadline(driver, "浏览器启动/登录页", login_timeout):
+            driver.set_page_load_timeout(login_timeout)
+            try:
+                driver.get("https://chatgpt.com/auth/login")
+            finally:
+                driver.set_page_load_timeout(normal_timeout)
+            human_delay("navigate")
+            _assert_login_gate_not_blocked(driver)
+            _maybe_accept(driver)
+            _check_manual_stop()
 
         # 相同出口提交失败后继续在同一页面重试意义很小；单次确认失败即交给上层换代理。
         email_step_timeout = max(20, int(getattr(_cfg, "CLOAK_EMAIL_STEP_TIMEOUT", 120) or 120))
-        next_state = _submit_email_and_wait_next(driver, email, attempts=1, timeout=email_step_timeout)
-        _check_manual_stop()
+        with _stage_deadline(driver, "登录页进入下一步", email_step_timeout):
+            next_state = _submit_email_and_wait_next(driver, email, attempts=1, timeout=email_step_timeout)
+            _check_manual_stop()
 
         password_timeout = max(15, int(getattr(_cfg, "CLOAK_PASSWORD_PAGE_TIMEOUT", 45) or 45))
         openai_password = None if next_state == "otp" else _fill_password_page_if_present(driver, email, timeout=password_timeout)
@@ -217,13 +254,15 @@ def run_cloak_registration(
             current_otp = None
 
         profile_timeout = max(30, int(getattr(_cfg, "CLOAK_PROFILE_TIMEOUT", 90) or 90))
-        profile_submitted = _complete_profile_page(driver, name, birthday, timeout=profile_timeout)
+        with _stage_deadline(driver, "资料页提交", profile_timeout):
+            profile_submitted = _complete_profile_page(driver, name, birthday, timeout=profile_timeout)
         if profile_submitted:
             create_acknowledged = True
             human_delay("post_auth")
 
         session_timeout = max(30, int(getattr(_cfg, "CLOAK_SESSION_TIMEOUT", 90) or 90))
-        session_info = _fetch_chatgpt_session(driver, timeout=session_timeout)
+        with _stage_deadline(driver, "登录态/session", session_timeout):
+            session_info = _fetch_chatgpt_session(driver, timeout=session_timeout)
         access_token = session_info["accessToken"]
         logger.info("[Cloak注册] 已拿到 accessToken：%s", redact_email(email))
 

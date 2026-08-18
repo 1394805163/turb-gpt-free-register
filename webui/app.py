@@ -2413,7 +2413,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.post("/api/jobs/<int:job_id>/stop")
     def api_job_stop(job_id: int):
         """手动停止单个注册任务。pending 取消；running 发送停止信号。"""
-        result = svc.request_stop_job(job_id)
+        data = request.get_json(silent=True) or {}
+        reason = str(data.get("reason") or "用户手动停止").strip()[:500]
+        result = svc.request_stop_job(job_id, reason=reason)
         if not result.get("ok"):
             return jsonify({"ok": False, "error": result.get("error") or "停止失败"}), int(result.get("status") or 400)
         return jsonify(result)

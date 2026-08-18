@@ -51,6 +51,7 @@ _ACTIVE_BROWSER_LOCK = threading.RLock()
 # 排队能力，但实际浏览器阶段只允许一个任务占用资源槽，避免 WebUI 被浏览器抢空。
 _REGISTRATION_BROWSER_SLOTS = threading.BoundedSemaphore(1)
 _JOB_TIMEOUT_DEFAULT_SECONDS = 15 * 60
+_JOB_STALL_DEFAULT_SECONDS = 180
 
 
 class StopRequested(RuntimeError):
@@ -59,6 +60,11 @@ class StopRequested(RuntimeError):
 
 class RegistrationJobTimeout(TimeoutError):
     """注册子进程超过总时限，已被父任务终止。"""
+
+
+def _is_automatic_stop_reason(reason: object) -> bool:
+    text = str(reason or "")
+    return text.startswith(("自动超时", "外部看门狗", "execution_stall_timeout"))
 
 
 def register_active_browser(job_id: int, driver: object) -> None:
@@ -208,6 +214,15 @@ def _job_timeout_seconds() -> int:
     except (TypeError, ValueError):
         value = _JOB_TIMEOUT_DEFAULT_SECONDS
     return max(180, min(3600, value))
+
+
+def _job_stall_timeout_seconds() -> int:
+    """Bound a browser child that remains alive but stops making progress."""
+    try:
+        value = int(os.getenv("REGISTRATION_STALL_TIMEOUT_SECONDS", str(_JOB_STALL_DEFAULT_SECONDS)))
+    except (TypeError, ValueError):
+        value = _JOB_STALL_DEFAULT_SECONDS
+    return max(90, min(600, value))
 
 
 def _start_job_watchdog(job_id: int) -> threading.Timer:
@@ -522,7 +537,13 @@ def _run_registration_isolated(job_id: int, log_file: str, email: str, name: str
     process.start()
     _register_active_registration_process(job_id, process)
     timeout = _job_timeout_seconds()
+    stall_timeout = _job_stall_timeout_seconds()
     deadline = time.monotonic() + timeout
+    last_progress_at = time.monotonic()
+    try:
+        last_log_mtime = Path(log_file).stat().st_mtime_ns
+    except OSError:
+        last_log_mtime = 0
     try:
         while True:
             job = db.get_job(job_id) or {}
@@ -532,7 +553,7 @@ def _run_registration_isolated(job_id: int, log_file: str, email: str, name: str
                 # like manual stops and selected the wrong terminal status.
                 reason = str(job.get("error_message") or job.get("error") or "用户手动停止")
                 _terminate_registration_process(process, reason)
-                if reason.startswith("自动超时"):
+                if _is_automatic_stop_reason(reason):
                     raise RegistrationJobTimeout(reason)
                 raise StopRequested(reason)
             remaining = deadline - time.monotonic()
@@ -543,6 +564,20 @@ def _run_registration_isolated(job_id: int, log_file: str, email: str, name: str
             try:
                 message = result_queue.get(timeout=min(0.5, remaining))
             except Empty:
+                try:
+                    log_mtime = Path(log_file).stat().st_mtime_ns
+                except OSError:
+                    log_mtime = last_log_mtime
+                if log_mtime != last_log_mtime:
+                    last_log_mtime = log_mtime
+                    last_progress_at = time.monotonic()
+                elif time.monotonic() - last_progress_at >= stall_timeout:
+                    reason = (
+                        f"execution_stall_timeout: 注册子进程连续 {stall_timeout} 秒无日志进展，"
+                        "已终止浏览器；该结果不判定代理失效"
+                    )
+                    _terminate_registration_process(process, reason)
+                    raise RegistrationJobTimeout(reason)
                 if not process.is_alive():
                     process.join(timeout=1)
                     raise RuntimeError(
@@ -654,7 +689,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
         _release_unconsumed_job_email(email, str(exc))
         current = db.get_job(job_id) or {}
         reason = str(current.get("error_message") or str(exc))
-        auto_timeout = reason.startswith("自动超时") or str(exc).startswith("自动超时")
+        auto_timeout = _is_automatic_stop_reason(reason) or _is_automatic_stop_reason(exc)
         terminal_status = "failed" if auto_timeout else "stopped"
         terminal_error = reason[:500] if auto_timeout else "用户手动停止"
         log_logger.warning(f"[Job {job_id}] {'自动超时' if auto_timeout else '已停止'}: {reason}")
@@ -673,7 +708,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
         if is_stop_requested(job_id):
             current = db.get_job(job_id) or {}
             reason = str(current.get("error_message") or str(exc))
-            auto_timeout = reason.startswith("自动超时")
+            auto_timeout = _is_automatic_stop_reason(reason)
             terminal_status = "failed" if auto_timeout else "stopped"
             terminal_error = reason[:500] if auto_timeout else "用户手动停止"
             log_logger.warning(
@@ -980,16 +1015,17 @@ def cancel_pending_jobs() -> int:
     return cancelled
 
 
-def request_stop_job(job_id: int) -> dict:
+def request_stop_job(job_id: int, *, reason: str = "用户手动停止") -> dict:
     """手动停止单个注册任务。pending 直接取消；running 设置停止标记，运行线程会在检查点退出。"""
+    reason = str(reason or "用户手动停止").strip()[:500] or "用户手动停止"
     job = db.get_job(job_id)
     if not job:
         return {"ok": False, "error": "任务不存在", "status": 404}
     status = job.get("status")
     now_iso = datetime.now().isoformat(timespec="seconds")
     if status == "pending":
-        db.update_job(job_id, status="cancelled", completed_at=now_iso, error="用户手动停止/取消排队")
-        _append_job_log(job_id, "用户手动停止：任务尚未运行，已取消排队。")
+        db.update_job(job_id, status="cancelled", completed_at=now_iso, error=f"{reason}/取消排队")
+        _append_job_log(job_id, f"{reason}：任务尚未运行，已取消排队。")
         return {"ok": True, "message": "排队任务已取消", "job_id": job_id, "state": "cancelled"}
     if status in ("success", "failed", "cancelled", "stopped"):
         return {"ok": True, "message": f"任务已结束：{status}", "job_id": job_id, "state": status}
@@ -1009,18 +1045,18 @@ def request_stop_job(job_id: int) -> dict:
                 job_id,
                 status="stopped",
                 completed_at=now_iso,
-                error="用户手动停止（任务实例不存在）",
+                error=f"{reason}（任务实例不存在）",
             )
             _release_unconsumed_job_email(
                 str(job.get("email") or "").strip() or None,
                 "任务实例不存在，确认未继续执行",
             )
-            _append_job_log(job_id, "用户手动停止：未找到运行中的任务实例，已直接标记为已停止。")
-            logger.warning("[Service] 用户停止任务 #%s：任务实例不存在，已直接标记 stopped", job_id)
+            _append_job_log(job_id, f"{reason}：未找到运行中的任务实例，已直接标记为已停止。")
+            logger.warning("[Service] 请求停止任务 #%s：任务实例不存在，已直接标记 stopped（%s）", job_id, reason)
             return {"ok": True, "message": "任务实例不存在，已直接标记为已停止", "job_id": job_id, "state": "stopped"}
-        db.update_job(job_id, status="stopping", error="用户手动停止中")
-        _append_job_log(job_id, "用户手动停止：已发送停止信号，任务会在当前步骤检查点退出。")
-        logger.warning("[Service] 用户请求停止任务 #%s", job_id)
+        db.update_job(job_id, status="stopping", error=reason)
+        _append_job_log(job_id, f"{reason}：已发送停止信号，任务会在当前步骤检查点退出。")
+        logger.warning("[Service] 请求停止任务 #%s：%s", job_id, reason)
         return {"ok": True, "message": "已发送停止信号", "job_id": job_id, "state": "stopping"}
     return {"ok": False, "error": f"当前状态不支持停止：{status}", "status": 409}
 
