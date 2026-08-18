@@ -2823,7 +2823,7 @@ function renderConfigField(f) {
     html += `<input type="number" data-key="${attrEsc(f.key)}" value="${attrEsc(fv == null ? '' : fv)}">`;
   } else if (f.type === 'float') {
     html += `<input type="number" step="0.1" data-key="${attrEsc(f.key)}" value="${attrEsc(fv == null ? '' : fv)}">`;
-  } else if (f.type === 'list_str_multiline') {
+  } else if (f.type === 'list_str_multiline' || f.type === 'list_str_delimited') {
     html += `<textarea data-key="${attrEsc(f.key)}" placeholder="每行一条，可留空">${attrEsc((fv||[]).join('\n'))}</textarea>`;
   } else {
     // 空字符串/占位符 '-' 都显示为空输入框，避免误保存成真实值
@@ -3192,7 +3192,7 @@ async function saveRoxyWorkspaceSelection() {
 }
 function readConfigElementValue(el, f) {
   if (!f) return undefined;
-  if (f.type === 'list_str_multiline') return el.value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if (f.type === 'list_str_multiline' || f.type === 'list_str_delimited') return el.value.split('\n').flatMap(s => s.split(/[,;]/)).map(s=>s.trim()).filter(Boolean);
   if (f.type === 'bool') return el.value === 'true';
   if (f.type === 'int') return parseInt(el.value || '0', 10);
   if (f.type === 'float') return parseFloat(el.value || '0');

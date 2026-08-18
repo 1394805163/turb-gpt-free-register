@@ -228,6 +228,16 @@ def _coerce_env_value(raw: str, default, vtype: str | None = None):
         except Exception:
             pass
         return [line.strip() for line in text.splitlines() if line.strip()]
+    if vtype == "list_str_delimited":
+        text = str(raw)
+        try:
+            import ast
+            val = ast.literal_eval(text)
+            if isinstance(val, (list, tuple)):
+                return [str(x).strip() for x in val if str(x).strip()]
+        except Exception:
+            pass
+        return [item.strip() for item in re.split(r"[,;\n]+", text) if item.strip()]
     return str(raw).strip()
 
 
@@ -268,7 +278,7 @@ def env_list(key: str, default: list[str] | None = None) -> list[str]:
 def apply_env_overrides(namespace: dict, schema: dict[str, str] | None = None) -> None:
     """用 .env/环境变量覆盖模块 globals() 中的配置常量。
 
-    schema: {KEY: type}，type 支持 bool/int/float/str/list_str_multiline。
+    schema: {KEY: type}，type 支持 bool/int/float/str/list_str_multiline/list_str_delimited。
     没传 schema 时，会对 namespace 里已有的大写常量按默认值类型推断。
     """
     ensure_loaded()

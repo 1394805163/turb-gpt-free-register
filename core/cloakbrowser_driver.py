@@ -440,12 +440,19 @@ def _detect_openai_route_geo(proxy_url: str | None = None) -> dict:
         from config import browser as _browser_cfg
 
         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        response = requests.get(
-            "https://auth.openai.com/cdn-cgi/trace",
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"},
-            proxies=proxies,
-            timeout=(5, float(getattr(_browser_cfg, "IP_GEO_TIMEOUT", 6) or 6)),
-        )
+        client = requests.Session()
+        # 透明路由由本机网络策略接管；不能让 HTTP(S)_PROXY/ALL_PROXY
+        # 把预检送到浏览器不会使用的另一条环境代理路径。
+        client.trust_env = False
+        try:
+            response = client.get(
+                "https://auth.openai.com/cdn-cgi/trace",
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"},
+                proxies=proxies,
+                timeout=(5, float(getattr(_browser_cfg, "IP_GEO_TIMEOUT", 6) or 6)),
+            )
+        finally:
+            client.close()
         if response.status_code != 200:
             return {}
         fields = {}
@@ -545,6 +552,89 @@ def _allows_transparent_mihomo_route(selection: dict | None) -> bool:
     return bool(data.get("transparent")) and data.get("mode") in {"mihomo_us", "mihomo_excluded"}
 
 
+def _is_retryable_mihomo_selection_error(exc: Exception) -> bool:
+    """仅对控制器/网络瞬态错误重选，配置禁用或空池错误立即终止。"""
+    lowered = str(exc or "").lower()
+    if any(marker in lowered for marker in ("disabled", "配置不完整", "为空", "国家过滤")):
+        return False
+    if re.search(r"\b(?:408|425|429|500|502|503|504)\b", lowered):
+        return True
+    return any(marker in lowered for marker in ("timeout", "timed out", "connection", "controller", "tempor"))
+
+
+def _prepare_cloak_route(proxy: str | None) -> tuple[str | None, dict, str | None, bool, dict, dict]:
+    """选择并验证 CloakBrowser 路由，透明 Mihomo 在启动浏览器前有限重选。"""
+    from config import proxy as _proxy_cfg
+
+    use_proxy = bool(getattr(_cfg, "CLOAK_USE_PROXY", True))
+    required = bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
+    if not use_proxy:
+        if required:
+            raise RuntimeError("Resin 注册代理门禁已开启，但 CloakBrowser 代理开关未开启")
+        raise RuntimeError("Resin 门禁已关闭但 CloakBrowser 代理开关未开启；已阻止直连注册")
+
+    if required:
+        proxy_selection = {}
+        if proxy is None:
+            proxy_selection = _proxy_cfg.pick_registration_proxy()
+            proxy = str(proxy_selection.get("proxy_url") or "")
+        if not str(proxy or "").strip():
+            raise RuntimeError("Resin 注册代理门禁已开启，但合格代理池为空；已阻止 VPS 直连注册")
+        proxy_url = _normalize_proxy(proxy)
+        locale_opts = _build_cloak_locale_options(proxy_url)
+        exit_geo = locale_opts.get("geo") if isinstance(locale_opts.get("geo"), dict) else {}
+        return proxy, proxy_selection, proxy_url, False, locale_opts, exit_geo
+
+    try:
+        attempts = max(1, int(getattr(_cfg, "CLOAK_MIHOMO_EXIT_ATTEMPTS", 3) or 3))
+    except (TypeError, ValueError):
+        attempts = 3
+    attempts = min(attempts, 10)
+    last_error: RuntimeError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            proxy_selection = _proxy_cfg.pick_registration_proxy()
+        except RuntimeError as exc:
+            last_error = exc
+            if attempt < attempts and _is_retryable_mihomo_selection_error(exc):
+                logger.warning(
+                    "[Cloak] Mihomo 节点选择失败，启动浏览器前重试：attempt=%s/%s error=%s",
+                    attempt,
+                    attempts,
+                    str(exc)[:180],
+                )
+                continue
+            raise
+        selected_proxy = str(proxy_selection.get("proxy_url") or "")
+        transparent_route = _allows_transparent_mihomo_route(proxy_selection)
+        proxy_url = _normalize_proxy(selected_proxy)
+        if not proxy_url and not transparent_route:
+            raise RuntimeError("Mihomo 注册代理不可用；已阻止直连注册")
+        locale_opts = _build_cloak_locale_options(
+            proxy_url,
+            transparent_route=transparent_route,
+        )
+        # 出口合规性与浏览器指纹的 locale/时区是两件事。无论是否关闭
+        # CLOAK_GEOIP 或显式指定了 locale/timezone，Mihomo 路由都必须用
+        # OpenAI 同域 trace 重新确认真实出口。
+        exit_geo = _detect_openai_route_geo(proxy_url)
+        try:
+            _assert_mihomo_registration_exit(proxy_selection, exit_geo)
+        except RuntimeError as exc:
+            last_error = exc
+            if proxy_selection.get("mode") in {"mihomo_us", "mihomo_excluded"} and attempt < attempts:
+                logger.warning(
+                    "[Cloak] OpenAI 真实出口校验失败，启动浏览器前重选 Mihomo 节点：attempt=%s/%s error=%s",
+                    attempt,
+                    attempts,
+                    str(exc)[:180],
+                )
+                continue
+            raise
+        return selected_proxy, proxy_selection, proxy_url, transparent_route, locale_opts, exit_geo
+    raise last_error or RuntimeError("Mihomo 注册代理不可用；已阻止直连注册")
+
+
 def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
     """启动 CloakBrowser 并返回 Selenium 风格 driver。
 
@@ -552,26 +642,7 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     proxy=""    时显式禁用代理；
     proxy="..." 时使用指定代理。
     """
-    from config import proxy as _proxy_cfg
-    proxy_selection: dict = {}
-    if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
-        required = bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
-        if proxy is None or not required:
-            # Resin 关闭时忽略任意显式代理，强制走 Mihomo 注册出口策略。
-            proxy_selection = _proxy_cfg.pick_registration_proxy()
-            proxy = str(proxy_selection.get("proxy_url") or "")
-        elif not str(proxy or "").strip():
-            raise RuntimeError("注册代理为空；已阻止直连")
-    if bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False)):
-        if not bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
-            raise RuntimeError("Resin 注册代理门禁已开启，但 CloakBrowser 代理开关未开启")
-        if not str(proxy or "").strip():
-            raise RuntimeError("Resin 注册代理门禁已开启，但合格代理池为空；已阻止 VPS 直连注册")
-    else:
-        if not bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
-            raise RuntimeError("Resin 门禁已关闭但 CloakBrowser 代理开关未开启；已阻止直连注册")
-        if not str(proxy or "").strip() and not _allows_transparent_mihomo_route(proxy_selection):
-            raise RuntimeError("Mihomo 注册代理不可用；已阻止直连注册")
+    proxy, proxy_selection, proxy_url, transparent_route, locale_opts, exit_geo = _prepare_cloak_route(proxy)
     try:
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:
@@ -582,14 +653,6 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     if seed:
         launch_args.append(f"--fingerprint={seed}")
 
-    proxy_url = _normalize_proxy(proxy) if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)) else None
-    transparent_route = _allows_transparent_mihomo_route(proxy_selection)
-    locale_opts = _build_cloak_locale_options(
-        proxy_url,
-        transparent_route=transparent_route,
-    )
-    exit_geo = locale_opts.get("geo") if isinstance(locale_opts.get("geo"), dict) else {}
-    _assert_mihomo_registration_exit(proxy_selection, exit_geo)
     if proxy_selection:
         proxy_selection["exit_ip"] = str(exit_geo.get("ip") or "")
         logger.info(

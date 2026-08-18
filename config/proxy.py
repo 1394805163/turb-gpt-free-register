@@ -271,11 +271,14 @@ def _normalize_country_codes(values: object) -> set[str]:
         values = re.split(r"[,;\n\s]+", values)
     if not isinstance(values, (list, tuple, set, frozenset)):
         return set()
-    return {
-        str(value).strip().upper()
-        for value in values
-        if str(value).strip()
-    }
+    result: set[str] = set()
+    for value in values:
+        result.update(
+            item.strip().upper()
+            for item in re.split(r"[,;\n\s]+", str(value))
+            if item.strip()
+        )
+    return result
 
 
 def node_matches_country(node_name: str, country_code: str) -> bool:
@@ -423,7 +426,10 @@ def pick_registration_proxy() -> dict:
             allow_transparent=MIHOMO_TRANSPARENT_ROUTING,
         )
     except Exception as exc:
-        raise RuntimeError(f"Mihomo 美国代理选择失败；已阻止直连: {type(exc).__name__}") from exc
+        reason = str(exc).strip().replace("\n", " ")[:180]
+        raise RuntimeError(
+            f"Mihomo 注册代理选择失败；已阻止直连: {type(exc).__name__} {reason}"
+        ) from exc
 
 
 # 兼容入口：默认每次进程启动随机选一个，作为本次注册全程的固定代理
@@ -444,7 +450,7 @@ apply_env_overrides(globals(), {
     'MIHOMO_CONTROLLER_TIMEOUT': 'float',
     'MIHOMO_REGISTRATION_ROUTE': 'str',
     'MIHOMO_REGISTRATION_GROUP': 'str',
-    'MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES': 'list_str_multiline',
+    'MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES': 'list_str_delimited',
     'PLAN_CHECK_PROXY_MODE': 'str',
     'PLAN_CHECK_PROXY': 'str',
     'PLAN_CHECK_TIMEOUT': 'float',

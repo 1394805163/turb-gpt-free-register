@@ -2729,11 +2729,16 @@ async function loadRegistrationProxyStatus() {
     REGISTRATION_PROXY_READY = !!r.ready;
     box.classList.toggle('is-error', !!r.required && !r.ready);
     const title = box.querySelector('.resin-status-v2-title');
-    const proxyLabel = r.mode === 'mihomo_us' ? 'Mihomo 美国代理' : 'Resin 代理';
+    const isMihomoExcluded = String(r.mode || '').startsWith('mihomo_excluded');
+    const isMihomoUs = String(r.mode || '').startsWith('mihomo_us');
+    const proxyLabel = isMihomoExcluded ? 'Mihomo 国家过滤代理' : isMihomoUs ? 'Mihomo 美国代理' : 'Resin 代理';
     if (title) title.textContent = r.ready
       ? `${proxyLabel}注册：已就绪`
       : `${proxyLabel}注册：已阻止直连`;
-    const source = r.pool_source === 'verified_file' ? '验证文件' : r.pool_source === 'mihomo_us' ? 'chatgpt us 组' : '手动配置';
+    const source = r.pool_source === 'verified_file' ? '验证文件'
+      : r.pool_source === 'mihomo_excluded_controller' ? 'Mihomo 国家过滤组'
+      : r.pool_source === 'mihomo_controller' ? 'Mihomo 控制器'
+      : r.pool_source === 'mihomo_us' ? 'chatgpt us 组' : '手动配置';
     detail.textContent = r.ready
       ? `合格代理 ${r.qualified_count || 0} 个 · 入口 ${r.endpoint || '-'} · 来源 ${source}`
       : `${r.error || '代理未就绪'} · 合格代理 ${r.qualified_count || 0} 个`;
@@ -5833,7 +5838,7 @@ function renderConfigPlainFieldV2(f) {
     control = `<input type="number" data-key="${attrEsc(f.key)}" value="${attrEsc(fv == null ? '' : fv)}">`;
   } else if (f.type === 'float') {
     control = `<input type="number" step="0.1" data-key="${attrEsc(f.key)}" value="${attrEsc(fv == null ? '' : fv)}">`;
-  } else if (f.type === 'list_str_multiline') {
+  } else if (f.type === 'list_str_multiline' || f.type === 'list_str_delimited') {
     control = `<textarea data-key="${attrEsc(f.key)}" placeholder="每行一条，可留空">${attrEsc((fv || []).join('\n'))}</textarea>`;
   } else {
     const shown = isPlaceholderEmpty(fv) ? '' : fv;
@@ -6351,7 +6356,7 @@ async function saveRoxyWorkspaceSelection() {
 
 function readConfigElementValue(el, f) {
   if (!f) return undefined;
-  if (f.type === 'list_str_multiline') return el.value.split('\n').map(s=>s.trim()).filter(Boolean);
+  if (f.type === 'list_str_multiline' || f.type === 'list_str_delimited') return el.value.split('\n').flatMap(s => s.split(/[,;]/)).map(s=>s.trim()).filter(Boolean);
   if (f.type === 'bool') {
     if (el.type === 'checkbox') return !!el.checked;
     return el.value === 'true';

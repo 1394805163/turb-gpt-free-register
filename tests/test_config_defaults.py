@@ -39,6 +39,29 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
 
         self.assertEqual(namespace["PROXY_POOL"], [])
 
+    def test_delimited_env_list_splits_comma_and_newline_delimiters(self):
+        old_loaded = env_loader._LOADED
+        env_loader._LOADED = True
+        try:
+            with patch.dict(os.environ, {"COUNTRIES": "US, HK\nJP"}, clear=True):
+                self.assertEqual(
+                    env_loader.env_value("COUNTRIES", [], "list_str_delimited"),
+                    ["US", "HK", "JP"],
+                )
+        finally:
+            env_loader._LOADED = old_loaded
+
+    def test_multiline_list_preserves_proxy_credentials_with_semicolon(self):
+        raw = "http://user;password@proxy.example.test:8080\nhttp://next.example.test:8080"
+
+        self.assertEqual(
+            env_loader._coerce_env_value(raw, [], "list_str_multiline"),
+            [
+                "http://user;password@proxy.example.test:8080",
+                "http://next.example.test:8080",
+            ],
+        )
+
     def test_config_editor_formats_empty_list_as_literal_empty_list(self):
         self.assertEqual(config_editor._format_env_value([], "list_str_multiline"), "[]")
 

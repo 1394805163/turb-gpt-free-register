@@ -25,7 +25,8 @@ EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL"}
 #   bool   -> True/False
 #   int    -> 整数
 #   str    -> 带引号字符串
-#   list_str_multiline -> 多行字符串列表（PROXY_POOL 专用，整块替换）
+#   list_str_multiline -> 多行字符串列表（代理 URL 等，一行一项）
+#   list_str_delimited -> 支持逗号/分号/换行的枚举列表（国家码等）
 # ============================================================
 
 EDITABLE_FIELDS = [
@@ -74,6 +75,10 @@ EDITABLE_FIELDS = [
     {
         "key": "CLOAK_USE_PROXY", "file": "cloakbrowser.py", "type": "bool", "group": "CloakBrowser",
         "label": "Cloak使用代理", "help": "把本项目传入或代理池抽取的代理传给 CloakBrowser",
+    },
+    {
+        "key": "CLOAK_MIHOMO_EXIT_ATTEMPTS", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
+        "label": "Mihomo出口重选次数", "help": "透明路由在启动浏览器前校验 OpenAI 同域出口；命中排除国家或临时控制器错误时最多重选次数",
     },
     {
         "key": "CLOAK_LICENSE_KEY", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
@@ -544,7 +549,7 @@ EDITABLE_FIELDS = [
         "label": "注册 Mihomo 组", "help": "留空复用 Mihomo 美国组；填写后用于国家过滤模式",
     },
     {
-        "key": "MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES", "file": "proxy.py", "type": "list_str_multiline", "group": "代理池",
+        "key": "MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES", "file": "proxy.py", "type": "list_str_delimited", "group": "代理池",
         "label": "注册排除国家", "help": "逗号或换行分隔的国家码，例如 US,HK；最终仍以 OpenAI 同域出口检测为准",
     },
     {
@@ -825,7 +830,7 @@ def _find_assignment_value_node(source: str, key: str):
 
 def _parse_value_from_source(source: str, key: str, vtype: str):
     """从源码里解析 KEY 的当前值。失败返回 None。"""
-    if vtype == "list_str_multiline":
+    if vtype in ("list_str_multiline", "list_str_delimited"):
         # 用 AST 解析整个模块，取这个赋值的 list 字面量
         value_node = _find_assignment_value_node(source, key)
         if value_node is None:
@@ -875,7 +880,7 @@ def _coerce_raw_value(raw: str, fallback, vtype: str):
             return int(str(raw).strip())
         if vtype == "float":
             return float(str(raw).strip())
-        if vtype == "list_str_multiline":
+        if vtype in ("list_str_multiline", "list_str_delimited"):
             text = str(raw)
             try:
                 val = ast.literal_eval(text)
@@ -883,6 +888,8 @@ def _coerce_raw_value(raw: str, fallback, vtype: str):
                     return [str(x).strip() for x in val if str(x).strip()]
             except Exception:
                 pass
+            if vtype == "list_str_delimited":
+                return [item.strip() for item in re.split(r"[,;\n]+", text) if item.strip()]
             return [line.strip() for line in text.splitlines() if line.strip()]
         return str(raw)
     except Exception:
@@ -907,7 +914,7 @@ def get_config() -> list[dict]:
 
         if key in env_file_values:
             raw_env_value = env_file_values[key]
-            if field["type"] == "list_str_multiline" and key in EXPLICIT_EMPTY_LIST_KEYS and str(raw_env_value).strip() == "":
+            if field["type"] in ("list_str_multiline", "list_str_delimited") and key in EXPLICIT_EMPTY_LIST_KEYS and str(raw_env_value).strip() == "":
                 value = []
             else:
                 value = _coerce_raw_value(raw_env_value, fallback, field["type"])
@@ -916,7 +923,7 @@ def get_config() -> list[dict]:
         else:
             value = fallback
 
-        if field["type"] in ("str", "list_str_multiline"):
+        if field["type"] in ("str", "list_str_multiline", "list_str_delimited"):
             value = _normalize_config_value(value, field["type"])
         item = dict(field)
         item["storage"] = "env"
@@ -942,7 +949,7 @@ def _normalize_config_value(value, vtype: str):
         if s.lower() in {x.lower() for x in _PLACEHOLDER_EMPTY}:
             return ""
         return s
-    if vtype == "list_str_multiline":
+    if vtype in ("list_str_multiline", "list_str_delimited"):
         if value is None:
             return []
         if isinstance(value, str):
@@ -1045,7 +1052,7 @@ def _format_env_value(value, vtype: str) -> str:
         return str(int(value))
     if vtype == "float":
         return repr(float(value))
-    if vtype == "list_str_multiline":
+    if vtype in ("list_str_multiline", "list_str_delimited"):
         lines = _normalize_config_value(value, vtype)
         return "\n".join(lines) if lines else "[]"
     if vtype == "str":

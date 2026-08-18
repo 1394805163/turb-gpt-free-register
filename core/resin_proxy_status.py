@@ -47,6 +47,8 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
     required = bool(getattr(cfg, "REGISTRATION_PROXY_REQUIRED", False))
     mihomo_enabled = bool(getattr(cfg, "MIHOMO_US_FALLBACK_ENABLED", False)) and not required
     transparent = mihomo_enabled and bool(getattr(cfg, "MIHOMO_TRANSPARENT_ROUTING", False))
+    route = str(getattr(cfg, "MIHOMO_REGISTRATION_ROUTE", "us") or "us").strip().lower()
+    mihomo_mode = "mihomo_excluded" if route in {"exclude", "excluded", "country_filter"} else "mihomo_us"
     if mihomo_enabled:
         route_endpoint = (
             str(getattr(cfg, "MIHOMO_CONTROLLER_URL", "") or "").strip()
@@ -72,6 +74,7 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
         online = any(_tcp_reachable(host, port) for host, port in endpoints[:3])
 
     error = ""
+    route_label = "Mihomo 注册代理"
     if driver != "cloak":
         error = f"当前注册驱动为 {driver or '未配置'}，目标驱动应为 cloak"
     elif not cloak_proxy_enabled:
@@ -80,7 +83,7 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
         error = (
             "Mihomo Controller 地址为空"
             if transparent
-            else "Mihomo 美国代理入口为空"
+            else f"{route_label}入口为空"
         ) if mihomo_enabled else "Resin 合格代理池为空"
     elif check_tcp and not online:
         error = (
@@ -93,7 +96,7 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
     loaded_from = getattr(cfg, "PROXY_POOL_LOADED_FROM", None)
     return {
         "required": required,
-        "mode": "mihomo_us_transparent" if transparent else ("mihomo_us" if mihomo_enabled else "resin"),
+        "mode": f"{mihomo_mode}_transparent" if transparent else (mihomo_mode if mihomo_enabled else "resin"),
         "ready": ready,
         "driver": driver,
         "cloak_proxy_enabled": cloak_proxy_enabled,
@@ -101,7 +104,11 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
         "endpoint_count": len(endpoints),
         "endpoint": endpoint_labels[0] if endpoint_labels else "",
         "online": online,
-        "pool_source": "mihomo_controller" if transparent else ("mihomo_us" if mihomo_enabled else ("verified_file" if loaded_from else "configured")),
+        "pool_source": (
+            f"{mihomo_mode}_controller"
+            if transparent
+            else (mihomo_mode if mihomo_enabled else ("verified_file" if loaded_from else "configured"))
+        ),
         "pool_file": str(loaded_from or getattr(cfg, "PROXY_POOL_FILE", "") or ""),
         "management_url": str(getattr(cfg, "RESIN_MANAGEMENT_URL", "") or "").strip(),
         "error": error,
@@ -125,20 +132,27 @@ def test_registration_proxy(*, target_url: str = "https://auth.openai.com/") -> 
         except Exception as exc:
             return {
                 "ok": False,
-                "error": f"Mihomo 美国代理选择失败: {type(exc).__name__}",
+                "error": f"Mihomo 注册代理选择失败: {type(exc).__name__}",
                 **registration_proxy_status(check_tcp=False),
             }
     started = time.monotonic()
     try:
         proxies = {"http": selected, "https": selected} if selected else None
-        response = requests.get(
-            target_url,
-            proxies=proxies,
-            timeout=(5, 12),
-            allow_redirects=False,
-            stream=True,
-            headers={"User-Agent": "Mozilla/5.0 Resin registration connectivity check"},
-        )
+        client = requests.Session()
+        # 与透明 Mihomo 的实际浏览器路径一致，不让 HTTPS_PROXY/ALL_PROXY
+        # 把“测试代理”请求静默导向另一条环境代理。
+        client.trust_env = False
+        try:
+            response = client.get(
+                target_url,
+                proxies=proxies,
+                timeout=(5, 12),
+                allow_redirects=False,
+                stream=True,
+                headers={"User-Agent": "Mozilla/5.0 Resin registration connectivity check"},
+            )
+        finally:
+            client.close()
         latency_ms = round((time.monotonic() - started) * 1000)
         ok = response.status_code not in {407, 502, 503, 504}
         response.close()

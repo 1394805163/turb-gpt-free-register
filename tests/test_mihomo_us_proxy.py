@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import sys
+import types
 import unittest
 from unittest.mock import Mock, patch
 
@@ -125,14 +127,27 @@ class MihomoUsProxyTests(unittest.TestCase):
         with patch.object(proxy, "select_mihomo_us_proxy", side_effect=ConnectionError("controller down")), patch.object(
             proxy, "REGISTRATION_PROXY_REQUIRED", False, create=True
         ), patch.object(proxy, "MIHOMO_US_FALLBACK_ENABLED", True, create=True):
-            with self.assertRaisesRegex(RuntimeError, "Mihomo"):
-                proxy.pick_registration_proxy()
+            with patch.object(proxy, "MIHOMO_REGISTRATION_ROUTE", "us"):
+                with self.assertRaisesRegex(RuntimeError, "Mihomo"):
+                    proxy.pick_registration_proxy()
 
         with patch.object(proxy, "REGISTRATION_PROXY_REQUIRED", False), patch.object(
             proxy, "MIHOMO_US_FALLBACK_ENABLED", True
         ), patch.object(proxy, "MIHOMO_US_GROUP", ""):
-            with self.assertRaisesRegex(RuntimeError, "配置不完整"):
+            with patch.object(proxy, "MIHOMO_REGISTRATION_ROUTE", "us"):
+                with self.assertRaisesRegex(RuntimeError, "配置不完整"):
+                    proxy.pick_registration_proxy()
+
+    def test_controller_http_503_is_exposed_for_transient_route_retry(self):
+        with patch.object(
+            proxy,
+            "select_mihomo_us_proxy",
+            side_effect=__import__("requests").HTTPError("503 Server Error"),
+        ), patch.object(proxy, "MIHOMO_REGISTRATION_ROUTE", "us"):
+            with self.assertRaisesRegex(RuntimeError, "503"):
                 proxy.pick_registration_proxy()
+
+        self.assertTrue(cloakbrowser_driver._is_retryable_mihomo_selection_error(RuntimeError("503 Server Error")))
 
     def test_pick_registration_proxy_accepts_configured_chatgpt_group_name(self):
         selected = {
@@ -146,7 +161,8 @@ class MihomoUsProxyTests(unittest.TestCase):
         ), patch.object(proxy, "MIHOMO_US_GROUP", "🤖 ChatGPT"), patch.object(
             proxy, "select_mihomo_us_proxy", return_value=selected
         ) as select_proxy:
-            self.assertEqual(proxy.pick_registration_proxy(), selected)
+            with patch.object(proxy, "MIHOMO_REGISTRATION_ROUTE", "us"):
+                self.assertEqual(proxy.pick_registration_proxy(), selected)
 
         self.assertEqual(select_proxy.call_args.kwargs["group"], "🤖 ChatGPT")
 
@@ -207,7 +223,9 @@ class MihomoUsProxyTests(unittest.TestCase):
 
         with patch.object(proxy, "REGISTRATION_PROXY_REQUIRED", False), patch.object(
             proxy, "MIHOMO_US_FALLBACK_ENABLED", True
-        ), patch.object(proxy, "MIHOMO_TRANSPARENT_ROUTING", True), patch.object(
+        ), patch.object(proxy, "MIHOMO_REGISTRATION_ROUTE", "us"), patch.object(
+            proxy, "MIHOMO_TRANSPARENT_ROUTING", True
+        ), patch.object(
             proxy, "MIHOMO_CONTROLLER_URL", "http://192.168.6.1:9090"
         ), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
             cloakbrowser, "CLOAK_USE_PROXY", True
@@ -215,6 +233,22 @@ class MihomoUsProxyTests(unittest.TestCase):
             status = resin_proxy_status.registration_proxy_status(check_tcp=True)
         self.assertTrue(status["ready"])
         self.assertEqual(status["mode"], "mihomo_us_transparent")
+
+    def test_status_labels_excluded_transparent_route(self):
+        with patch.object(proxy, "REGISTRATION_PROXY_REQUIRED", False), patch.object(
+            proxy, "MIHOMO_US_FALLBACK_ENABLED", True
+        ), patch.object(proxy, "MIHOMO_REGISTRATION_ROUTE", "exclude"), patch.object(
+            proxy, "MIHOMO_TRANSPARENT_ROUTING", True
+        ), patch.object(proxy, "MIHOMO_CONTROLLER_URL", "http://192.168.6.1:9090"), patch.object(
+            roxybrowser, "REGISTRATION_DRIVER", "cloak"
+        ), patch.object(
+            cloakbrowser, "CLOAK_USE_PROXY", True
+        ), patch.object(resin_proxy_status, "_tcp_reachable", return_value=True):
+            status = resin_proxy_status.registration_proxy_status(check_tcp=True)
+
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["mode"], "mihomo_excluded_transparent")
+        self.assertEqual(status["pool_source"], "mihomo_excluded_controller")
 
     def test_transparent_route_uses_openai_trace_for_geo_instead_of_direct_exit(self):
         with patch.object(
@@ -269,6 +303,182 @@ class MihomoUsProxyTests(unittest.TestCase):
                 "transparent": True,
             })
         )
+
+    def test_transparent_route_reselects_before_starting_browser_after_excluded_openai_exit(self):
+        selections = iter([
+            {
+                "mode": "mihomo_excluded",
+                "transparent": True,
+                "node_name": "US-01",
+                "excluded_countries": ["US", "HK"],
+            },
+            {
+                "mode": "mihomo_excluded",
+                "transparent": True,
+                "node_name": "JP-01",
+                "excluded_countries": ["US", "HK"],
+            },
+        ])
+        launch = Mock()
+        browser = Mock()
+        context = Mock()
+        page = Mock()
+        launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = page
+        fake_cloak = types.SimpleNamespace(launch=launch, launch_persistent_context=Mock())
+
+        with patch.dict(sys.modules, {"cloakbrowser": fake_cloak}), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", False
+        ), patch.object(
+            cloakbrowser, "CLOAK_USE_PROXY", True
+        ), patch.object(
+            cloakbrowser,
+            "CLOAK_MIHOMO_EXIT_ATTEMPTS",
+            2,
+            create=True,
+        ), patch.object(
+            proxy,
+            "pick_registration_proxy",
+            side_effect=lambda: next(selections),
+        ) as pick_route, patch.object(
+            cloakbrowser_driver,
+            "_build_cloak_locale_options",
+            return_value={},
+        ), patch.object(
+            cloakbrowser_driver,
+            "_detect_openai_route_geo",
+            side_effect=[
+                {"country": "US", "ip": "198.51.100.10"},
+                {"country": "JP", "ip": "198.51.100.11"},
+            ],
+        ):
+            _, result = cloakbrowser_driver.build_cloak_driver()
+
+        self.assertEqual(pick_route.call_count, 2)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(result.raw["proxy_node"], "JP-01")
+
+    def test_required_resin_route_selects_pool_when_proxy_is_not_explicit(self):
+        selection = {
+            "mode": "resin",
+            "proxy_url": "http://proxy.example.test:8080",
+            "node_name": "",
+        }
+        launch = Mock()
+        browser = Mock()
+        context = Mock()
+        launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = Mock()
+        fake_cloak = types.SimpleNamespace(launch=launch, launch_persistent_context=Mock())
+
+        with patch.dict(sys.modules, {"cloakbrowser": fake_cloak}), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", True
+        ), patch.object(
+            cloakbrowser, "CLOAK_USE_PROXY", True
+        ), patch.object(
+            proxy, "pick_registration_proxy", return_value=selection
+        ) as pick_route, patch.object(
+            cloakbrowser_driver,
+            "_build_cloak_locale_options",
+            return_value={},
+        ):
+            _, result = cloakbrowser_driver.build_cloak_driver()
+
+        pick_route.assert_called_once_with()
+        self.assertEqual(result.raw["proxy"], "http://proxy.example.test:8080")
+
+    def test_transparent_route_verifies_openai_trace_when_geoip_is_disabled(self):
+        selection = {
+            "mode": "mihomo_excluded",
+            "transparent": True,
+            "node_name": "JP-01",
+            "excluded_countries": ["US", "HK"],
+        }
+        launch = Mock()
+        browser = Mock()
+        context = Mock()
+        launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = Mock()
+        fake_cloak = types.SimpleNamespace(launch=launch, launch_persistent_context=Mock())
+
+        with patch.dict(sys.modules, {"cloakbrowser": fake_cloak}), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", False
+        ), patch.object(
+            cloakbrowser, "CLOAK_USE_PROXY", True
+        ), patch.object(
+            cloakbrowser, "CLOAK_GEOIP", False
+        ), patch.object(
+            proxy, "pick_registration_proxy", return_value=selection
+        ), patch.object(
+            cloakbrowser_driver,
+            "_detect_openai_route_geo",
+            return_value={"country": "JP", "ip": "198.51.100.12"},
+        ) as trace:
+            _, result = cloakbrowser_driver.build_cloak_driver()
+
+        trace.assert_called_once_with(None)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(result.raw["proxy_exit_ip"], "198.51.100.12")
+
+    def test_transparent_route_retries_controller_selection_before_starting_browser(self):
+        selection = {
+            "mode": "mihomo_excluded",
+            "transparent": True,
+            "node_name": "JP-01",
+            "excluded_countries": ["US", "HK"],
+        }
+        launch = Mock()
+        browser = Mock()
+        context = Mock()
+        launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = Mock()
+        fake_cloak = types.SimpleNamespace(launch=launch, launch_persistent_context=Mock())
+
+        with patch.dict(sys.modules, {"cloakbrowser": fake_cloak}), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", False
+        ), patch.object(
+            cloakbrowser, "CLOAK_USE_PROXY", True
+        ), patch.object(
+            cloakbrowser, "CLOAK_MIHOMO_EXIT_ATTEMPTS", 2
+        ), patch.object(
+            proxy,
+            "pick_registration_proxy",
+            side_effect=[RuntimeError("controller timeout"), selection],
+        ) as pick_route, patch.object(
+            cloakbrowser_driver,
+            "_build_cloak_locale_options",
+            return_value={"geo": {"country": "JP", "ip": "198.51.100.13"}},
+        ), patch.object(
+            cloakbrowser_driver,
+            "_detect_openai_route_geo",
+            return_value={"country": "JP", "ip": "198.51.100.13"},
+        ):
+            _, result = cloakbrowser_driver.build_cloak_driver()
+
+        self.assertEqual(pick_route.call_count, 2)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(result.raw["proxy_node"], "JP-01")
+
+    def test_openai_trace_does_not_inherit_process_proxy_environment(self):
+        response = Mock()
+        response.status_code = 200
+        response.text = "ip=198.51.100.14\nloc=JP\ncolo=NRT\n"
+        session = Mock()
+        session.get.return_value = response
+
+        with patch("requests.get", return_value=response), patch(
+            "requests.Session", return_value=session
+        ) as session_factory:
+            result = cloakbrowser_driver._detect_openai_route_geo(None)
+
+        session_factory.assert_called_once_with()
+        self.assertFalse(session.trust_env)
+        session.get.assert_called_once()
+        self.assertEqual(result["country"], "JP")
 
     def test_transparent_liveness_preserves_explicit_empty_proxy(self):
         session = Mock()
@@ -376,6 +586,34 @@ class MihomoUsProxyTests(unittest.TestCase):
         self.assertTrue(proxy.node_matches_country("🇭🇰 香港-01", "HK"))
         self.assertTrue(proxy.node_matches_country("🇯🇵 日本-东京", "JP"))
         self.assertFalse(proxy.node_matches_country("🇸🇬 SG-01", "HK"))
+        self.assertEqual(proxy._normalize_country_codes(["US,HK", "JP"]), {"US", "HK", "JP"})
+        country_field = next(
+            field for field in config_editor.EDITABLE_FIELDS
+            if field["key"] == "MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES"
+        )
+        self.assertEqual(country_field["type"], "list_str_delimited")
+        self.assertIn(
+            "CLOAK_MIHOMO_EXIT_ATTEMPTS",
+            {field["key"] for field in config_editor.EDITABLE_FIELDS},
+        )
+
+    def test_proxy_test_ignores_process_proxy_environment_in_transparent_mode(self):
+        response = Mock(status_code=200)
+        response.close.return_value = None
+        client = Mock()
+        client.get.return_value = response
+
+        with patch.object(proxy, "REGISTRATION_PROXY_REQUIRED", False), patch.object(
+            proxy, "pick_registration_proxy", return_value={
+                "mode": "mihomo_excluded", "proxy_url": "", "node_name": "JP-01"
+            }
+        ), patch("requests.Session", return_value=client) as session_factory:
+            result = resin_proxy_status.test_registration_proxy()
+
+        session_factory.assert_called_once_with()
+        self.assertFalse(client.trust_env)
+        client.get.assert_called_once()
+        self.assertTrue(result["ok"])
 
     def test_resin_disabled_never_allows_explicit_or_liveness_direct_bypass(self):
         with patch.object(proxy, "REGISTRATION_PROXY_REQUIRED", False), patch.object(
