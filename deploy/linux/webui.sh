@@ -4,11 +4,11 @@ set -euo pipefail
 # Turb GPT Free Register WebUI 管理脚本
 #
 # 用法：
-#   ./webui.sh start      启动 WebUI
-#   ./webui.sh stop       关闭 WebUI
-#   ./webui.sh restart    重启 WebUI
-#   ./webui.sh status     查看状态
-#   ./webui.sh logs       实时查看日志
+#   ./deploy/linux/webui.sh start      启动 WebUI
+#   ./deploy/linux/webui.sh stop       关闭 WebUI
+#   ./deploy/linux/webui.sh restart    重启 WebUI
+#   ./deploy/linux/webui.sh status     查看状态
+#   ./deploy/linux/webui.sh logs       实时查看日志
 #
 # 可选环境变量：
 #   HOST=127.0.0.1
@@ -18,7 +18,7 @@ set -euo pipefail
 #   AUTH_CODE=xxx
 #   EXTRA_ARGS="..."
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 RUN_DIR="$ROOT_DIR/run"
@@ -63,9 +63,9 @@ commands:
   HOST=127.0.0.1 PORT=5000 OPEN_BROWSER=1 VERBOSE=1 AUTH_CODE=xxx EXTRA_ARGS="..."
 
 示例：
-  ./webui.sh start
-  PORT=8000 OPEN_BROWSER=1 ./webui.sh start
-  HOST=0.0.0.0 PORT=5000 ./webui.sh restart
+  ./deploy/linux/webui.sh start
+  PORT=8000 OPEN_BROWSER=1 ./deploy/linux/webui.sh start
+  HOST=0.0.0.0 PORT=5000 ./deploy/linux/webui.sh restart
 EOF
 }
 

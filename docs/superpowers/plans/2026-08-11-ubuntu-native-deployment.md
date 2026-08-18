@@ -24,7 +24,7 @@
 - 创建 `.gitattributes`：固定 Linux 文本文件为 LF。
 - 创建 `LINUX_DEPLOY.md`：安装、升级、回滚、内存和故障排查。
 - 修改 `requirements.txt`：加入 Gunicorn。
-- 修改 `webui.sh`：手工启动时优先复用生产 Gunicorn 配置。
+- 修改 `deploy/linux/webui.sh`：手工启动时优先复用生产 Gunicorn 配置。
 - 修改 `README.md`：提供 Linux 部署入口。
 
 ### 任务 1：建立单 worker 的低内存 Gunicorn 运行时
@@ -32,7 +32,7 @@
 **文件：**
 - 创建：`deploy/linux/gunicorn.conf.py`
 - 修改：`requirements.txt`
-- 修改：`webui.sh`
+- 修改：`deploy/linux/webui.sh`
 - 测试：`tests/test_linux_deployment.py`
 
 - [ ] **步骤 1：编写失败的 Gunicorn 契约测试**
@@ -62,7 +62,7 @@ class GunicornConfigTests(unittest.TestCase):
 
 `gunicorn.conf.py` 固定 1 worker、`gthread`、4 threads、`preload_app=False`、`graceful_timeout=45`，绑定地址从 `HOST`/`PORT` 环境变量读取；不要定义 `max_requests`。
 
-`webui.sh` 在 `.venv/bin/gunicorn` 存在时启动：
+`deploy/linux/webui.sh` 在 `.venv/bin/gunicorn` 存在时启动：
 
 ```bash
 "$ROOT_DIR/.venv/bin/gunicorn" \
@@ -81,7 +81,7 @@ class GunicornConfigTests(unittest.TestCase):
 - [ ] **步骤 5：提交任务 1**
 
 ```bash
-git add deploy/linux/gunicorn.conf.py requirements.txt webui.sh tests/test_linux_deployment.py
+git add deploy/linux/gunicorn.conf.py deploy/linux/webui.sh requirements.txt tests/test_linux_deployment.py
 git commit -m "perf: 添加单进程低内存 Gunicorn 运行时"
 ```
 
@@ -161,7 +161,7 @@ def test_bootstrap_preserves_secrets_and_installs_cloak_as_service_user(self):
 "C:/Program Files/Git/bin/bash.exe" -n deploy/linux/bootstrap.sh
 "C:/Program Files/Git/bin/bash.exe" -n deploy/linux/install-systemd.sh
 "C:/Program Files/Git/bin/bash.exe" -n deploy/linux/doctor.sh
-"C:/Program Files/Git/bin/bash.exe" -n webui.sh
+"C:/Program Files/Git/bin/bash.exe" -n deploy/linux/webui.sh
 ```
 
 预期：全部退出 0。

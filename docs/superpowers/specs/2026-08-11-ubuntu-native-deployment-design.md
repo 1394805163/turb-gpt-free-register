@@ -83,7 +83,7 @@ HTTP 线程只负责 WebUI 和任务入队。耗时注册工作仍由项目现�
 - `.gitattributes`：强制 shell 和 systemd 文件使用 LF。
 - `.github/workflows/linux-ci.yml`：在 Ubuntu 24.04 上执行部署结构与项目测试。
 
-`requirements.txt` 增加 Gunicorn。`webui.sh` 在虚拟环境存在 Gunicorn 时使用同一份生产配置；没有 Gunicorn 时才回退到 Flask 开发服务器，保持旧开发环境可用。
+`requirements.txt` 增加 Gunicorn。`deploy/linux/webui.sh` 在虚拟环境存在 Gunicorn 时使用同一份生产配置；没有 Gunicorn 时才回退到 Flask 开发服务器，保持旧开发环境可用。
 
 ## 安装流程
 

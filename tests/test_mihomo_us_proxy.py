@@ -43,6 +43,49 @@ class MihomoUsProxyTests(unittest.TestCase):
             "Bearer controller-secret",
         )
 
+    def test_selects_node_outside_us_and_hk_from_registration_group(self):
+        session = Mock()
+        session.get.return_value = self._response({
+            "name": "🤖 ChatGPT",
+            "type": "Selector",
+            "now": "🇺🇸 US-01",
+            "all": ["🇺🇸 US-01", "🇭🇰 香港-01", "🇯🇵 日本-东京", "🇸🇬 SG-01"],
+        })
+        session.put.return_value = self._response({})
+
+        with patch.object(proxy.random, "choice", return_value="🇯🇵 日本-东京"):
+            selected = proxy.select_mihomo_proxy(
+                controller_url="http://127.0.0.1:9090",
+                secret="controller-secret",
+                group="🤖 ChatGPT",
+                proxy_url="socks5h://127.0.0.1:7897",
+                excluded_countries={"US", "HK"},
+                session=session,
+            )
+
+        self.assertEqual(selected["mode"], "mihomo_excluded")
+        self.assertEqual(selected["excluded_countries"], ["HK", "US"])
+        self.assertEqual(selected["node_name"], "🇯🇵 日本-东京")
+        self.assertEqual(session.put.call_args.kwargs["json"], {"name": "🇯🇵 日本-东京"})
+
+    def test_registration_group_rejects_when_only_excluded_nodes_exist(self):
+        session = Mock()
+        session.get.return_value = self._response({
+            "name": "🤖 ChatGPT",
+            "now": "🇭🇰 香港-01",
+            "all": ["DIRECT", "🇺🇸 US-01", "🇭🇰 香港-01", "REJECT"],
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "国家过滤"):
+            proxy.select_mihomo_proxy(
+                controller_url="http://127.0.0.1:9090",
+                secret="",
+                group="🤖 ChatGPT",
+                proxy_url="socks5h://127.0.0.1:7897",
+                excluded_countries={"US", "HK"},
+                session=session,
+            )
+
     def test_rotation_prefers_a_different_us_node_than_current(self):
         session = Mock()
         session.get.return_value = self._response({
@@ -106,6 +149,26 @@ class MihomoUsProxyTests(unittest.TestCase):
             self.assertEqual(proxy.pick_registration_proxy(), selected)
 
         self.assertEqual(select_proxy.call_args.kwargs["group"], "🤖 ChatGPT")
+
+    def test_pick_registration_proxy_dispatches_to_country_filter_mode(self):
+        selected = {
+            "mode": "mihomo_excluded",
+            "group": "🤖 ChatGPT",
+            "node_name": "🇯🇵 日本-东京",
+            "proxy_url": "",
+            "transparent": True,
+        }
+        with patch.object(proxy, "REGISTRATION_PROXY_REQUIRED", False), patch.object(
+            proxy, "MIHOMO_US_FALLBACK_ENABLED", True
+        ), patch.object(proxy, "MIHOMO_REGISTRATION_ROUTE", "exclude"), patch.object(
+            proxy, "MIHOMO_REGISTRATION_GROUP", "🤖 ChatGPT"
+        ), patch.object(proxy, "MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES", ["US", "HK"]), patch.object(
+            proxy, "select_mihomo_proxy", return_value=selected
+        ) as select_proxy:
+            self.assertEqual(proxy.pick_registration_proxy(), selected)
+
+        self.assertEqual(select_proxy.call_args.kwargs["excluded_countries"], {"US", "HK"})
+        self.assertEqual(select_proxy.call_args.kwargs["mode"], "mihomo_excluded")
 
     def test_transparent_router_mode_needs_no_explicit_proxy_after_us_switch(self):
         session = Mock()
@@ -181,6 +244,31 @@ class MihomoUsProxyTests(unittest.TestCase):
             cloakbrowser_driver._assert_mihomo_us_exit(selection, {})
 
         cloakbrowser_driver._assert_mihomo_us_exit(selection, {"country": "US"})
+
+    def test_mihomo_excluded_route_rejects_us_hk_and_unknown_exit(self):
+        selection = {
+            "mode": "mihomo_excluded",
+            "transparent": True,
+            "excluded_countries": ["US", "HK"],
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "排除国家"):
+            cloakbrowser_driver._assert_mihomo_registration_exit(selection, {"country": "US"})
+        with self.assertRaisesRegex(RuntimeError, "排除国家"):
+            cloakbrowser_driver._assert_mihomo_registration_exit(selection, {"country": "HK"})
+        with self.assertRaisesRegex(RuntimeError, "排除国家"):
+            cloakbrowser_driver._assert_mihomo_registration_exit(selection, {"country": "CN", "city": "HKG"})
+        with self.assertRaisesRegex(RuntimeError, "确认"):
+            cloakbrowser_driver._assert_mihomo_registration_exit(selection, {})
+        cloakbrowser_driver._assert_mihomo_registration_exit(selection, {"country": "JP"})
+
+    def test_transparent_route_accepts_country_filtered_mode(self):
+        self.assertTrue(
+            cloakbrowser_driver._allows_transparent_mihomo_route({
+                "mode": "mihomo_excluded",
+                "transparent": True,
+            })
+        )
 
     def test_transparent_liveness_preserves_explicit_empty_proxy(self):
         session = Mock()
@@ -279,9 +367,15 @@ class MihomoUsProxyTests(unittest.TestCase):
             "MIHOMO_US_GROUP",
             "MIHOMO_PROXY_URL",
             "MIHOMO_TRANSPARENT_ROUTING",
+            "MIHOMO_REGISTRATION_ROUTE",
+            "MIHOMO_REGISTRATION_GROUP",
+            "MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES",
         }.issubset(keys))
         self.assertTrue(proxy.is_us_node_name("US Seattle 01"))
         self.assertFalse(proxy.is_us_node_name("DIRECT"))
+        self.assertTrue(proxy.node_matches_country("🇭🇰 香港-01", "HK"))
+        self.assertTrue(proxy.node_matches_country("🇯🇵 日本-东京", "JP"))
+        self.assertFalse(proxy.node_matches_country("🇸🇬 SG-01", "HK"))
 
     def test_resin_disabled_never_allows_explicit_or_liveness_direct_bypass(self):
         with patch.object(proxy, "REGISTRATION_PROXY_REQUIRED", False), patch.object(

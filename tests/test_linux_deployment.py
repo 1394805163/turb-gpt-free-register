@@ -10,7 +10,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEBUI = (ROOT / "webui.sh").read_text(encoding="utf-8")
+WEBUI = (ROOT / "deploy/linux/webui.sh").read_text(encoding="utf-8")
 BASH = Path("C:/Program Files/Git/bin/bash.exe")
 if not BASH.is_file():
     BASH = Path(shutil.which("bash") or "")
@@ -183,8 +183,8 @@ trap 'rm -rf "$work"' EXIT
 app="$work/app"
 proc="$work/proc"
 mkdir -p "$app/.venv/bin" "$app/deploy/linux" "$proc"
-cp webui.sh "$app/webui.sh"
-chmod +x "$app/webui.sh"
+cp deploy/linux/webui.sh "$app/deploy/linux/webui.sh"
+chmod +x "$app/deploy/linux/webui.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$app/.venv/bin/python"
 printf '#!/usr/bin/env bash\ntouch "$(dirname "$0")/../../unexpected-start"\nexit 1\n' > "$app/.venv/bin/gunicorn"
 chmod +x "$app/.venv/bin/python" "$app/.venv/bin/gunicorn"
@@ -220,9 +220,9 @@ printf '%s\0' 'HOST=127.0.0.1' 'PORT=5000' > "$proc/99109/environ"
 printf 'Name:\tgunicorn\nPPid:\t0\n' > "$proc/99109/status"
 printf '99109 (gunicorn) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0\n' > "$proc/99109/stat"
 set +e
-output=$(cd "$app" && WEBUI_TEST_MODE=1 WEBUI_TEST_PROC_ROOT="$proc" HOST=127.0.0.1 PORT=5000 ./webui.sh status)
+output=$(cd "$app" && WEBUI_TEST_MODE=1 WEBUI_TEST_PROC_ROOT="$proc" HOST=127.0.0.1 PORT=5000 ./deploy/linux/webui.sh status)
 status=$?
-start_output=$(cd "$app" && WEBUI_TEST_MODE=1 WEBUI_TEST_PROC_ROOT="$proc" HOST=127.0.0.1 PORT=5000 ./webui.sh start)
+start_output=$(cd "$app" && WEBUI_TEST_MODE=1 WEBUI_TEST_PROC_ROOT="$proc" HOST=127.0.0.1 PORT=5000 ./deploy/linux/webui.sh start)
 start_status=$?
 set -e
 printf 'status=%s\n%s\nstart_status=%s\n%s\nstarted=%s\n' "$status" "$output" \
@@ -257,8 +257,8 @@ app="$work/app"
 proc="$work/proc"
 pid=99301
 mkdir -p "$app/.venv/bin" "$app/deploy/linux" "$proc/$pid"
-cp webui.sh "$app/webui.sh"
-chmod +x "$app/webui.sh"
+cp deploy/linux/webui.sh "$app/deploy/linux/webui.sh"
+chmod +x "$app/deploy/linux/webui.sh"
 gunicorn="$app/.venv/bin/gunicorn"
 config="$app/deploy/linux/gunicorn.conf.py"
 printf '%s\0' "$gunicorn" --config "$config" 'webui.app:create_app()' > "$proc/$pid/cmdline"
@@ -266,7 +266,7 @@ printf '%s\0' 'HOST=127.0.0.1' 'PORT=5000' > "$proc/$pid/environ"
 printf 'Name:\tgunicorn\nPPid:\t0\n' > "$proc/$pid/status"
 printf '%s (gunicorn) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345 0\n' "$pid" > "$proc/$pid/stat"
 set +e
-output=$(cd "$app" && PROC_ROOT="$proc" WEBUI_TEST_PROC_ROOT="$proc" ./webui.sh status 2>&1)
+output=$(cd "$app" && PROC_ROOT="$proc" WEBUI_TEST_PROC_ROOT="$proc" ./deploy/linux/webui.sh status 2>&1)
 status=$?
 set -e
 printf 'status=%s\n%s\n' "$status" "$output"
@@ -283,9 +283,9 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 app="$work/app"
 proc="$work/proc"
-mkdir -p "$app" "$proc"
-cp webui.sh "$app/webui.sh"
-chmod +x "$app/webui.sh"
+mkdir -p "$app/deploy/linux" "$proc"
+cp deploy/linux/webui.sh "$app/deploy/linux/webui.sh"
+chmod +x "$app/deploy/linux/webui.sh"
 make_legacy() {
   pid="$1"; shift
   mkdir -p "$proc/$pid"
@@ -299,7 +299,7 @@ make_legacy 99402 /bin/echo /usr/bin/python3 "$app/web.py" --host 127.0.0.1 --po
 make_legacy 99403 /usr/bin/python3 -m wrapper "$app/web.py" --host 127.0.0.1 --port 5000
 make_legacy 99404 /usr/bin/python3 "$app/web.py" --host ignored 127.0.0.1 --port 5000
 set +e
-output=$(cd "$app" && WEBUI_TEST_MODE=1 WEBUI_TEST_PROC_ROOT="$proc" ./webui.sh status)
+output=$(cd "$app" && WEBUI_TEST_MODE=1 WEBUI_TEST_PROC_ROOT="$proc" ./deploy/linux/webui.sh status)
 status=$?
 set -e
 printf 'status=%s\n%s\n' "$status" "$output"
@@ -319,12 +319,12 @@ child=''
 cleanup() { [[ -z "$child" ]] || kill -9 "$child" >/dev/null 2>&1 || true; rm -rf "$work"; }
 trap cleanup EXIT
 app="$work/app"
-mkdir -p "$app/run"
-cp webui.sh "$app/webui.sh"
-chmod +x "$app/webui.sh"
+mkdir -p "$app/deploy/linux" "$app/run"
+cp deploy/linux/webui.sh "$app/deploy/linux/webui.sh"
+chmod +x "$app/deploy/linux/webui.sh"
 sleep 30 & child=$!
 printf '%s\n' "$child" > "$app/run/webui.pid"
-(cd "$app" && ./webui.sh stop >/dev/null 2>&1)
+(cd "$app" && ./deploy/linux/webui.sh stop >/dev/null 2>&1)
 if kill -0 "$child" >/dev/null 2>&1; then alive=yes; else alive=no; fi
 printf 'alive=%s\n' "$alive"
 '''
@@ -1088,7 +1088,7 @@ class LinuxDocumentationAndCITests(unittest.TestCase):
             "python-version: '3.12'",
             "python -m venv .venv",
             ".venv/bin/python -m pip install -r requirements.txt",
-            "bash -n deploy/linux/*.sh webui.sh",
+            "bash -n deploy/linux/*.sh",
             "python -m unittest tests.test_linux_deployment -v",
             "python -m compileall -q .",
             "python -m unittest discover -s tests -v",

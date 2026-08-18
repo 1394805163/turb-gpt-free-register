@@ -468,15 +468,39 @@ def _detect_openai_route_geo(proxy_url: str | None = None) -> dict:
         return {}
 
 
-def _assert_mihomo_us_exit(selection: dict | None, geo: dict | None) -> None:
+def _effective_geo_country(geo: dict | None) -> str:
+    data = geo if isinstance(geo, dict) else {}
+    country = str(data.get("country") or "").strip().upper()
+    city = str(data.get("city") or data.get("colo") or "").strip().upper()
+    # Cloudflare trace may report Hong Kong as CN with colo/city HKG.
+    if country == "CN" and city in {"HK", "HKG", "HONG KONG"}:
+        return "HK"
+    return country
+
+
+def _assert_mihomo_registration_exit(selection: dict | None, geo: dict | None) -> None:
     data = selection if isinstance(selection, dict) else {}
-    if str(data.get("mode") or "") != "mihomo_us":
+    mode = str(data.get("mode") or "")
+    if mode not in {"mihomo_us", "mihomo_excluded"}:
         return
-    country = str((geo or {}).get("country") or "").strip().upper()
+    country = _effective_geo_country(geo)
     if not country:
         raise RuntimeError("无法确认 OpenAI 注册出口国家；已阻止继续注册")
-    if country != "US":
+    if mode == "mihomo_us" and country != "US":
         raise RuntimeError(f"OpenAI 注册出口非美国（country={country}）；已阻止继续注册")
+    if mode == "mihomo_excluded":
+        excluded = {
+            str(item).strip().upper()
+            for item in (data.get("excluded_countries") or [])
+            if str(item).strip()
+        }
+        if country in excluded:
+            raise RuntimeError(f"OpenAI 注册出口属于排除国家（country={country}）；已阻止继续注册")
+
+
+def _assert_mihomo_us_exit(selection: dict | None, geo: dict | None) -> None:
+    """兼容旧调用方；新模式统一由 _assert_mihomo_registration_exit 校验。"""
+    _assert_mihomo_registration_exit(selection, geo)
 
 
 def _build_cloak_locale_options(
@@ -516,9 +540,9 @@ def _build_cloak_locale_options(
 
 
 def _allows_transparent_mihomo_route(selection: dict | None) -> bool:
-    """仅允许已完成 Mihomo 美国节点选择的透明路由省略显式代理 URL。"""
+    """仅允许已完成 Mihomo 节点选择的透明路由省略显式代理 URL。"""
     data = selection if isinstance(selection, dict) else {}
-    return bool(data.get("transparent")) and data.get("mode") == "mihomo_us"
+    return bool(data.get("transparent")) and data.get("mode") in {"mihomo_us", "mihomo_excluded"}
 
 
 def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
@@ -533,7 +557,7 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
         required = bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
         if proxy is None or not required:
-            # Resin 关闭时忽略任意显式代理，强制走 Mihomo `chatgpt us` 美国组。
+            # Resin 关闭时忽略任意显式代理，强制走 Mihomo 注册出口策略。
             proxy_selection = _proxy_cfg.pick_registration_proxy()
             proxy = str(proxy_selection.get("proxy_url") or "")
         elif not str(proxy or "").strip():
@@ -547,7 +571,7 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
         if not bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
             raise RuntimeError("Resin 门禁已关闭但 CloakBrowser 代理开关未开启；已阻止直连注册")
         if not str(proxy or "").strip() and not _allows_transparent_mihomo_route(proxy_selection):
-            raise RuntimeError("Mihomo 美国代理不可用；已阻止直连注册")
+            raise RuntimeError("Mihomo 注册代理不可用；已阻止直连注册")
     try:
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:
@@ -565,7 +589,7 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
         transparent_route=transparent_route,
     )
     exit_geo = locale_opts.get("geo") if isinstance(locale_opts.get("geo"), dict) else {}
-    _assert_mihomo_us_exit(proxy_selection, exit_geo)
+    _assert_mihomo_registration_exit(proxy_selection, exit_geo)
     if proxy_selection:
         proxy_selection["exit_ip"] = str(exit_geo.get("ip") or "")
         logger.info(

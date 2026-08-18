@@ -536,6 +536,18 @@ EDITABLE_FIELDS = [
         "label": "Mihomo 本地代理", "help": "浏览器使用的本地 HTTP/SOCKS 入口，例如 socks5h://127.0.0.1:7897",
     },
     {
+        "key": "MIHOMO_REGISTRATION_ROUTE", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "注册出口模式", "help": "us=仅美国（兼容旧配置）；exclude=排除配置国家后选择其他 Mihomo 节点",
+    },
+    {
+        "key": "MIHOMO_REGISTRATION_GROUP", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "注册 Mihomo 组", "help": "留空复用 Mihomo 美国组；填写后用于国家过滤模式",
+    },
+    {
+        "key": "MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES", "file": "proxy.py", "type": "list_str_multiline", "group": "代理池",
+        "label": "注册排除国家", "help": "逗号或换行分隔的国家码，例如 US,HK；最终仍以 OpenAI 同域出口检测为准",
+    },
+    {
         "key": "MIHOMO_TRANSPARENT_ROUTING", "file": "proxy.py", "type": "bool", "group": "代理池",
         "label": "Mihomo 路由器透明分流", "help": "控制器切换美国节点后，由路由器按 OpenAI 域名透明分流；开启时无需填写显式代理 URL",
     },

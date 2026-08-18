@@ -20,7 +20,7 @@ jobs:
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -r requirements.txt
       - name: Check shell syntax
-        run: bash -n deploy/linux/*.sh webui.sh
+        run: bash -n deploy/linux/*.sh
       - name: Run Linux deployment tests
         run: .venv/bin/python -m unittest tests.test_linux_deployment -v
       - name: Compile Python sources
