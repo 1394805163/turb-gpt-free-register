@@ -161,7 +161,7 @@ class GunicornConfigTests(unittest.TestCase):
         self.assertEqual(cfg["worker_class"], "gthread")
         self.assertEqual(cfg["threads"], 4)
         self.assertFalse(cfg["preload_app"])
-        self.assertEqual(cfg["graceful_timeout"], 45)
+        self.assertEqual(cfg["graceful_timeout"], 15)
         self.assertNotIn("max_requests", cfg)
 
     def test_runtime_dependency_contains_gunicorn(self):

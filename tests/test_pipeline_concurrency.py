@@ -27,9 +27,9 @@ class PipelineConcurrencyTests(unittest.TestCase):
         self.assertEqual(registration_service._normalize_workers(99), 2)
         self.assertEqual(live_check_service._WORKERS, 2)
         self.assertEqual(chatgpt2api_push.queue_settings()["workers"], 2)
-        self.assertEqual(proxy_config.PLAN_CHECK_WORKERS, 1)
-        self.assertEqual(plan_check_service._WORKERS, 1)
-        self.assertEqual(codex_agent_service._WORKERS, 1)
+        self.assertEqual(proxy_config.PLAN_CHECK_WORKERS, 2)
+        self.assertEqual(plan_check_service._WORKERS, 2)
+        self.assertEqual(codex_agent_service._WORKERS, 2)
         self.assertEqual(extract_link_service._WORKERS, 2)
 
         source = Path(proxy_config.__file__).read_text(encoding="utf-8")

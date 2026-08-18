@@ -157,22 +157,26 @@ def generate_sentinel_token(
     )
 
     # 把 challenge 写入临时文件，避免命令行长度 / 转义问题
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".json",
-        prefix=f"sentinel-challenge-{flow}-",
-        delete=False,
-        encoding="utf-8",
-    )
+    tmp_path: Path | None = None
     try:
-        json.dump(challenge, tmp, ensure_ascii=False)
-        tmp.flush()
-        tmp.close()
+        # Windows 不允许 Node 在 NamedTemporaryFile 仍持有句柄时重新打开；
+        # 用 with 确保交给 subprocess 前句柄已经关闭，同时保留 delete=False
+        # 以便子进程按路径读取。
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            prefix=f"sentinel-challenge-{flow}-",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp:
+            json.dump(challenge, tmp, ensure_ascii=False)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
 
         cmd = [
             _resolve_node_executable(),
             str(_RUNNER_PATH),
-            "--challenge-file", tmp.name,
+            "--challenge-file", str(tmp_path),
             "--flow", flow,
             "--device-id", device_id,
             "--sentinel-sid", sentinel_sid or "",
@@ -287,6 +291,7 @@ def generate_sentinel_token(
     finally:
         # 清理临时文件
         try:
-            os.unlink(tmp.name)
-        except OSError:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+        except (OSError, ValueError):
             pass

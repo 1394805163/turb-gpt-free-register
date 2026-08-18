@@ -108,23 +108,33 @@ def _terminate_registration_process(process: mp.Process, reason: str) -> None:
         return
     if not pid:
         return
-    try:
-        pgid = os.getpgid(pid)
-    except ProcessLookupError:
-        pgid = None
-    try:
-        if pgid and pgid != os.getpgrp():
-            os.killpg(pgid, signal.SIGTERM)
-        else:
-            process.terminate()
-    except ProcessLookupError:
-        pass
-    except Exception as exc:
-        logger.warning("[Service] 终止注册子进程失败（%s）：%s", reason, exc)
+    if os.name == "nt":
+        # Windows 没有 POSIX 进程组 API；multiprocessing.Process 的终止
+        # 方法是跨 Windows/POSIX 都可用的基础接口。
         try:
             process.terminate()
-        except Exception:
+        except (ProcessLookupError, OSError):
             pass
+        except Exception as exc:
+            logger.warning("[Service] 终止注册子进程失败（%s）：%s", reason, exc)
+    else:
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            pgid = None
+        try:
+            if pgid and pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.warning("[Service] 终止注册子进程失败（%s）：%s", reason, exc)
+            try:
+                process.terminate()
+            except Exception:
+                pass
     try:
         process.join(timeout=5)
     except (AttributeError, ValueError):
@@ -135,19 +145,27 @@ def _terminate_registration_process(process: mp.Process, reason: str) -> None:
     except (AttributeError, ValueError):
         alive = False
     if alive:
-        try:
-            pgid = os.getpgid(pid)
-            if pgid != os.getpgrp():
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
-            pass
-        except Exception:
+        if os.name == "nt":
             try:
                 process.kill()
+            except (ProcessLookupError, OSError):
+                pass
             except Exception:
                 pass
+        else:
+            try:
+                pgid = os.getpgid(pid)
+                if pgid != os.getpgrp():
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
         try:
             process.join(timeout=3)
         except (AttributeError, ValueError):
@@ -503,10 +521,11 @@ def _registration_process_entry(
     birthday: str,
 ) -> None:
     """Run browser automation in a process that can be forcefully reaped."""
-    try:
-        os.setsid()
-    except Exception:
-        pass
+    if os.name != "nt":
+        try:
+            os.setsid()
+        except Exception:
+            pass
     try:
         with _JobLogContext(log_file):
             from main import run_registration

@@ -79,8 +79,12 @@ class ICloudMailboxPool:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temp_name, stat.S_IMODE(previous.st_mode) if previous else 0o600)
-            if previous and os.geteuid() == 0:
-                os.chown(temp_name, previous.st_uid, previous.st_gid)
+            # Windows 没有 geteuid/chown；权限和属主继承只在 POSIX 且 API
+            # 可用时执行，不能让邮箱状态持久化因平台差异失败。
+            geteuid = getattr(os, "geteuid", None)
+            chown = getattr(os, "chown", None)
+            if previous and callable(geteuid) and callable(chown) and geteuid() == 0:
+                chown(temp_name, previous.st_uid, previous.st_gid)
             os.replace(temp_name, self.state_file)
         finally:
             if temp_name:

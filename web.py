@@ -22,9 +22,11 @@ from webui.app import create_app
 from webui.auth import is_generated_code
 
 
-def _acquire_single_instance(port: int):
+def _acquire_single_instance(port: int, lock_path: str | Path | None = None):
     """持有跨进程文件锁，防止同一端口启动多个 WebUI 实例。"""
-    lock_path = Path(tempfile.gettempdir()) / f"turb-gpt-free-register-web-{int(port)}.lock"
+    lock_path = Path(lock_path) if lock_path is not None else (
+        Path(tempfile.gettempdir()) / f"turb-gpt-free-register-web-{int(port)}.lock"
+    )
     handle = lock_path.open("a+", encoding="utf-8")
     handle.seek(0, os.SEEK_END)
     if handle.tell() == 0:
@@ -59,9 +61,13 @@ def _release_single_instance(handle) -> None:
         else:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except (OSError, IOError):
+    except (OSError, IOError, ValueError):
         pass
-    handle.close()
+    finally:
+        try:
+            handle.close()
+        except (OSError, IOError, ValueError):
+            pass
 
 
 def _setup_logging(verbose: bool) -> None:

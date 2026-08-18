@@ -461,11 +461,13 @@ class ICloudMailboxPoolTests(unittest.TestCase):
                 {"mailboxes": "first@icloud.com\nsecond@icloud.com"},
                 state_file,
             )
-            mailbox = pool.acquire()
-            pool.finish(mailbox, True)
+            with patch("core.icloud_mail_pool.secrets.choice", side_effect=lambda values: values[0]):
+                mailbox = pool.acquire()
+                pool.finish(mailbox, True)
 
             self.assertEqual(mailbox["address"], "first@icloud.com")
-            self.assertEqual(pool.acquire()["address"], "second@icloud.com")
+            with patch("core.icloud_mail_pool.secrets.choice", side_effect=lambda values: values[0]):
+                self.assertEqual(pool.acquire()["address"], "second@icloud.com")
 
     def test_email_provider_accepts_icloud_source(self):
         self.assertEqual(parse_email_sources("icloud,outlook"), ["icloud", "outlook"])
