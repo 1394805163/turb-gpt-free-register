@@ -101,11 +101,13 @@ class PlatformCompatibilityTests(unittest.TestCase):
             calls.append((fd, mode, size))
 
         fake_msvcrt = types.SimpleNamespace(LK_NBLCK=10, LK_UNLCK=20, locking=locking)
-        with tempfile.TemporaryDirectory() as tmp, patch.object(web.os, "name", "nt"), patch.dict(
-            sys.modules, {"msvcrt": fake_msvcrt}
-        ):
-            handle = web._acquire_single_instance(5000, Path(tmp) / "webui.lock")
-            web._release_single_instance(handle)
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "webui.lock"
+            with patch.object(web.os, "name", "nt"), patch.dict(
+                sys.modules, {"msvcrt": fake_msvcrt}
+            ):
+                handle = web._acquire_single_instance(5000, lock_path)
+                web._release_single_instance(handle)
 
         self.assertEqual([item[1:] for item in calls], [(10, 1), (20, 1)])
 
