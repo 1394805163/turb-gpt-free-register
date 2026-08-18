@@ -92,3 +92,4 @@ output/
 # HAR 是本地忽略输入，仓库只保留脱敏分析结论。
 Default-all-domains-*.json
 are-capture-*.jsonl
+docs/protocol_har_summary.json

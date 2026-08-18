@@ -180,6 +180,7 @@ class SourcePortabilityTests(unittest.TestCase):
             "注册成功的邮箱.json",
             "注册成功的token.txt",
             "Default-all-domains-1784468371563.json",
+            "protocol_har_summary.json",
         }
         violations = [item for item in tracked if Path(item).name in forbidden_names or "__pycache__" in Path(item).parts]
         self.assertEqual(violations, [])
