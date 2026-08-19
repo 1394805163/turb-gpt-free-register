@@ -204,11 +204,20 @@ def run_registration(
         from config import proxy as _proxy_cfg
         from core.cloakbrowser_registration import is_proxy_rejection_error, run_cloak_registration
 
-        pool_size = len(_proxy_cfg.get_proxy_pool())
-        # 可恢复失败继续轮换；配置为 0 或负数表示最多无重复走完当前代理池。
-        configured_attempts = int(getattr(_cloak_cfg, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0) or 0)
-        max_attempts = pool_size if configured_attempts <= 0 else min(configured_attempts, pool_size or 1)
-        max_attempts = max(1, max_attempts)
+        mihomo_route_managed = not bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
+        if mihomo_route_managed:
+            # 透明 Mihomo 不使用静态 Resin 池；其节点选择和 OpenAI trace
+            # 校验由 Cloak 驱动完成，外层只保留有限的浏览器失败重试。
+            configured_attempts = int(getattr(_cloak_cfg, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0) or 0)
+            if configured_attempts <= 0:
+                configured_attempts = int(getattr(_cloak_cfg, "CLOAK_MIHOMO_EXIT_ATTEMPTS", 3) or 3)
+            max_attempts = min(10, max(1, configured_attempts))
+        else:
+            pool_size = len(_proxy_cfg.get_proxy_pool())
+            # 可恢复失败继续轮换；配置为 0 或负数表示最多无重复走完当前代理池。
+            configured_attempts = int(getattr(_cloak_cfg, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0) or 0)
+            max_attempts = pool_size if configured_attempts <= 0 else min(configured_attempts, pool_size or 1)
+            max_attempts = max(1, max_attempts)
         from core.registration_preflight import preflight_proxy
         last_result = None
         attempted_proxies: set[str] = set()
@@ -220,19 +229,27 @@ def run_registration(
                 check_stop_requested()
             except ImportError:
                 pass
-            selected_proxy = _proxy_cfg.acquire_registration_proxy(
-                excluded=attempted_proxies,
-                preferred=proxy if attempt == 1 else None,
-            )
-            if not selected_proxy:
-                last_result = {"success": False, "email": email, "error": "当前无可分配的新代理身份"}
-                break
-            attempted_proxies.add(selected_proxy)
+            if mihomo_route_managed:
+                selected_proxy = ""
+            else:
+                selected_proxy = _proxy_cfg.acquire_registration_proxy(
+                    excluded=attempted_proxies,
+                    preferred=proxy if attempt == 1 else None,
+                )
+                if not selected_proxy:
+                    last_result = {"success": False, "email": email, "error": "当前无可分配的新代理身份"}
+                    break
+                attempted_proxies.add(selected_proxy)
             try:
-                # Exit country is recorded for routing quality analysis, not
-                # used as a registration gate.  A route must still pass the
-                # connectivity and duplicate-egress checks below.
-                preflight = preflight_proxy(selected_proxy, require_country="", force=True)
+                if mihomo_route_managed:
+                    # 透明 Mihomo 没有可传给 requests 的静态 proxy URL；
+                    # 真实出口会在 build_cloak_driver 中通过 OpenAI trace 校验。
+                    preflight = {"ok": True, "country": "mihomo", "latency_ms": 0, "reason": "由 Cloak/Mihomo 路由校验"}
+                else:
+                    # Exit country is recorded for routing quality analysis, not
+                    # used as a registration gate.  A route must still pass the
+                    # connectivity and duplicate-egress checks below.
+                    preflight = preflight_proxy(selected_proxy, require_country="", force=True)
                 next_attempt = attempt + 1
                 logger.info(
                     "[Cloak注册][预检] attempt=%s/%s ok=%s country=%s latency_ms=%s reason=%s",
@@ -291,7 +308,8 @@ def run_registration(
                     reason = "ChatGPT/Cloudflare 拒绝" if is_proxy_rejection_error(error) else "当前任务可恢复失败"
                     logger.warning("[Cloak注册][代理轮换] %s，关闭当前浏览器并切换下一个代理", reason)
             finally:
-                _proxy_cfg.release_registration_proxy(selected_proxy)
+                if selected_proxy:
+                    _proxy_cfg.release_registration_proxy(selected_proxy)
 
         try:
             from core.email_provider import release_email

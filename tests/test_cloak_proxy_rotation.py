@@ -28,6 +28,8 @@ class CloakProxyRotationTests(unittest.TestCase):
             return {"success": True, "email": kwargs["email"], "account_id": "fixture"}
 
         with patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", True
+        ), patch.object(
             cloakbrowser, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0
         ), patch.object(proxy, "get_proxy_pool", return_value=self.pool), patch(
             "core.registration_preflight.preflight_proxy", return_value={"ok": True, "country": "US"}
@@ -48,6 +50,30 @@ class CloakProxyRotationTests(unittest.TestCase):
             proxy.release_registration_proxy(second)
         self.assertFalse(proxy._REGISTRATION_PROXY_LEASES)
 
+    def test_transparent_mihomo_batch_does_not_preflight_static_resin_pool(self):
+        attempts = []
+
+        def register(**kwargs):
+            attempts.append(kwargs["proxy"])
+            return {"success": True, "email": kwargs["email"], "account_id": "fixture"}
+
+        with patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", False
+        ), patch.object(
+            cloakbrowser, "CLOAK_MIHOMO_EXIT_ATTEMPTS", 3, create=True
+        ), patch.object(
+            proxy, "get_proxy_pool", return_value=[f"http://resin-{i}:8080" for i in range(600)]
+        ), patch(
+            "core.registration_preflight.preflight_proxy"
+        ) as preflight, patch(
+            "core.cloakbrowser_registration.run_cloak_registration", side_effect=register
+        ):
+            result = registration_main.run_registration("fixture@example.test", "Fixture", "1990-01-01")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(attempts, [""])
+        preflight.assert_not_called()
+
     def test_duplicate_real_exit_ip_is_skipped_without_consuming_browser_attempt(self):
         browser_attempts = []
         preflights = iter([
@@ -63,6 +89,8 @@ class CloakProxyRotationTests(unittest.TestCase):
             return {"success": True, "email": kwargs["email"], "account_id": "fixture"}
 
         with patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", True
+        ), patch.object(
             cloakbrowser, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0
         ), patch.object(proxy, "get_proxy_pool", return_value=self.pool), patch(
             "core.registration_preflight.preflight_proxy", side_effect=lambda *args, **kwargs: next(preflights)
@@ -87,6 +115,8 @@ class CloakProxyRotationTests(unittest.TestCase):
                 "REGISTRATION_REQUIRED_COUNTRY": "US",
             },
         ), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+            proxy, "REGISTRATION_PROXY_REQUIRED", True
+        ), patch.object(
             cloakbrowser, "CLOAK_PROXY_ROTATION_ATTEMPTS", 1
         ), patch.object(proxy, "get_proxy_pool", return_value=self.pool), patch(
             "core.registration_preflight.preflight_proxy",
