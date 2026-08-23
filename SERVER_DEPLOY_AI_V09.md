@@ -1,4 +1,4 @@
-# turb-gpt-free-register v0.9 部署交接
+# turb-gpt-free-register v0.9.1 部署交接
 
 本文给服务器上的 AI 使用。目标是把注册机以 Ubuntu 24.04 原生 systemd 服务运行，保留 Resin 主代理链路、CloakBrowser 无头运行和本地运行数据。
 
@@ -22,7 +22,7 @@ sudo cp -a .env ".env.backup-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
 sudo tar -czf "/root/turb-gpt-register-runtime-$(date +%Y%m%d-%H%M%S).tgz" \
   .env data "注册成功的邮箱.json" "注册成功的邮箱.txt" "注册成功的token.txt" 2>/dev/null || true
 sudo git fetch --tags origin
-sudo git checkout v0.9
+sudo git checkout v0.9.1
 ```
 
 更新代码时不要删除或覆盖这些运行时内容：`.env`、`data/`、`注册成功的邮箱.json`、`注册成功的邮箱.txt`、`注册成功的token.txt`、`codex_accounts/`、`accounts/` 和 `logs/`。不要使用 `git reset --hard` 清理工作区。

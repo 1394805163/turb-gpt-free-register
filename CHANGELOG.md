@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.1 - 2026-08-24
+
+发布提交：`5c42393`（`codex/v08-resin-primary-deploy`）
+
+### 修复
+
+- **OAuth 覆盖账号池**：导入账号池 JSON 时优先使用 `chatgpt_*` 持久化字段，完整 OAuth 会覆盖旧 `access_token`，并保留 `refresh_token/id_token`。
+- **未压缩迁移包**：补充服务器部署交接文档和本地账号/邮箱池同步导出流程；运行时凭据不进入 Git。
+
 ## 0.9 - 2026-08-24
 
 发布提交：`acd53bc`（`codex/v08-resin-primary-deploy`）
