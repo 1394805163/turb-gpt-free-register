@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.9 - 2026-08-24
+
+发布提交：`acd53bc`（`codex/v08-resin-primary-deploy`）
+
+### 重点改动
+
+- **Resin 主代理链路**：注册、快速查活和 OAuth 统一使用出口预检；Resin 代理异常时轮换出口，失败时保持阻断直连。
+- **Mihomo 兼容路由**：保留 Mihomo 单节点选择、地区筛选和透明路由轮换能力，作为通用代理策略的兼容实现。
+- **OAuth 持久化**：补齐 OAuth 凭据保存、导入导出、年龄策略、拦截识别和代理轮换重试。
+- **查活与推送**：Token 快速查活、套餐/生图额度记录、成功凭据去重推送和账号状态同步。
+- **WebUI 与调度**：增加跨页选择、OAuth 状态筛选、邮箱池同步、任务调度和浏览器任务并发闸门。
+
+### 部署验收
+
+- 本地回归：`311 passed, 3 skipped`。
+- 服务器定向回归：`35 passed`。
+- Ubuntu systemd、CloakBrowser doctor、Resin feed 和 WebUI `/login` 已验收。
+- 运行时账号、Token、邮箱池、日志、`.env` 和本地备份不属于版本资产。
+
 ## 0.8 - 2026-08-23
 
 基线提交：`8ce3bc2`（`codex/registration-country-agnostic-20260818`）
