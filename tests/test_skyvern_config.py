@@ -31,6 +31,7 @@ class SkyvernConfigTests(unittest.TestCase):
 
     @patch("core.skyvern_client.requests.get")
     @patch("core.skyvern_client.requests.post")
+    @patch("config.chatgpt2api.CHATGPT2API_PUSH_ENABLED", False)
     def test_open_session_reads_browser_address_from_get_session(self, post, get):
         post.return_value.status_code = 200
         post.return_value.json.return_value = {"browser_session_id": "bs_123"}

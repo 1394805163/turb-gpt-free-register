@@ -107,6 +107,79 @@ def import_mailboxes(text: str) -> dict[str, int | bool]:
     }
 
 
+def sync_registered_mailboxes(accounts: list[dict] | tuple[dict, ...]) -> dict[str, int]:
+    """把已注册的 iCloud 账号回填为邮箱池 ``used`` 状态。
+
+    注册账号是权威来源：邮箱不存在于当前池文件时补入，已有别名保持标签；
+    已手动停用的别名不被自动恢复，避免把 Apple 控制台停用项重新放回可用状态。
+    """
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for account in accounts or []:
+        if not isinstance(account, dict):
+            continue
+        email = str(account.get("email") or "").strip().lower()
+        source = str(account.get("email_source") or "").strip().lower()
+        if source != "icloud" and email.rsplit("@", 1)[-1] not in {"icloud.com", "me.com", "mac.com"}:
+            continue
+        if "@" not in email or email in seen:
+            continue
+        seen.add(email)
+        addresses.append(email)
+
+    pool = _pool()
+    with pool.lock:
+        existing = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))
+        existing_by_email = {item["email"]: item for item in existing}
+        state = pool._load()
+        now = datetime.now(timezone.utc).isoformat()
+        inserted = marked_used = already_used = preserved_disabled = 0
+        state_dirty = False
+        for email in addresses:
+            if email not in existing_by_email:
+                item = {"email": email, "label": ""}
+                existing.append(item)
+                existing_by_email[email] = item
+                state[email] = {
+                    "state": "used",
+                    "reason": "已有注册账号回填",
+                    "label": "",
+                    "imported_at": now,
+                    "updated_at": now,
+                }
+                inserted += 1
+                state_dirty = True
+                continue
+            current = dict(state.get(email) or {})
+            current_state = str(current.get("state") or "available").strip().lower()
+            if current_state == "disabled":
+                preserved_disabled += 1
+                continue
+            if current_state == "used":
+                already_used += 1
+                continue
+            current.update({
+                "state": "used",
+                "reason": "已有注册账号回填",
+                "label": existing_by_email[email].get("label") or current.get("label") or "",
+                "updated_at": now,
+            })
+            state[email] = current
+            marked_used += 1
+            state_dirty = True
+        if inserted:
+            _write_mailboxes(existing)
+        if state_dirty:
+            pool._save(state)
+    return {
+        "accounts": len(addresses),
+        "inserted": inserted,
+        "marked_used": marked_used,
+        "already_used": already_used,
+        "preserved_disabled": preserved_disabled,
+    }
+
+
 def list_mailboxes(status: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
     pool = _pool()
     entries = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))

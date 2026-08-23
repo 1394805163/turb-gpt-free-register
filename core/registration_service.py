@@ -23,6 +23,7 @@ from queue import Empty
 from typing import Any
 
 from core import codex_retry_service, db
+from core.browser_task_gate import browser_task_slot
 from core.log_safety import redact_email
 from core.pipeline_concurrency import pipeline_slot
 
@@ -198,14 +199,15 @@ def _acquire_registration_browser_slot(job_id: int) -> bool:
 
 @contextmanager
 def _registration_browser_slot(job_id: int):
-    """限制 CloakBrowser 实例数量；等待槽位时不占用全局流水线槽。"""
-    acquired = _acquire_registration_browser_slot(job_id)
-    if not acquired:
-        raise StopRequested(f"任务 #{job_id} 在等待浏览器资源槽时被停止")
-    try:
-        yield
-    finally:
-        _REGISTRATION_BROWSER_SLOTS.release()
+    """限制注册浏览器，并与 OAuth 浏览器共享互斥闸门。"""
+    while True:
+        if is_stop_requested(job_id):
+            raise StopRequested(f"任务 #{job_id} 在等待浏览器资源槽时被停止")
+        with browser_task_slot("registration", timeout=1.0) as acquired:
+            if not acquired:
+                continue
+            yield
+            return
 
 
 def _job_timeout_seconds() -> int:

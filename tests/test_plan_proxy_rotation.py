@@ -56,6 +56,64 @@ class PlanProxyRotationTests(unittest.TestCase):
         resolve.assert_called_once_with("http://EXPLICIT")
         self.assertEqual(browser.call_count, 2)
 
+    def test_http_403_is_temporary_and_retries_with_a_new_route(self):
+        first = Mock()
+        first.session.get.return_value = Mock(status_code=403, text="Just a moment")
+        second = Mock()
+        second.session.get.return_value = Mock(status_code=403, text="Just a moment")
+        routes = [
+            {"proxy": "", "proxy_mode": "mihomo_excluded_transparent", "network_route": "transparent", "proxy_node": "JP04"},
+            {"proxy": "", "proxy_mode": "mihomo_excluded_transparent", "network_route": "transparent", "proxy_node": "US05"},
+        ]
+        with patch.object(chatgpt_plan, "resolve_plan_check_route", side_effect=routes) as resolve, patch.object(
+            chatgpt_plan, "BrowserSession", side_effect=[first, second]
+        ):
+            result = chatgpt_plan.check_account_plan(
+                "e30.e30.signature",
+                max_attempts=2,
+                retry_delay=0,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["http_status"], 403)
+        self.assertEqual(result["attempt_count"], 2)
+        self.assertEqual(resolve.call_count, 2)
+
+    def test_mihomo_plan_route_uses_registration_selector(self):
+        selection = {
+            "proxy_url": "",
+            "transparent": True,
+            "mode": "mihomo_excluded",
+            "group": "🤖 ChatGPT",
+            "node_name": "🇯🇵 JP04",
+        }
+        with patch("config.proxy.REGISTRATION_PROXY_SOURCE", "mihomo"), patch(
+            "config.proxy.REGISTRATION_PROXY_REQUIRED", False
+        ), patch("config.proxy.pick_registration_proxy", return_value=selection) as pick:
+            route = chatgpt_plan.resolve_plan_check_route()
+
+        self.assertEqual(route["proxy"], "")
+        self.assertEqual(route["network_route"], "transparent")
+        self.assertEqual(route["proxy_node"], "🇯🇵 JP04")
+        pick.assert_called_once_with()
+
+    def test_resin_plan_route_uses_registration_selector_and_preflight(self):
+        selection = {
+            "mode": "resin",
+            "proxy_url": "http://RESIN_HOST:PORT",
+            "preflight": {"ok": True, "country": "US"},
+            "exit_country": "US",
+        }
+        with patch("config.proxy.REGISTRATION_PROXY_SOURCE", "resin"), patch(
+            "config.proxy.REGISTRATION_PROXY_REQUIRED", True
+        ), patch("config.proxy.pick_registration_proxy", return_value=selection) as pick:
+            route = chatgpt_plan.resolve_plan_check_route()
+
+        self.assertEqual(route["proxy"], "http://RESIN_HOST:PORT")
+        self.assertEqual(route["network_route"], "proxy")
+        self.assertEqual(route["proxy_mode"], "resin")
+        pick.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

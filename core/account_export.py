@@ -24,6 +24,31 @@ from core.log_safety import redact_email
 
 logger = logging.getLogger(__name__)
 
+
+def _load_chatgpt_oauth_credential(extra: dict) -> dict:
+    """从 Codex/CPA 结果或其文件读取 ChatGPT OAuth 凭据。"""
+    codex = extra.get("codex") if isinstance(extra, dict) else None
+    codex = codex if isinstance(codex, dict) else {}
+    raw = codex.get("credential") if isinstance(codex.get("credential"), dict) else {}
+    file_path = str(codex.get("credential_file") or codex.get("file_path") or "").strip()
+    if file_path:
+        try:
+            candidate = json.loads(Path(file_path).read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                raw = {**candidate, **raw}
+        except (OSError, ValueError, TypeError):
+            pass
+    return {
+        "access_token": str(raw.get("access_token") or raw.get("accessToken") or "").strip(),
+        "refresh_token": str(raw.get("refresh_token") or raw.get("refreshToken") or "").strip(),
+        "id_token": str(raw.get("id_token") or raw.get("idToken") or "").strip(),
+        "oauth_client_id": str(raw.get("oauth_client_id") or raw.get("client_id") or "").strip(),
+        "account_id": str(raw.get("account_id") or raw.get("chatgpt_account_id") or "").strip(),
+        "expires_at": str(raw.get("expires_at") or raw.get("expired") or "").strip(),
+        "last_refresh": str(raw.get("last_refresh") or "").strip(),
+        "source": str(raw.get("source") or "codex_oauth").strip(),
+    }
+
 # 输出目录（与项目根 .claude/ 工作区分离，单独放在 accounts/）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ACCOUNTS_DIR = _PROJECT_ROOT / "accounts"
@@ -96,6 +121,16 @@ def _append_batch_archive(
         "row": row,
         "extra": extra,
     }
+    oauth = _load_chatgpt_oauth_credential(extra)
+    if oauth.get("refresh_token"):
+        archive.update({
+            "chatgpt_oauth_access_token": oauth.get("access_token"),
+            "chatgpt_refresh_token": oauth.get("refresh_token"),
+            "chatgpt_id_token": oauth.get("id_token"),
+            "chatgpt_oauth_client_id": oauth.get("oauth_client_id"),
+            "chatgpt_account_id": oauth.get("account_id"),
+            "chatgpt_token_expires_at": oauth.get("expires_at"),
+        })
 
     with _BATCH_ARCHIVE_LOCK:
         _append_line(folder / "注册成功的邮箱.txt", material_line)
@@ -411,6 +446,8 @@ def save_account_data(
     if codex_status == "failed":
         codex_error = codex.get("message")
 
+    chatgpt_oauth = _load_chatgpt_oauth_credential(extra)
+
     row_id = insert_account(
         email=email,
         access_token=access_token,
@@ -425,6 +462,7 @@ def save_account_data(
         extra=extra,
         codex_status=codex_status,
         codex_error=codex_error,
+        chatgpt_oauth=chatgpt_oauth,
     )
     batch_folder = _append_batch_archive(
         row_id=row_id,

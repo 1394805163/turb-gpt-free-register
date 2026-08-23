@@ -4,7 +4,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from core import db, plan_check_service
+from core import account_liveness, db, plan_check_service
 from core.account_export import save_account_data
 from core.account_liveness import check_account_liveness
 
@@ -186,6 +186,8 @@ class FastLivenessPushTests(unittest.TestCase):
         session = Mock(device_id="device-fixture", proxy=None)
         session.session = Mock()
         with patch("core.account_liveness._LOG_DIR", Path(self.tmp.name) / "logs"), patch(
+            "config.roxybrowser.REGISTRATION_DRIVER", "protocol"
+        ), patch(
             "core.account_liveness._network_preflight_with_retry",
             return_value=(session, "https://auth.openai.com/authorize"),
         ), patch(
@@ -202,6 +204,36 @@ class FastLivenessPushTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["method"], "otp")
+
+    def test_cloak_full_login_liveness_skips_legacy_providers_preflight(self):
+        expected = {
+            "ok": True,
+            "status": "live",
+            "method": "otp",
+            "access_token": "cloak-refreshed-token",
+        }
+        with patch.object(account_liveness, "_LOG_DIR", Path(self.tmp.name) / "logs"), patch(
+            "config.roxybrowser.REGISTRATION_DRIVER", "cloak"
+        ), patch(
+            "core.cloakbrowser_liveness.run_cloak_liveness_flow",
+            return_value=expected,
+        ) as cloak_flow, patch.object(
+            account_liveness,
+            "_network_preflight_with_retry",
+            side_effect=AssertionError("legacy chatgpt.com/api/auth/providers must not run"),
+        ):
+            result = check_account_liveness(
+                "alias@icloud.com",
+                proxy="",
+                proxy_selection={"mode": "mihomo_excluded", "transparent": True, "node_name": "🇺🇸 US02"},
+            )
+
+        self.assertEqual(result, expected)
+        cloak_flow.assert_called_once_with(
+            "alias@icloud.com",
+            proxy="",
+            proxy_selection={"mode": "mihomo_excluded", "transparent": True, "node_name": "🇺🇸 US02"},
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
+_REGISTRATION_COMMON_COUNTRIES = {"US", "JP", "SG", "KR", "TW"}
+
 _LOCK = threading.Lock()
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 180.0
@@ -40,18 +42,44 @@ def _trace_fields(text: str) -> dict[str, str]:
     return fields
 
 
-def preflight_proxy(proxy: str | None, *, require_country: str = "US", force: bool = False) -> dict:
+def preflight_proxy(
+    proxy: str | None,
+    *,
+    require_country: str = "US",
+    allowed_countries: object = None,
+    excluded_countries: object = None,
+    allow_transparent: bool = False,
+    route_identity: str | None = None,
+    force: bool = False,
+) -> dict:
     """返回代理预检结果；结果带短缓存，避免同一节点重复打探。
 
     `chatgpt_status=403` 仅作为信息记录，因为该接口会返回需要浏览器 JS
     执行的 Cloudflare challenge，不能用 requests 的 403 否定浏览器可用性。
     """
     value = str(proxy or "").strip()
-    if not value:
+    def _countries(raw: object) -> set[str]:
+        if isinstance(raw, str):
+            raw = raw.replace(",", " ").replace(";", " ").split()
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            return set()
+        return {str(item).strip().upper() for item in raw if str(item).strip()}
+
+    allowed = _countries(allowed_countries)
+    excluded = _countries(excluded_countries)
+    if not value and not allow_transparent:
         return {"ok": False, "reason": "代理地址为空", "endpoint": ""}
+    cache_key = "|".join([
+        value,
+        str(route_identity or "").strip(),
+        ",".join(sorted(allowed)),
+        ",".join(sorted(excluded)),
+        "transparent" if allow_transparent else "explicit",
+        str(require_country or "").strip().upper(),
+    ])
     now = time.monotonic()
     with _LOCK:
-        cached = _CACHE.get(value)
+        cached = _CACHE.get(cache_key)
         if cached and not force and now - cached[0] < _CACHE_TTL:
             return {**cached[1], "cached": True}
 
@@ -60,7 +88,7 @@ def preflight_proxy(proxy: str | None, *, require_country: str = "US", force: bo
     try:
         import requests
 
-        proxies = {"http": value, "https": value}
+        proxies = {"http": value, "https": value} if value else None
         response = requests.get(
             "https://auth.openai.com/cdn-cgi/trace",
             proxies=proxies,
@@ -80,6 +108,19 @@ def preflight_proxy(proxy: str | None, *, require_country: str = "US", force: bo
             result["reason"] = f"OpenAI trace HTTP {response.status_code}"
         elif wanted and result["country"] != wanted:
             result["reason"] = f"出口国家为 {result['country'] or '未知'}，需要 {wanted}"
+        elif allowed:
+            country = result["country"]
+            explicit_allowed = allowed - {"OTHER"}
+            allowed_as_other = "OTHER" in allowed and bool(country) and country not in _REGISTRATION_COMMON_COUNTRIES
+            if country not in explicit_allowed and not allowed_as_other:
+                result["reason"] = f"出口国家为 {country or '未知'}，不在允许地区内"
+            elif country in excluded:
+                result["reason"] = f"出口国家为 {country or '未知'}，属于排除地区"
+            else:
+                result["ok"] = True
+                result["reason"] = "网络出口预检通过"
+        elif result["country"] in excluded:
+            result["reason"] = f"出口国家为 {result['country'] or '未知'}，属于排除地区"
         else:
             result["ok"] = True
             result["reason"] = "网络出口预检通过"
@@ -90,5 +131,5 @@ def preflight_proxy(proxy: str | None, *, require_country: str = "US", force: bo
         )
 
     with _LOCK:
-        _CACHE[value] = (time.monotonic(), dict(result))
+        _CACHE[cache_key] = (time.monotonic(), dict(result))
     return result

@@ -45,8 +45,12 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
 
     pool = cfg.get_proxy_pool()
     required = bool(getattr(cfg, "REGISTRATION_PROXY_REQUIRED", False))
-    mihomo_enabled = bool(getattr(cfg, "MIHOMO_US_FALLBACK_ENABLED", False)) and not required
+    configured_source = str(getattr(cfg, "REGISTRATION_PROXY_SOURCE", "") or "").strip().lower()
+    resin_enabled = required or configured_source == "resin"
+    mihomo_enabled = (not required) and (configured_source == "mihomo" or (not configured_source and bool(getattr(cfg, "MIHOMO_US_FALLBACK_ENABLED", False))))
     transparent = mihomo_enabled and bool(getattr(cfg, "MIHOMO_TRANSPARENT_ROUTING", False))
+    route = str(getattr(cfg, "MIHOMO_REGISTRATION_ROUTE", "exclude") or "exclude").strip().lower()
+    mihomo_mode = "mihomo_excluded" if route in {"exclude", "excluded", "country_filter"} else "mihomo_us"
     if mihomo_enabled:
         route_endpoint = (
             str(getattr(cfg, "MIHOMO_CONTROLLER_URL", "") or "").strip()
@@ -80,7 +84,7 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
         error = (
             "Mihomo Controller 地址为空"
             if transparent
-            else "Mihomo 美国代理入口为空"
+            else "Mihomo 代理入口为空"
         ) if mihomo_enabled else "Resin 合格代理池为空"
     elif check_tcp and not online:
         error = (
@@ -93,7 +97,7 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
     loaded_from = getattr(cfg, "PROXY_POOL_LOADED_FROM", None)
     return {
         "required": required,
-        "mode": "mihomo_us_transparent" if transparent else ("mihomo_us" if mihomo_enabled else "resin"),
+        "mode": f"{mihomo_mode}_transparent" if transparent else (mihomo_mode if mihomo_enabled else "resin"),
         "ready": ready,
         "driver": driver,
         "cloak_proxy_enabled": cloak_proxy_enabled,
@@ -101,7 +105,8 @@ def registration_proxy_status(*, check_tcp: bool = True) -> dict:
         "endpoint_count": len(endpoints),
         "endpoint": endpoint_labels[0] if endpoint_labels else "",
         "online": online,
-        "pool_source": "mihomo_controller" if transparent else ("mihomo_us" if mihomo_enabled else ("verified_file" if loaded_from else "configured")),
+        "pool_source": f"{mihomo_mode}_controller" if transparent else (mihomo_mode if mihomo_enabled else ("verified_file" if loaded_from else "configured")),
+        "preflight_required": bool(resin_enabled or mihomo_enabled),
         "pool_file": str(loaded_from or getattr(cfg, "PROXY_POOL_FILE", "") or ""),
         "management_url": str(getattr(cfg, "RESIN_MANAGEMENT_URL", "") or "").strip(),
         "error": error,
@@ -113,21 +118,15 @@ def test_registration_proxy(*, target_url: str = "https://auth.openai.com/") -> 
     from config import proxy as cfg
 
     selection = {}
-    if bool(getattr(cfg, "REGISTRATION_PROXY_REQUIRED", False)):
-        pool = cfg.get_proxy_pool()
-        if not pool:
-            return {"ok": False, "error": "Resin 合格代理池为空", **registration_proxy_status(check_tcp=False)}
-        selected = pool[0]
-    else:
-        try:
-            selection = cfg.pick_registration_proxy()
-            selected = str(selection.get("proxy_url") or "")
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": f"Mihomo 美国代理选择失败: {type(exc).__name__}",
-                **registration_proxy_status(check_tcp=False),
-            }
+    try:
+        selection = cfg.pick_registration_proxy()
+        selected = str(selection.get("proxy_url") or "")
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"注册代理选择/预检失败: {type(exc).__name__}",
+            **registration_proxy_status(check_tcp=False),
+        }
     started = time.monotonic()
     try:
         proxies = {"http": selected, "https": selected} if selected else None

@@ -27,9 +27,9 @@ class PipelineConcurrencyTests(unittest.TestCase):
         self.assertEqual(registration_service._normalize_workers(99), 2)
         self.assertEqual(live_check_service._WORKERS, 2)
         self.assertEqual(chatgpt2api_push.queue_settings()["workers"], 2)
-        self.assertEqual(proxy_config.PLAN_CHECK_WORKERS, 1)
-        self.assertEqual(plan_check_service._WORKERS, 1)
-        self.assertEqual(codex_agent_service._WORKERS, 1)
+        self.assertEqual(proxy_config.PLAN_CHECK_WORKERS, 2)
+        self.assertEqual(plan_check_service._WORKERS, 2)
+        self.assertEqual(codex_agent_service._WORKERS, 2)
         self.assertEqual(extract_link_service._WORKERS, 2)
 
         source = Path(proxy_config.__file__).read_text(encoding="utf-8")
@@ -82,7 +82,7 @@ class PipelineConcurrencyTests(unittest.TestCase):
                 trigger="concurrency_test",
             )
 
-        def fake_codex_oauth(_email, force=False):
+        def fake_codex_oauth(_email, force=False, proxy=None, proxy_selection=None):
             observed["codex_retry"] = pipeline_concurrency.pipeline_snapshot()["active"]
             return {
                 "ok": True,
@@ -94,6 +94,18 @@ class PipelineConcurrencyTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir, patch.object(
             codex_retry_service.db,
             "update_account_codex_status",
+        ), patch(
+            "config.proxy.pick_registration_proxy",
+            return_value={"proxy_url": "http://HOST:PORT", "mode": "mihomo_excluded"},
+        ), patch(
+            "config.reload_all",
+        ), patch(
+            "core.registration_preflight.preflight_proxy",
+            return_value={"ok": True, "country": "US", "ip": "198.51.100.11"},
+        ), patch.object(
+            codex_retry_service,
+            "_persist_oauth_result_and_queue_liveness",
+            side_effect=lambda _email, result: result,
         ), patch(
             "core.codex_oauth.run_codex_oauth",
             side_effect=fake_codex_oauth,

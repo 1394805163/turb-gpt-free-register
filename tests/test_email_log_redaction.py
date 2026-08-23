@@ -49,6 +49,10 @@ class EmailLogRedactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             account_liveness, "_LOG_DIR", Path(temp_dir)
         ), patch.object(
+            __import__("config.roxybrowser", fromlist=["REGISTRATION_DRIVER"]),
+            "REGISTRATION_DRIVER",
+            "protocol",
+        ), patch.object(
             account_liveness,
             "_network_preflight_with_retry",
             return_value=(session, "https://auth.openai.com/authorize"),
@@ -79,6 +83,10 @@ class EmailLogRedactionTests(unittest.TestCase):
     def test_liveness_error_text_also_redacts_embedded_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             account_liveness, "_LOG_DIR", Path(temp_dir)
+        ), patch.object(
+            __import__("config.roxybrowser", fromlist=["REGISTRATION_DRIVER"]),
+            "REGISTRATION_DRIVER",
+            "protocol",
         ), patch.object(
             account_liveness,
             "_network_preflight_with_retry",

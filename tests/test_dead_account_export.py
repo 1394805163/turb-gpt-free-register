@@ -97,6 +97,21 @@ class DeadAccountExportTests(unittest.TestCase):
             {"dead-one@example.com", "dead-two@example.com"},
         )
 
+    def test_oauth_status_filter_separates_complete_and_access_only_accounts(self):
+        complete = db.insert_account(email="complete@example.com", access_token="complete-token")
+        db.update_account_chatgpt_oauth("complete@example.com", {
+            "email": "complete@example.com",
+            "access_token": "complete-token-new",
+            "refresh_token": "refresh-token",
+            "id_token": "id-token",
+        })
+        access_only = db.insert_account(email="access-only@example.com", access_token="access-only-token")
+
+        complete_rows = db.list_accounts_page(oauth_filter="complete", limit=50)["items"]
+        access_only_rows = db.list_accounts_page(oauth_filter="access_only", limit=50)["items"]
+        self.assertEqual({row["id"] for row in complete_rows}, {complete})
+        self.assertEqual({row["id"] for row in access_only_rows}, {access_only})
+
     def test_ambiguous_invalid_requires_a_second_check_after_interval(self):
         acc_id = db.insert_account(email="review@example.com", access_token="review-token")
         candidate = classify_liveness_failure(RuntimeError("invalid_account"))

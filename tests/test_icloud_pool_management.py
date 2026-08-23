@@ -63,6 +63,20 @@ class ICloudPoolManagementTests(unittest.TestCase):
         self.assertEqual(listed.get_json()["items"][0]["source"], "icloud")
         self.assertEqual(listed.get_json()["items"][0]["label"], "测试")
 
+    def test_sync_registered_mailboxes_marks_existing_and_inserts_missing(self):
+        icloud_mail_client.import_mailboxes("existing@icloud.com----保留标签")
+        result = icloud_mail_client.sync_registered_mailboxes([
+            {"email": "existing@icloud.com", "email_source": "icloud"},
+            {"email": "missing@icloud.com", "email_source": "icloud"},
+        ])
+        self.assertEqual(result["accounts"], 2)
+        self.assertEqual(result["marked_used"], 1)
+        self.assertEqual(result["inserted"], 1)
+        rows = {row["email"]: row for row in icloud_mail_client.list_mailboxes()}
+        self.assertEqual(rows["existing@icloud.com"]["status"], "used")
+        self.assertEqual(rows["existing@icloud.com"]["label"], "保留标签")
+        self.assertEqual(rows["missing@icloud.com"]["status"], "used")
+
 
 if __name__ == "__main__":
     unittest.main()

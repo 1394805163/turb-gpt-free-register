@@ -27,7 +27,7 @@ class CloakProxyRotationTests(unittest.TestCase):
                 return {"success": False, "email": kwargs["email"], "error": "temporary page state"}
             return {"success": True, "email": kwargs["email"], "account_id": "fixture"}
 
-        with patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+        with patch.object(proxy, "REGISTRATION_PROXY_SOURCE", "resin"), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
             cloakbrowser, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0
         ), patch.object(proxy, "get_proxy_pool", return_value=self.pool), patch(
             "core.registration_preflight.preflight_proxy", return_value={"ok": True, "country": "US"}
@@ -62,7 +62,7 @@ class CloakProxyRotationTests(unittest.TestCase):
                 return {"success": False, "email": kwargs["email"], "error": "temporary page state"}
             return {"success": True, "email": kwargs["email"], "account_id": "fixture"}
 
-        with patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+        with patch.object(proxy, "REGISTRATION_PROXY_SOURCE", "resin"), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
             cloakbrowser, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0
         ), patch.object(proxy, "get_proxy_pool", return_value=self.pool), patch(
             "core.registration_preflight.preflight_proxy", side_effect=lambda *args, **kwargs: next(preflights)
@@ -86,7 +86,7 @@ class CloakProxyRotationTests(unittest.TestCase):
                 "REGISTRATION_ALLOWED_COUNTRIES": "JP,US",
                 "REGISTRATION_REQUIRED_COUNTRY": "US",
             },
-        ), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
+        ), patch.object(proxy, "REGISTRATION_PROXY_SOURCE", "resin"), patch.object(roxybrowser, "REGISTRATION_DRIVER", "cloak"), patch.object(
             cloakbrowser, "CLOAK_PROXY_ROTATION_ATTEMPTS", 1
         ), patch.object(proxy, "get_proxy_pool", return_value=self.pool), patch(
             "core.registration_preflight.preflight_proxy",

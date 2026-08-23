@@ -18,7 +18,8 @@ from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, make_response, render_template, request
 
-from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
+from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, registration_scheduler
+from core.codex_oauth_policy import evaluate_oauth_eligibility
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -86,13 +87,14 @@ def _compact_account_for_list(row: dict) -> dict:
         "has_access_token": bool(str(row.get("access_token") or "").strip()),
         "totp_enabled": bool(row.get("totp_secret")),
         "codex_agent_has_token": bool(str(row.get("codex_agent_token") or "").strip()),
+        "oauth_eligibility": evaluate_oauth_eligibility(row),
     }
 
     # 这些是列表固定列直接展示字段。
     for key in (
         "user_name", "email_source", "note", "archived", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
-        "plan_check_status", "codex_status", "codex_agent_status",
+        "plan_check_status", "codex_status", "oauth_status", "codex_agent_status",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -117,6 +119,8 @@ def _compact_account_for_list(row: dict) -> dict:
         # Codex / Agent 状态提示。
         "codex_error", "codex_agent_message", "codex_agent_runtime_id",
         "codex_agent_sub2api_url", "codex_agent_sub2api_mode", "codex_agent_sub2api_total",
+        "image_quota", "image_quota_reset_at", "image_quota_unknown",
+        "image_quota_checked_at", "image_quota_error",
     )
     for key in optional_keys:
         value = row.get(key)
@@ -173,25 +177,36 @@ def _job_status_counts(rows: list[dict]) -> dict:
 def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
+    _prepared_downloads_lock = threading.Lock()
+    _prepared_download_ttl_seconds = 600
 
     def _put_prepared_download(content: bytes, filename: str, mimetype: str = "application/zip") -> str:
         now = time.time()
-        # 顺手清理 10 分钟前的临时下载，避免内存堆积。
-        for k, v in list(_prepared_downloads.items()):
-            if now - float(v.get("created_at") or 0) > 600:
-                _prepared_downloads.pop(k, None)
+        # 顺手清理过期下载，避免账号凭据长期留在进程内存中。
         download_id = uuid.uuid4().hex
-        _prepared_downloads[download_id] = {
-            "content": bytes(content),
-            "filename": filename,
-            "mimetype": mimetype,
-            "created_at": now,
-        }
+        with _prepared_downloads_lock:
+            for k, v in list(_prepared_downloads.items()):
+                if now - float(v.get("created_at") or 0) > _prepared_download_ttl_seconds:
+                    _prepared_downloads.pop(k, None)
+            _prepared_downloads[download_id] = {
+                "content": bytes(content),
+                "filename": filename,
+                "mimetype": mimetype,
+                "created_at": now,
+            }
         return download_id
 
     @app.get("/api/downloads/<download_id>")
     def api_prepared_download(download_id: str):
-        item = _prepared_downloads.pop(str(download_id or ""), None)
+        now = time.time()
+        key = str(download_id or "")
+        with _prepared_downloads_lock:
+            # 浏览器可能对同一个下载 URL 发起 HEAD/GET/重试请求；在短 TTL
+            # 内保持幂等读取，避免首个 GET 成功后后续重试拿到 404。
+            for stale_key, value in list(_prepared_downloads.items()):
+                if now - float(value.get("created_at") or 0) > _prepared_download_ttl_seconds:
+                    _prepared_downloads.pop(stale_key, None)
+            item = _prepared_downloads.get(key)
         if not item:
             return jsonify({"ok": False, "error": "下载已过期或不存在，请重新生成"}), 404
         content = item.get("content") or b""
@@ -212,6 +227,17 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    try:
+        from core.icloud_mail_client import _mailboxes_path, sync_registered_mailboxes
+        # 只有已经配置并存在邮箱池文件时才做启动回填；空配置不应被账号库自动扩成整池。
+        if _mailboxes_path().is_file():
+            sync_result = sync_registered_mailboxes(db.list_accounts(limit=1_000_000, archived="all"))
+            if sync_result.get("accounts"):
+                logger.info("已同步注册账号到 iCloud 邮箱池: %s", sync_result)
+        else:
+            logger.info("iCloud 邮箱池文件不存在，跳过启动回填")
+    except Exception:
+        logger.exception("启动时同步注册账号到 iCloud 邮箱池失败")
     recovered_registration_jobs = db.recover_interrupted_registration_jobs()
     if recovered_registration_jobs:
         logger.warning("已回收 %s 个因 WebUI 重启遗留的注册任务状态", recovered_registration_jobs)
@@ -326,6 +352,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
         status_filter = str(request.args.get("status", default="") or "").lower()
+        oauth_filter = str(request.args.get("oauth", default="") or "").lower()
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
@@ -337,11 +364,11 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to)
+            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to)
             result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
             result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
             return jsonify(result)
-        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to))
+        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to))
 
     @app.get("/api/accounts/confirmed-dead.txt")
     def api_confirmed_dead_accounts_txt():
@@ -372,6 +399,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
         status_filter = str(request.args.get("status", default="") or "").lower()
+        oauth_filter = str(request.args.get("oauth", default="") or "").lower()
         q = str(request.args.get("q", default="") or "").strip()
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
@@ -379,10 +407,10 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q)
             snapshot.update({"page": page, "page_size": page_size})
         else:
-            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q)
         snapshot["queue"] = plan_check_service.queue_settings()
         return jsonify(snapshot)
 
@@ -1179,6 +1207,279 @@ def create_app(auth_code: str | None = None) -> Flask:
             },
         )
 
+    @app.post("/api/accounts/download-oauth-bulk")
+    def api_accounts_download_oauth_bulk():
+        """导出选中账号本地已持久化的完整 ChatGPT OAuth 凭据。"""
+        import io
+        import json as _json
+        import re
+        import zipfile
+        from datetime import datetime as _dt
+
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 1000:
+            return jsonify({"ok": False, "error": "单次最多导出 1000 个账号"}), 400
+
+        def first(*values) -> str:
+            for value in values:
+                text = str(value or "").strip()
+                if text:
+                    return text
+            return ""
+
+        def safe_name(email: str, account_id: int) -> str:
+            value = re.sub(r"[^A-Za-z0-9._-]+", "_", email).strip("._")
+            return value or f"account-{account_id}"
+
+        errors: list[dict] = []
+        added: list[dict] = []
+        used_names: set[str] = set()
+        seen_ids: set[int] = set()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for raw_id in ids:
+                try:
+                    account_id = int(raw_id)
+                except (TypeError, ValueError):
+                    errors.append({"id": raw_id, "error": "ID 非法"})
+                    continue
+                if account_id in seen_ids:
+                    continue
+                seen_ids.add(account_id)
+                account = db.get_account(account_id)
+                if not account:
+                    errors.append({"id": account_id, "error": "账号不存在"})
+                    continue
+                email = str(account.get("email") or "").strip()
+                access_token = first(account.get("chatgpt_oauth_access_token"), account.get("access_token"))
+                # Outlook 的顶层 refresh_token 属于邮箱池（用于读取 OTP），
+                # 不能在缺少 chatgpt_refresh_token 时被误导出为 ChatGPT OAuth 凭据。
+                chatgpt_refresh_token = first(account.get("chatgpt_refresh_token"))
+                email_source = str(account.get("email_source") or "").strip().lower()
+                mailbox_sources = {
+                    "outlook", "generic_api", "cloudmail", "mailnest",
+                    "cloudflare", "cloudflare_domain",
+                }
+                refresh_token = chatgpt_refresh_token
+                if not refresh_token and email_source not in mailbox_sources:
+                    # 兼容早期 iCloud/无来源记录把 ChatGPT OAuth refresh_token
+                    # 写在顶层字段的旧格式。
+                    refresh_token = first(account.get("refresh_token"))
+                id_token = first(account.get("chatgpt_id_token"), account.get("id_token"))
+                if not email or not access_token or not refresh_token or not id_token:
+                    errors.append({
+                        "id": account_id,
+                        "email": email,
+                        "error": "缺少完整 OAuth 凭据（email/access_token/refresh_token/id_token）",
+                    })
+                    continue
+
+                credential = {
+                    "type": "codex",
+                    "email": email,
+                    "expired": first(account.get("chatgpt_token_expires_at"), account.get("token_expires_at"), account.get("expires_at")),
+                    "id_token": id_token,
+                    "account_id": first(account.get("chatgpt_account_id"), account.get("account_id")),
+                    "disabled": bool(
+                        account.get("archived")
+                        or str(account.get("codex_status") or "").lower() in {"deactivated", "disabled"}
+                        or str(account.get("live_check_status") or "").lower() in {"confirmed_dead", "deactivated"}
+                    ),
+                    "access_token": access_token,
+                    "session_token": first(account.get("session_token")),
+                    "last_refresh": first(account.get("last_refresh"), account.get("chatgpt_credential_updated_at")),
+                    "refresh_token": refresh_token,
+                    "oauth_client_id": first(account.get("chatgpt_oauth_client_id"), account.get("oauth_client_id")),
+                    "oauth_status": str(account.get("oauth_status") or "success"),
+                    "oauth_completed_at": first(account.get("oauth_completed_at")),
+                }
+                arcname = f"codex-{safe_name(email, account_id)}-oauth.json"
+                if arcname in used_names:
+                    arcname = f"codex-{safe_name(email, account_id)}-{account_id}-oauth.json"
+                used_names.add(arcname)
+                zf.writestr(arcname, _json.dumps(credential, ensure_ascii=False, indent=2) + "\n")
+                added.append({"id": account_id, "email": email, "filename": arcname})
+
+            manifest = {
+                "exported_at": _dt.now().isoformat(timespec="seconds"),
+                "source": "local_chatgpt_oauth",
+                "format": "codex_oauth_json",
+                "count": len(added),
+                "files": added,
+                "errors": errors,
+            }
+            zf.writestr("manifest.json", _json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+
+        if not added:
+            return jsonify({"ok": False, "error": "没有可导出的完整 OAuth 凭据", "errors": errors}), 404
+        filename = f"accounts-oauth-{_dt.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        buf.seek(0)
+        zip_bytes = buf.getvalue()
+        if data.get("prepare"):
+            download_id = _put_prepared_download(zip_bytes, filename, "application/zip")
+            return jsonify({
+                "ok": True,
+                "prepared": True,
+                "download_id": download_id,
+                "download_url": f"/api/downloads/{download_id}",
+                "filename": filename,
+                "added_count": len(added),
+                "error_count": len(errors),
+            })
+        return Response(
+            zip_bytes,
+            mimetype="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @app.post("/api/accounts/import-oauth")
+    def api_accounts_import_oauth():
+        """导入完整 OAuth JSON 或 OAuth ZIP；按邮箱/账号 ID覆盖本地账号。"""
+        import base64
+        import io
+        import json as _json
+        import zipfile
+
+        def extract(value) -> list[dict]:
+            if isinstance(value, list):
+                rows: list[dict] = []
+                for item in value:
+                    rows.extend(extract(item))
+                return rows
+            if not isinstance(value, dict):
+                return []
+            # 兼容不同导出器的顶层包装：credentials/accounts/items/records/data。
+            # 只有看起来像凭据的对象才作为记录，避免把 manifest 当账号导入。
+            credential_keys = {
+                "email", "access_token", "accessToken", "refresh_token", "refreshToken",
+                "id_token", "idToken", "account_id", "chatgpt_account_id",
+            }
+            if credential_keys.intersection(value):
+                return [value]
+            for key in (
+                "credentials", "accounts", "items", "records", "data",
+                "credential", "auth_json", "authJson", "auth", "auth_file", "authFile", "file",
+            ):
+                nested = value.get(key)
+                if isinstance(nested, (list, dict)):
+                    rows = extract(nested)
+                    if rows:
+                        return rows
+            return []
+
+        records: list[dict] = []
+        uploaded = request.files.get("file")
+        if uploaded is not None:
+            raw_bytes = uploaded.read()
+            if zipfile.is_zipfile(io.BytesIO(raw_bytes)):
+                with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
+                    for info in archive.infolist():
+                        if info.is_dir() or not info.filename.lower().endswith(".json"):
+                            continue
+                        try:
+                            records.extend(extract(_json.loads(archive.read(info).decode("utf-8"))))
+                        except Exception:
+                            continue
+            else:
+                try:
+                    records = extract(_json.loads(raw_bytes.decode("utf-8")))
+                except Exception as exc:
+                    return jsonify({"ok": False, "error": f"OAuth JSON 解析失败: {type(exc).__name__}"}), 400
+        else:
+            data = request.get_json(silent=True) or {}
+            if isinstance(data, dict) and data.get("base64"):
+                try:
+                    decoded = base64.b64decode(str(data["base64"]))
+                    records = extract(_json.loads(decoded.decode("utf-8")))
+                except Exception as exc:
+                    return jsonify({"ok": False, "error": f"base64 OAuth 文件解析失败: {type(exc).__name__}"}), 400
+            else:
+                # JSON 既可以是单条凭据，也可以是 {accounts/items/credentials: [...]} 包装。
+                records = extract(data)
+
+        if not records:
+            return jsonify({"ok": False, "error": "没有解析到 OAuth 凭据"}), 400
+        result = db.import_account_credentials(records, source=(request.form.get("source") if uploaded else None))
+        return jsonify({"ok": True, **result})
+
+    @app.post("/api/accounts/download-credentials-bulk")
+    def api_accounts_download_credentials_bulk():
+        """导出账号迁移包；完整 OAuth 和只有 access_token 的账号均可导出。"""
+        import io
+        import json as _json
+        import re
+        import zipfile
+        from datetime import datetime as _dt
+
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        added, errors, names = [], [], set()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for raw_id in ids:
+                try:
+                    account_id = int(raw_id)
+                except (TypeError, ValueError):
+                    errors.append({"id": raw_id, "error": "ID 非法"})
+                    continue
+                account = db.get_account(account_id)
+                if not account:
+                    errors.append({"id": account_id, "error": "账号不存在"})
+                    continue
+                email = str(account.get("email") or "").strip()
+                access_token = str(account.get("chatgpt_oauth_access_token") or account.get("access_token") or "").strip()
+                if not email or not access_token:
+                    errors.append({"id": account_id, "email": email, "error": "缺少 email 或 access_token"})
+                    continue
+                refresh_token = str(account.get("chatgpt_refresh_token") or "").strip()
+                id_token = str(account.get("chatgpt_id_token") or account.get("id_token") or "").strip()
+                kind = "complete" if refresh_token and id_token else "access_only"
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "_", email).strip("._") or f"account-{account_id}"
+                name = f"account-{safe}-credentials.json"
+                if name in names:
+                    name = f"account-{safe}-{account_id}-credentials.json"
+                names.add(name)
+                payload = {
+                    "type": "codex" if kind == "complete" else "account_migration",
+                    "credential_kind": kind,
+                    "email": email,
+                    "email_source": account.get("email_source") or "",
+                    "account_id": account.get("chatgpt_account_id") or account.get("account_id") or "",
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "id_token": id_token,
+                    "oauth_client_id": account.get("chatgpt_oauth_client_id") or account.get("oauth_client_id") or "",
+                    "oauth_status": account.get("oauth_status") or "",
+                    "email_pool_status": "used",
+                }
+                zf.writestr(name, _json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                added.append({"id": account_id, "email": email, "filename": name, "credential_kind": kind})
+            zf.writestr("manifest.json", _json.dumps({
+                "exported_at": _dt.now().isoformat(timespec="seconds"),
+                "source": "register_account_migration",
+                "count": len(added),
+                "files": added,
+                "errors": errors,
+            }, ensure_ascii=False, indent=2) + "\n")
+        if not added:
+            return jsonify({"ok": False, "error": "没有可导出的账号凭据", "errors": errors}), 404
+        filename = f"accounts-credentials-{_dt.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        buf.seek(0)
+        content = buf.getvalue()
+        if data.get("prepare"):
+            download_id = _put_prepared_download(content, filename, "application/zip")
+            return jsonify({"ok": True, "prepared": True, "download_url": f"/api/downloads/{download_id}", "filename": filename, "added_count": len(added), "error_count": len(errors)})
+        return Response(content, mimetype="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"})
+
     @app.post("/api/accounts/download-cpa-bulk")
     def api_accounts_download_cpa_bulk():
         """
@@ -1443,6 +1744,17 @@ def create_app(auth_code: str | None = None) -> Flask:
             "parsed": len(records),
             "as_registered": as_registered,
         })
+
+    @app.post("/api/outlook/sync-registered")
+    def api_outlook_sync_registered():
+        """按已注册账号回填 iCloud 邮箱池状态；不删除邮箱、不改账号。"""
+        try:
+            from core.icloud_mail_client import sync_registered_mailboxes
+            result = sync_registered_mailboxes(db.list_accounts(limit=1_000_000, archived="all"))
+            return jsonify({"ok": True, **result})
+        except Exception as exc:
+            logger.exception("同步注册账号邮箱池失败")
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
     @app.post("/api/outlook/status")
     def api_outlook_status():
@@ -2025,7 +2337,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/codex/retry")
     def api_codex_retry():
-        """手动补跑某账号的 Codex 授权。Body {email}。"""
+        """手动补跑某账号的 Codex 授权；未满最小账号年龄时自动转轻量查活。"""
         data = request.get_json(silent=True) or {}
         email = (data.get("email") or "").strip()
         if not email:
@@ -2033,6 +2345,32 @@ def create_app(auth_code: str | None = None) -> Flask:
         acc = db.get_account_by_email(email)
         if acc is None:
             return jsonify({"ok": False, "error": f"账号不存在: {email}"}), 404
+        eligibility = evaluate_oauth_eligibility(acc)
+        if not eligibility.get("eligible"):
+            token = str(acc.get("access_token") or "").strip()
+            if not token:
+                return jsonify({
+                    "ok": False,
+                    "error": "账号未达到 OAuth 条件且没有 access_token，无法执行轻量查活",
+                    "action": "plan_check",
+                    "eligibility": eligibility,
+                }), 409
+            queued = plan_check_service.enqueue_account_plan_check(
+                account_id=int(acc.get("id") or 0),
+                email=email,
+                access_token=token,
+                trigger="oauth_gate",
+                proxy=None,
+                timezone_offset_min="-",
+            )
+            return jsonify({
+                "ok": True,
+                "started": bool(queued.get("accepted")),
+                "action": "plan_check",
+                "message": "账号尚未满足完整 OAuth 条件，已转为轻量查活",
+                "eligibility": eligibility,
+                "plan_check": {k: v for k, v in queued.items() if k != "future"},
+            }), 202
         if (acc.get("codex_status") or "") == "deactivated":
             return jsonify({"ok": False, "error": "账号已废号，不能补跑 Codex"}), 409
         if not _reserve_codex_retry(email):
@@ -2049,7 +2387,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/codex/retry-bulk")
     def api_codex_retry_bulk():
-        """批量补跑 Codex。Body {account_ids:[...], workers: 1-16}。"""
+        """批量补跑 Codex；未满最小账号年龄的账号自动进入轻量查活队列。"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from datetime import datetime as _dt
 
@@ -2059,13 +2397,15 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not isinstance(ids, list) or not ids:
             return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
         try:
-            workers = max(1, min(16, int(workers)))
+            workers = max(1, min(2, int(workers)))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "workers 必须是数字"}), 400
         if len(ids) > 500:
             return jsonify({"ok": False, "error": "单次最多选择 500 个账号"}), 400
 
         selected = []
+        simple_check_started = []
+        simple_check_busy = []
         skipped = []
         seen_ids = set()
         for raw in ids:
@@ -2085,6 +2425,38 @@ def create_app(auth_code: str | None = None) -> Flask:
             if not email:
                 skipped.append({"id": acc_id, "reason": "邮箱为空"})
                 continue
+            eligibility = evaluate_oauth_eligibility(acc)
+            if not eligibility.get("eligible"):
+                token = str(acc.get("access_token") or "").strip()
+                if not token:
+                    skipped.append({
+                        "id": acc_id,
+                        "email": email,
+                        "reason": "未达到 OAuth 条件且缺少 access_token",
+                        "eligibility": eligibility,
+                    })
+                    continue
+                queued = plan_check_service.enqueue_account_plan_check(
+                    account_id=acc_id,
+                    email=email,
+                    access_token=token,
+                    trigger="oauth_gate_bulk",
+                    proxy=None,
+                    timezone_offset_min="-",
+                )
+                item = {
+                    "id": acc_id,
+                    "email": email,
+                    "eligibility": eligibility,
+                    **{k: v for k, v in queued.items() if k != "future"},
+                }
+                if queued.get("accepted"):
+                    simple_check_started.append(item)
+                elif queued.get("busy"):
+                    simple_check_busy.append(item)
+                else:
+                    skipped.append({**item, "reason": queued.get("error") or "轻量查活入队失败"})
+                continue
             if (acc.get("codex_status") or "") == "deactivated":
                 skipped.append({"id": acc_id, "email": email, "reason": "账号已废号"})
                 continue
@@ -2093,7 +2465,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 continue
             selected.append({"id": acc_id, "email": email})
 
-        if not selected:
+        if not selected and not simple_check_started and not simple_check_busy:
             return jsonify({"ok": False, "error": "没有可补跑的账号", "skipped": skipped}), 409
 
         batch_id = _dt.now().strftime("%Y%m%d-%H%M%S")
@@ -2118,17 +2490,22 @@ def create_app(auth_code: str | None = None) -> Flask:
                         logger.exception(f"[Codex 批量补跑] 子任务异常 batch={batch}")
             logger.info(f"[Codex 批量补跑] 完成 batch={batch}")
 
-        threading.Thread(
-            target=_bulk_runner,
-            args=(selected, workers, batch_id),
-            name=f"codex-bulk-dispatch-{batch_id}",
-            daemon=True,
-        ).start()
+        if selected:
+            threading.Thread(
+                target=_bulk_runner,
+                args=(selected, workers, batch_id),
+                name=f"codex-bulk-dispatch-{batch_id}",
+                daemon=True,
+            ).start()
         return jsonify({
             "ok": True,
             "message": f"已开始批量补跑 {len(selected)} 个账号，并发 {workers}",
             "started": selected,
             "started_count": len(selected),
+            "simple_check_started": simple_check_started,
+            "simple_check_started_count": len(simple_check_started),
+            "simple_check_busy": simple_check_busy,
+            "simple_check_busy_count": len(simple_check_busy),
             "skipped": skipped,
             "batch_id": batch_id,
         })
@@ -2222,6 +2599,31 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         result = test_registration_proxy()
         return jsonify(result), (200 if result.get("ok") else 503)
+
+    @app.get("/api/registration/schedule")
+    def api_registration_schedule_get():
+        return jsonify({"ok": True, **registration_scheduler.get_schedule()})
+
+    @app.post("/api/registration/schedule")
+    def api_registration_schedule_set():
+        data = request.get_json(silent=True) or {}
+        if data.get("enabled") is False:
+            return jsonify({"ok": True, **registration_scheduler.cancel_schedule()})
+        try:
+            result = registration_scheduler.set_schedule(
+                run_at=str(data.get("run_at") or "").strip(),
+                count=int(data.get("count", 1)),
+                workers=int(data.get("workers", 1)),
+                repeat=str(data.get("repeat") or "once"),
+                email_source=str(data.get("email_source") or "icloud"),
+            )
+        except (TypeError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc) or "定时计划参数无效"}), 400
+        return jsonify({"ok": True, **result})
+
+    @app.post("/api/registration/schedule/cancel")
+    def api_registration_schedule_cancel():
+        return jsonify({"ok": True, **registration_scheduler.cancel_schedule()})
 
     @app.post("/api/jobs")
     def api_jobs_create():
@@ -2683,4 +3085,5 @@ def create_app(auth_code: str | None = None) -> Flask:
             ),
         })
 
+    registration_scheduler.start()
     return app

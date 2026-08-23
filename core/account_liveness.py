@@ -193,6 +193,7 @@ def check_account_liveness(
     *,
     clear_log: bool = True,
     rotate_transparent_route: bool = False,
+    proxy_selection: dict | None = None,
 ) -> dict:
     """
     重新登录账号并刷新最新 accessToken。
@@ -235,6 +236,17 @@ def check_account_liveness(
 
         logger.info("[查活] 日志文件：%s", path)
         logger.info("[查活] 开始重新登录：%s", redact_email(email))
+        from config import roxybrowser as registration_cfg
+        registration_driver = str(getattr(registration_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+        if registration_driver in {"cloak", "cloakbrowser"}:
+            from core.cloakbrowser_liveness import run_cloak_liveness_flow
+
+            logger.info("[查活] 使用 CloakBrowser 页面登录，跳过旧版 chatgpt.com/api/auth/providers 预检")
+            return run_cloak_liveness_flow(
+                email,
+                proxy=proxy,
+                proxy_selection=proxy_selection,
+            )
         logger.info("[查活] 流程：Providers → CSRF → Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
         session, authorize_url = _network_preflight_with_retry(
             email,

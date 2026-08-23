@@ -139,6 +139,18 @@ def resolve_email_source(email: str) -> str:
     from core.icloud_mail_client import get_account_context as get_icloud_context
     if get_icloud_context(email):
         return "icloud"
+    # iCloud Hide My Email 别名可能早于本地池文件导入（例如从服务器同步的
+    # 历史账号）。只要主邮箱 IMAP 已配置，Apple 域名地址都应直接走同一个
+    # INBOX，而不是落到 EMAIL_SOURCE 的默认 Outlook/API 来源。
+    try:
+        from config import email as _email_cfg
+        address_domain = str(email or "").rsplit("@", 1)[-1].strip().lower()
+        imap_user = str(getattr(_email_cfg, "ICLOUD_IMAP_USERNAME", "") or "").strip()
+        imap_password = str(getattr(_email_cfg, "ICLOUD_IMAP_PASSWORD", "") or "").strip()
+        if address_domain in {"icloud.com", "me.com", "mac.com"} and imap_user and imap_password:
+            return "icloud"
+    except Exception:
+        pass
     from core.gptmail_client import get_account_context as get_gptmail_context
     if get_gptmail_context(email):
         return "gptmail"
@@ -242,9 +254,14 @@ def wait_for_otp(
     return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
 
 
-def release_email(email: str, status: str = "available", note: str | None = None) -> str:
+def release_email(
+    email: str,
+    status: str = "available",
+    note: str | None = None,
+    source: str | None = None,
+) -> str:
     """按邮箱实际来源回收状态，返回来源名。"""
-    source = resolve_email_source(email)
+    source = str(source or "").strip().lower() or resolve_email_source(email)
     if source == "icloud":
         from core.icloud_mail_client import release_account
         release_account(email, status=status, note=note)

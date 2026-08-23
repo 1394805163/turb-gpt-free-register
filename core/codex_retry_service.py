@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from core import db
+from core.browser_task_gate import browser_task_slot
 from core.log_safety import email_fingerprint, redact_email
 from core.pipeline_concurrency import pipeline_limited
 
@@ -22,6 +23,37 @@ _RESERVED_AT: dict[str, float] = {}
 
 class CodexRetryStopped(Exception):
     """用户手动停止 Codex 补跑。"""
+
+
+def _oauth_proxy_rotation_attempts() -> int:
+    """返回 OAuth 代理拦截重试次数；Mihomo 没有静态池时使用有限上限。"""
+    try:
+        from config import cloakbrowser as cloak_cfg
+
+        configured = int(getattr(cloak_cfg, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0) or 0)
+    except (ImportError, TypeError, ValueError):
+        configured = 0
+    return max(1, min(configured if configured > 0 else 3, 5))
+
+
+def _is_oauth_proxy_rejection(result: dict | None) -> bool:
+    """仅将明确的代理/Cloudflare 拦截交给下一节点，不重试账号业务错误。"""
+    data = result if isinstance(result, dict) else {}
+    message = str(data.get("message") or data.get("error") or "")
+    try:
+        from core.cloakbrowser_registration import is_proxy_rejection_error
+
+        if is_proxy_rejection_error(message):
+            return True
+    except Exception:
+        pass
+    lowered = message.lower()
+    return any(marker in lowered for marker in (
+        "注册出口国家",
+        "无法确认注册出口",
+        "mihomo 代理选择失败",
+        "openai trace http 403",
+    ))
 
 
 def _thread_alive(thread_id: int | None) -> bool:
@@ -98,6 +130,101 @@ def is_stop_requested(email: str) -> bool:
 def check_stop_requested(email: str) -> None:
     if is_stop_requested(email):
         raise CodexRetryStopped("用户手动停止 Codex 补跑")
+
+
+def _select_oauth_route() -> dict:
+    """为完整 OAuth 选择与注册一致的 Mihomo/代理出口，失败时不直连。"""
+    from config import proxy as proxy_cfg
+
+    selection = proxy_cfg.pick_registration_proxy()
+    return _prepare_oauth_route(selection)
+
+
+def _prepare_oauth_route(selection: dict) -> dict:
+    """把本次 Mihomo 选择与实际 OpenAI 出口预检结果绑定。"""
+    from config import proxy as proxy_cfg
+    from core.registration_preflight import preflight_proxy
+
+    selection = dict(selection or {})
+    selected = str(selection.get("proxy_url") or "").strip()
+    transparent = bool(selection.get("transparent"))
+    if not selected and not transparent:
+        raise RuntimeError("OAuth 未取得代理出口，已阻止直连")
+    preflight = preflight_proxy(
+        selected,
+        require_country="",
+        allowed_countries=selection.get("allowed_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []),
+        excluded_countries=selection.get("excluded_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", ["HK"]),
+        allow_transparent=transparent,
+        route_identity=str(selection.get("node_name") or selected),
+        force=True,
+    )
+    if not preflight.get("ok"):
+        raise RuntimeError(f"代理预检失败: {preflight.get('reason') or 'unknown'}")
+    selection.update({
+        "preflight": dict(preflight),
+        "exit_country": str(preflight.get("country") or ""),
+        "exit_ip": str(preflight.get("ip") or ""),
+        "exit_geo": {
+            key: preflight.get(key)
+            for key in ("ip", "country", "colo")
+            if preflight.get(key)
+        },
+    })
+    logger.info(
+        "[Codex 补跑] 已选择代理 route=%s mode=%s group=%s node=%s",
+        selection.get("network_route") or ("transparent" if selection.get("transparent") else "proxy"),
+        selection.get("mode") or "-",
+        selection.get("group") or "-",
+        selection.get("node_name") or "-",
+    )
+    return selection
+
+
+def _select_oauth_proxy() -> str:
+    """兼容旧调用：返回已选择出口地址。"""
+    return str(_select_oauth_route().get("proxy_url") or "").strip()
+
+
+def _persist_oauth_result_and_queue_liveness(email: str, result: dict) -> dict:
+    """OAuth 文件落盘后回写账号，再由轻量查活成功路径触发 chatgpt2api 推送。"""
+    file_path = str(result.get("file_path") or "").strip()
+    credential = result.get("credential") if isinstance(result.get("credential"), dict) else None
+    if credential is not None:
+        persisted = db.update_account_chatgpt_oauth(email, credential)
+    elif file_path:
+        persisted = db.update_account_chatgpt_oauth_from_file(email, file_path)
+    else:
+        persisted = {"updated": False, "reason": "OAuth 结果缺少 credential/file_path"}
+    if not persisted.get("updated"):
+        raise RuntimeError(f"OAuth 凭据回写失败: {persisted.get('reason') or 'unknown'}")
+
+    account = db.get_account_by_email(email) or {}
+    access_token = str(account.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("OAuth 凭据回写后缺少 access_token")
+    db.update_account_codex_status(email, "success", None)
+    result = dict(result)
+    result["credential_persisted"] = True
+    result["credential_account_id"] = persisted.get("account_id")
+    try:
+        from core.plan_check_service import enqueue_account_plan_check
+
+        queued = enqueue_account_plan_check(
+            account_id=int(persisted.get("account_id") or account.get("id") or 0),
+            email=email,
+            access_token=access_token,
+            trigger="oauth_persisted",
+        )
+        result["liveness_check"] = {k: v for k, v in queued.items() if k != "future"}
+        if queued.get("accepted"):
+            logger.info("[Codex 补跑] OAuth 凭据已持久化，已入轻量查活队列: %s", redact_email(email))
+        else:
+            logger.warning("[Codex 补跑] OAuth 凭据已持久化，但轻量查活未入队: %s", queued.get("error") or queued.get("status") or "unknown")
+    except Exception as exc:
+        result["liveness_check"] = {"accepted": False, "error": type(exc).__name__}
+        logger.exception("[Codex 补跑] OAuth 凭据回写后入轻量查活失败")
+    return result
 
 
 def _async_raise(thread_id: int, exc_type: type[BaseException]) -> bool:
@@ -203,12 +330,24 @@ def run_worker(
             import config as config_pkg
             config_pkg.reload_all()
             from config import codex as codex_cfg
+            from config import cloakbrowser as cloak_cfg
             from config import roxybrowser as roxy_cfg
+            oauth_driver = str(getattr(codex_cfg, "CODEX_OAUTH_DRIVER", "") or "").strip().lower()
+            headless = (
+                getattr(cloak_cfg, "CLOAK_HEADLESS", "")
+                if oauth_driver in {"cloak", "cloakbrowser"}
+                else getattr(roxy_cfg, "ROXY_OPEN_HEADLESS", "")
+            )
+            keep_open = (
+                getattr(cloak_cfg, "CLOAK_KEEP_BROWSER_OPEN", "")
+                if oauth_driver in {"cloak", "cloakbrowser"}
+                else getattr(roxy_cfg, "ROXY_KEEP_BROWSER_OPEN", "")
+            )
             logger.info(
-                "[Codex 补跑] 已热加载配置：CODEX_OAUTH_DRIVER=%s ROXY_OPEN_HEADLESS=%s ROXY_KEEP_BROWSER_OPEN=%s",
-                getattr(codex_cfg, "CODEX_OAUTH_DRIVER", ""),
-                getattr(roxy_cfg, "ROXY_OPEN_HEADLESS", ""),
-                getattr(roxy_cfg, "ROXY_KEEP_BROWSER_OPEN", ""),
+                "[Codex 补跑] 已热加载配置：CODEX_OAUTH_DRIVER=%s BROWSER_HEADLESS=%s BROWSER_KEEP_OPEN=%s",
+                oauth_driver,
+                headless,
+                keep_open,
             )
         except Exception as exc:
             logger.warning("[Codex 补跑] 配置热加载失败，将继续使用当前内存配置：%s: %s", type(exc).__name__, exc)
@@ -218,7 +357,47 @@ def run_worker(
         logger.info("[Codex 补跑] 开始：%s", redact_email(email))
         logger.info("[Codex 补跑] 阶段说明：获取授权地址 → 登录邮箱 → 邮箱 OTP → 手机验证 → 捕获 callback → 提交/保存凭证")
         check_stop_requested(email)
-        result = run_codex_oauth(email, force=True)
+        with browser_task_slot("oauth") as acquired:
+            if not acquired:
+                raise RuntimeError("OAuth 浏览器闸门未取得，已取消本次任务")
+            result = {"status": "failed", "ok": False, "message": "OAuth 未执行"}
+            max_oauth_attempts = _oauth_proxy_rotation_attempts()
+            for oauth_attempt in range(1, max_oauth_attempts + 1):
+                check_stop_requested(email)
+                try:
+                    oauth_route = _select_oauth_route()
+                except Exception as exc:
+                    # Resin 预检失败、Mihomo 控制器抖动等发生在浏览器启动前，
+                    # 也必须进入同一轮换计数，不能直接落成一次最终失败。
+                    result = {
+                        "status": "failed",
+                        "ok": False,
+                        "message": f"代理选路失败: {type(exc).__name__}: {str(exc)[:220]}",
+                    }
+                    if oauth_attempt >= max_oauth_attempts:
+                        break
+                    logger.warning(
+                        "[Codex 补跑] 代理选路失败，准备重新选择出口 %s/%s：%s",
+                        oauth_attempt + 1,
+                        max_oauth_attempts,
+                        str(exc)[:180],
+                    )
+                    continue
+                oauth_proxy = str(oauth_route.get("proxy_url") or "").strip()
+                result = run_codex_oauth(
+                    email,
+                    force=True,
+                    proxy=oauth_proxy,
+                    proxy_selection=oauth_route,
+                )
+                if result.get("ok") or not _is_oauth_proxy_rejection(result) or oauth_attempt >= max_oauth_attempts:
+                    break
+                logger.warning(
+                    "[Codex 补跑] 检测到代理/Cloudflare 拦截，准备轮换节点重试 %s/%s：%s",
+                    oauth_attempt + 1,
+                    max_oauth_attempts,
+                    str(result.get("message") or result.get("error") or "")[:180],
+                )
         check_stop_requested(email)
         logger.info(
             "[Codex 补跑] 结果：status=%s ok=%s file=%s callback=%s",
@@ -226,7 +405,7 @@ def run_worker(
         )
         result_status = result.get("status", "failed")
         if result.get("ok"):
-            db.update_account_codex_status(email, "success", None)
+            result = _persist_oauth_result_and_queue_liveness(email, result)
             logger.info("[Codex 补跑] %s 成功", redact_email(email))
         elif result_status == "deactivated":
             db.update_account_codex_status(email, "deactivated", result.get("message"))

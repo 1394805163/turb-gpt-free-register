@@ -47,6 +47,14 @@ _LEGACY_ACCOUNTS_JSON = _LEGACY_DATA_DIR / "registered_accounts.json"
 _LEGACY_JOBS_JSON = _LEGACY_DATA_DIR / "registration_jobs.json"
 _LOCK = threading.RLock()
 
+# 静态查看页是旁路产物，不应在批量状态写入时反复生成大 HTML。
+# WebUI 实时列表直接读取 JSON，不依赖此文件。
+_VIEWER_DEBOUNCE_SECONDS = 3.0
+_VIEWER_REFRESH_LOCK = threading.Lock()
+_VIEWER_REFRESH_TIMER: threading.Timer | None = None
+_VIEWER_REFRESH_REASON = ""
+_VIEWER_REFRESH_GENERATION = 0
+
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -60,6 +68,47 @@ def _token_fingerprint(token: str) -> str:
 def token_fingerprint(token: str) -> str:
     """返回可用于并发 CAS 的 Token 短哈希，不暴露 Token 明文。"""
     return _token_fingerprint(token)
+
+
+def _run_debounced_static_viewer_refresh(generation: int | None = None) -> None:
+    """后台刷新静态查看页；高频保存只保留最后一次刷新。"""
+    global _VIEWER_REFRESH_TIMER, _VIEWER_REFRESH_REASON
+    with _VIEWER_REFRESH_LOCK:
+        if generation is not None and generation != _VIEWER_REFRESH_GENERATION:
+            return
+        _VIEWER_REFRESH_TIMER = None
+        reason = _VIEWER_REFRESH_REASON
+        _VIEWER_REFRESH_REASON = ""
+    try:
+        # 先释放 viewer 锁再获取数据锁，避免与 _save_accounts/_save_outlook 反向等待。
+        with _LOCK:
+            outlook_rows = _load_outlook()
+            account_rows = _load_accounts()
+        _render_static_viewer(outlook_rows=outlook_rows, account_rows=account_rows)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "后台刷新 accounts_viewer.html 失败: %s", reason or "-"
+        )
+
+
+def _schedule_static_viewer_refresh(reason: str = "") -> None:
+    """防抖刷新静态查看页，避免旁路渲染阻塞主注册/查活流程。"""
+    global _VIEWER_REFRESH_TIMER, _VIEWER_REFRESH_REASON, _VIEWER_REFRESH_GENERATION
+    with _VIEWER_REFRESH_LOCK:
+        _VIEWER_REFRESH_GENERATION += 1
+        generation = _VIEWER_REFRESH_GENERATION
+        _VIEWER_REFRESH_REASON = reason or _VIEWER_REFRESH_REASON
+        if _VIEWER_REFRESH_TIMER is not None:
+            _VIEWER_REFRESH_TIMER.cancel()
+        timer = threading.Timer(
+            _VIEWER_DEBOUNCE_SECONDS,
+            _run_debounced_static_viewer_refresh,
+            args=(generation,),
+        )
+        timer.daemon = True
+        _VIEWER_REFRESH_TIMER = timer
+        timer.start()
 
 
 def _ensure_storage() -> None:
@@ -479,7 +528,7 @@ def _load_outlook() -> list[dict]:
 def _save_outlook(rows: list[dict]) -> None:
     _write_json(_OUTLOOK_JSON, rows)
     _sync_outlook_txt(rows)
-    _render_static_viewer(outlook_rows=rows)
+    _schedule_static_viewer_refresh("save_outlook")
 
 
 def _load_generic_api_emails() -> list[dict]:
@@ -507,7 +556,7 @@ def _save_accounts(rows: list[dict]) -> None:
     _write_json(_ACCOUNTS_JSON, rows)
     _sync_accounts_txt(rows)
     _sync_tokens_txt(rows)
-    _render_static_viewer(account_rows=rows)
+    _schedule_static_viewer_refresh("save_accounts")
 
 
 def _load_jobs() -> list[dict]:
@@ -530,6 +579,15 @@ def _decorate_account(row: dict) -> dict:
     out = dict(row)
     out["note"] = out.get("note") or ""
     out["note_updated_at"] = out.get("note_updated_at") or ""
+    if "image_quota" in out and "生图额度:" not in out["note"]:
+        if out.get("image_quota_unknown"):
+            quota_note = "生图额度: 未知"
+        else:
+            value = out.get("image_quota") if out.get("image_quota") is not None else "未知"
+            quota_note = f"生图额度: {value}"
+        if out.get("image_quota_reset_at"):
+            quota_note += f"；重置: {out['image_quota_reset_at']}"
+        out["note"] = f"{out['note']}\n{quota_note}".strip()
     plan_status = out.get("plan_check_status")
     if plan_status in {"queued", "running"}:
         try:
@@ -633,6 +691,7 @@ def insert_account(
     extra: dict | None = None,
     codex_status: str | None = None,   # success / failed / skipped / missing
     codex_error: str | None = None,    # 失败原因（仅 codex_status=failed 时有意义）
+    chatgpt_oauth: dict | None = None,
 ) -> int:
     """插入或更新注册成功账号，返回本地文件中的 id。"""
     with _LOCK:
@@ -641,6 +700,7 @@ def insert_account(
         existing = _find_by_email(accounts, email)
         outlook_row = _find_by_email(outlook_rows, email)
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
+        chatgpt_oauth = chatgpt_oauth if isinstance(chatgpt_oauth, dict) else {}
 
         if existing is None:
             row_id = _next_id(accounts)
@@ -669,8 +729,39 @@ def insert_account(
             "extra_json": extra_json if extra_json is not None else row.get("extra_json"),
             "codex_status": codex_status if codex_status is not None else row.get("codex_status"),
             "codex_error": codex_error if codex_error is not None else row.get("codex_error"),
+            "chatgpt_oauth_access_token": (
+                str(chatgpt_oauth.get("access_token") or "").strip()
+                or row.get("chatgpt_oauth_access_token")
+            ),
+            "chatgpt_refresh_token": (
+                str(chatgpt_oauth.get("refresh_token") or "").strip()
+                or row.get("chatgpt_refresh_token")
+            ),
+            "chatgpt_id_token": (
+                str(chatgpt_oauth.get("id_token") or "").strip()
+                or row.get("chatgpt_id_token")
+            ),
+            "chatgpt_oauth_client_id": (
+                str(chatgpt_oauth.get("oauth_client_id") or chatgpt_oauth.get("client_id") or "").strip()
+                or row.get("chatgpt_oauth_client_id")
+            ),
+            "chatgpt_token_expires_at": (
+                str(chatgpt_oauth.get("expires_at") or chatgpt_oauth.get("expired") or "").strip()
+                or row.get("chatgpt_token_expires_at")
+            ),
+            "chatgpt_credential_source": (
+                str(chatgpt_oauth.get("source") or "").strip()
+                or row.get("chatgpt_credential_source")
+            ),
+            "chatgpt_credential_updated_at": (
+                str(chatgpt_oauth.get("updated_at") or "").strip()
+                or row.get("chatgpt_credential_updated_at")
+            ),
             "updated_at": _now(),
         })
+        if chatgpt_oauth.get("refresh_token"):
+            row["oauth_status"] = "success"
+            row["oauth_completed_at"] = row.get("oauth_completed_at") or _now()
         current_token_fingerprint = _token_fingerprint(access_token)
         if existing is None:
             row.setdefault("pipeline_status", "pending")
@@ -704,6 +795,27 @@ def insert_account(
             outlook_row["completed_at"] = _now()
             if totp_secret:
                 outlook_row["totp_secret"] = totp_secret
+        elif chatgpt_oauth:
+            # iCloud/非 Outlook 账号没有邮箱池 refresh_token；此时把 OAuth
+            # 凭据同步到旧版账号字段，兼容 chatgpt2api v1.6 导入格式。
+            if chatgpt_oauth.get("access_token"):
+                row["access_token"] = str(chatgpt_oauth["access_token"]).strip()
+            if chatgpt_oauth.get("refresh_token"):
+                row["refresh_token"] = str(chatgpt_oauth["refresh_token"]).strip()
+            if chatgpt_oauth.get("id_token"):
+                row["id_token"] = str(chatgpt_oauth["id_token"]).strip()
+            if chatgpt_oauth.get("oauth_client_id") or chatgpt_oauth.get("client_id"):
+                row["oauth_client_id"] = str(
+                    chatgpt_oauth.get("oauth_client_id") or chatgpt_oauth.get("client_id")
+                ).strip()
+            if chatgpt_oauth.get("account_id"):
+                row["account_id"] = str(chatgpt_oauth["account_id"]).strip()
+            if chatgpt_oauth.get("expires_at") or chatgpt_oauth.get("expired"):
+                row["token_expires_at"] = str(
+                    chatgpt_oauth.get("expires_at") or chatgpt_oauth.get("expired")
+                ).strip()
+            if chatgpt_oauth.get("last_refresh"):
+                row["last_refresh"] = str(chatgpt_oauth["last_refresh"]).strip()
 
         row["copy_line"] = _account_line(row)
         _save_accounts(accounts)
@@ -726,6 +838,233 @@ def update_account_codex_status(email: str, codex_status: str, codex_error: str 
         row["updated_at"] = _now()
         _save_accounts(accounts)
         return True
+
+
+def _extract_chatgpt_oauth_credential(value: object) -> dict | None:
+    """从 Codex/CPA 响应或文件内容提取完整 OAuth 凭据。"""
+    if not isinstance(value, dict):
+        return None
+    candidates = [value]
+    for key in ("credential", "auth_json", "authJson", "auth", "auth_file", "authFile", "file", "data"):
+        item = value.get(key)
+        if isinstance(item, dict):
+            candidates.append(item)
+    for item in candidates:
+        access_token = str(item.get("access_token") or item.get("accessToken") or "").strip()
+        refresh_token = str(item.get("refresh_token") or item.get("refreshToken") or "").strip()
+        if not access_token or not refresh_token:
+            continue
+        return {
+            "type": str(item.get("type") or "codex").strip() or "codex",
+            "email": str(item.get("email") or "").strip(),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": str(item.get("id_token") or item.get("idToken") or "").strip(),
+            "oauth_client_id": str(item.get("oauth_client_id") or item.get("client_id") or "").strip(),
+            "account_id": str(item.get("account_id") or item.get("chatgpt_account_id") or "").strip(),
+            "expires_at": str(item.get("expires_at") or item.get("expired") or "").strip(),
+            "last_refresh": str(item.get("last_refresh") or "").strip(),
+            "source": str(item.get("source") or "codex_oauth").strip(),
+        }
+    return None
+
+
+def update_account_chatgpt_oauth(email: str, credential: dict, expected_access_token: str | None = None) -> dict:
+    """原子写入已有账号的 ChatGPT OAuth 凭据，不覆盖 Outlook 邮箱凭据。"""
+    normalized = _extract_chatgpt_oauth_credential(credential)
+    if normalized is None:
+        return {"updated": False, "reason": "缺少 access_token 或 refresh_token"}
+    target_email = str(email or normalized.get("email") or "").strip()
+    if not target_email:
+        return {"updated": False, "reason": "email 为空"}
+    with _LOCK:
+        accounts = _load_accounts()
+        row = _find_by_email(accounts, target_email)
+        if row is None:
+            return {"updated": False, "reason": "账号不存在", "email": target_email}
+        if expected_access_token is not None and _token_fingerprint(row.get("access_token") or "") != _token_fingerprint(expected_access_token):
+            return {"updated": False, "reason": "access_token 已变化，拒绝覆盖", "email": target_email}
+        now = _now()
+        row["chatgpt_oauth_access_token"] = normalized["access_token"]
+        row["chatgpt_refresh_token"] = normalized["refresh_token"]
+        row["access_token"] = normalized["access_token"]
+        # Outlook 邮箱池自己的 refresh_token 用于收验证码，不能被 ChatGPT
+        # OAuth refresh_token 覆盖；iCloud/其他邮箱才使用兼容旧格式的顶层字段。
+        if _find_by_email(_load_outlook(), target_email) is None:
+            row["refresh_token"] = normalized["refresh_token"]
+        if normalized.get("id_token"):
+            row["chatgpt_id_token"] = normalized["id_token"]
+            row["id_token"] = normalized["id_token"]
+        if normalized.get("oauth_client_id"):
+            row["chatgpt_oauth_client_id"] = normalized["oauth_client_id"]
+            row["oauth_client_id"] = normalized["oauth_client_id"]
+        if normalized.get("account_id"):
+            row["chatgpt_account_id"] = normalized["account_id"]
+            row["account_id"] = normalized["account_id"]
+        if normalized.get("expires_at"):
+            row["chatgpt_token_expires_at"] = normalized["expires_at"]
+            row["token_expires_at"] = normalized["expires_at"]
+        if normalized.get("last_refresh"):
+            row["last_refresh"] = normalized["last_refresh"]
+        row["chatgpt_credential_source"] = normalized.get("source") or "codex_oauth"
+        row["chatgpt_credential_updated_at"] = now
+        row["oauth_status"] = "success"
+        row["oauth_completed_at"] = now
+        row["credential_source"] = normalized.get("source") or "codex_oauth"
+        row["credential_updated_at"] = now
+        row["updated_at"] = now
+        _save_accounts(accounts)
+        return {"updated": True, "account_id": int(row.get("id") or 0), "email": target_email}
+
+
+def import_chatgpt_oauth_credentials(records: list[dict], source: str | None = None) -> dict:
+    """导入完整 ChatGPT OAuth 凭据，并按邮箱/账号 ID更新已有账号。
+
+    新账号会进入本地账号池但不会被直接推送；必须先完成快速查活或完整登录。
+    对应邮箱池只同步为 used，不会删除邮箱素材。
+    """
+    stats = {"inserted": 0, "updated": 0, "skipped": 0, "errors": []}
+    for raw in records or []:
+        normalized = _extract_chatgpt_oauth_credential(raw)
+        if normalized is None or not normalized.get("id_token"):
+            stats["skipped"] += 1
+            stats["errors"].append({"error": "缺少完整 OAuth 凭据（需要 access_token/refresh_token/id_token）"})
+            continue
+        email = str(normalized.get("email") or "").strip()
+        account_id = str(normalized.get("account_id") or "").strip()
+        if not email:
+            stats["skipped"] += 1
+            stats["errors"].append({"error": "OAuth 凭据缺少 email"})
+            continue
+
+        with _LOCK:
+            accounts = _load_accounts()
+            target = _find_by_email(accounts, email)
+            if target is None and account_id:
+                target = next((item for item in accounts if str(
+                    item.get("chatgpt_account_id") or item.get("account_id") or ""
+                ).strip() == account_id), None)
+
+        try:
+            if target is not None:
+                result = update_account_chatgpt_oauth(
+                    str(target.get("email") or email),
+                    normalized,
+                )
+                if not result.get("updated"):
+                    stats["skipped"] += 1
+                    stats["errors"].append({"email": email, "error": result.get("reason") or "更新失败"})
+                    continue
+                stats["updated"] += 1
+                pool_source = str(target.get("email_source") or source or "").strip().lower()
+            else:
+                pool_source = str(source or "").strip().lower()
+                if not pool_source and email.rsplit("@", 1)[-1].lower() in {"icloud.com", "me.com", "mac.com"}:
+                    pool_source = "icloud"
+                insert_account(
+                    email=email,
+                    access_token=normalized["access_token"],
+                    email_source=pool_source or None,
+                    extra={"oauth_imported": True, "oauth": normalized},
+                    chatgpt_oauth=normalized,
+                )
+                stats["inserted"] += 1
+
+            try:
+                from core.email_provider import release_email
+                if (pool_source or "").lower() == "icloud":
+                    from core.icloud_mail_client import import_mailboxes
+                    import_mailboxes(email)
+                release_email(
+                    email,
+                    status="used",
+                    note="导入完整 ChatGPT OAuth 凭据",
+                    source=pool_source or None,
+                )
+            except Exception as exc:
+                # 邮箱池可能还没有导入这条素材；OAuth 账号本身已经成功落盘。
+                stats["errors"].append({"email": email, "error": f"邮箱池状态未同步: {type(exc).__name__}"})
+        except Exception as exc:
+            stats["skipped"] += 1
+            stats["errors"].append({"email": email, "error": f"{type(exc).__name__}: {str(exc)[:160]}"})
+    stats["items"] = [item for item in _load_accounts() if item.get("oauth_status") == "success"]
+    return stats
+
+
+def import_account_credentials(records: list[dict], source: str | None = None) -> dict:
+    """导入账号迁移凭据，兼容完整 OAuth 与只有 access_token 的账号。"""
+    oauth_records = []
+    access_only_records = []
+    for raw in records or []:
+        if not isinstance(raw, dict):
+            continue
+        access_token = str(raw.get("access_token") or raw.get("accessToken") or "").strip()
+        refresh_token = str(raw.get("refresh_token") or raw.get("refreshToken") or "").strip()
+        id_token = str(raw.get("id_token") or raw.get("idToken") or "").strip()
+        if access_token and refresh_token and id_token:
+            oauth_records.append(raw)
+        elif access_token:
+            access_only_records.append(raw)
+
+    result = import_chatgpt_oauth_credentials(oauth_records, source=source) if oauth_records else {
+        "inserted": 0, "updated": 0, "skipped": 0, "errors": [], "items": []
+    }
+    access_only_count = 0
+    for raw in access_only_records:
+        email = str(raw.get("email") or "").strip()
+        token = str(raw.get("access_token") or raw.get("accessToken") or "").strip()
+        if not email or not token:
+            result["skipped"] += 1
+            result["errors"].append({"email": email, "error": "AT-only 凭据缺少 email 或 access_token"})
+            continue
+        existing = get_account_by_email(email)
+        if existing:
+            insert_account(
+                email=email,
+                access_token=token,
+                email_source=raw.get("email_source") or source or existing.get("email_source"),
+                extra={"account_migration_imported": True},
+            )
+            result["updated"] += 1
+        else:
+            insert_account(
+                email=email,
+                access_token=token,
+                email_source=raw.get("email_source") or source,
+                extra={"account_migration_imported": True},
+            )
+            result["inserted"] += 1
+        access_only_count += 1
+        try:
+            from core.email_provider import release_email
+            pool_source = str(raw.get("email_source") or source or "").strip().lower()
+            if pool_source == "icloud":
+                from core.icloud_mail_client import import_mailboxes
+                import_mailboxes(email)
+            release_email(email, status="used", note="导入 access_token 账号迁移凭据", source=pool_source or None)
+        except Exception as exc:
+            result["errors"].append({"email": email, "error": f"邮箱池状态未同步: {type(exc).__name__}"})
+    result["oauth_status"] = {
+        key: value
+        for key, value in {"complete": len(oauth_records), "access_only": access_only_count}.items()
+        if value
+    }
+    result["items"] = [item for item in _load_accounts() if item.get("access_token")]
+    return result
+
+
+def update_account_chatgpt_oauth_from_file(email: str, file_path: str | Path, expected_access_token: str | None = None) -> dict:
+    """读取完整 CPA/Codex 文件后写回账号；回执文件会被拒绝。"""
+    path = Path(str(file_path or "")).expanduser()
+    if not path.is_file():
+        return {"updated": False, "reason": "授权文件不存在", "file_path": str(path)}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"updated": False, "reason": f"授权文件读取失败: {type(exc).__name__}", "file_path": str(path)}
+    result = update_account_chatgpt_oauth(email, payload, expected_access_token=expected_access_token)
+    result["file_path"] = str(path)
+    return result
 
 
 def claim_account_codex_agent(acc_id: int, trigger: str = "manual") -> bool:
@@ -1102,6 +1441,30 @@ def update_account_plan_check(
             row["eligible_offer_ids"] = result.get("eligible_offer_ids") or []
             row["plan_last_success_at"] = result.get("checked_at") or _now()
             row["plan_last_success_result_json"] = json.dumps(result, ensure_ascii=False)
+        for _key in (
+            "image_quota",
+            "image_quota_reset_at",
+            "image_quota_unknown",
+            "image_quota_checked_at",
+            "image_quota_error",
+        ):
+            if _key in result:
+                row[_key] = result.get(_key)
+        if any(key in result for key in ("image_quota", "image_quota_unknown", "image_quota_reset_at")):
+            note_lines = [
+                line.strip()
+                for line in str(row.get("note") or "").splitlines()
+                if line.strip() and not line.strip().startswith("生图额度:")
+            ]
+            if result.get("image_quota_unknown"):
+                quota_note = "生图额度: 未知"
+            else:
+                quota_note = f"生图额度: {result.get('image_quota') if result.get('image_quota') is not None else '未知'}"
+                if result.get("image_quota_reset_at"):
+                    quota_note += f"；重置: {result.get('image_quota_reset_at')}"
+            note_lines.append(quota_note)
+            row["note"] = "\n".join(note_lines)
+            row["note_updated_at"] = _now()
         row["plan_check_proxy_mode"] = result.get("proxy_mode")
         row["plan_check_network_route"] = result.get("network_route")
         row["plan_check_proxy_used"] = result.get("proxy_used")
@@ -1252,7 +1615,34 @@ def _parse_iso_dt(value: str | None, end_of_day: bool = False) -> datetime | Non
         return None
 
 
-def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+def _oauth_credential_kind(row: dict) -> str:
+    access = str(row.get("chatgpt_oauth_access_token") or row.get("access_token") or "").strip()
+    refresh = str(row.get("chatgpt_refresh_token") or "").strip()
+    identity = str(row.get("chatgpt_id_token") or row.get("id_token") or "").strip()
+    if access and refresh and identity:
+        return "complete"
+    if access and not refresh and not identity:
+        return "access_only"
+    if access:
+        return "partial"
+    return "none"
+
+
+def _oauth_filter_matches(row: dict, oauth_filter: str | None) -> bool:
+    wanted = str(oauth_filter or "").strip().lower()
+    if not wanted or wanted in {"all", "any"}:
+        return True
+    kind = _oauth_credential_kind(row)
+    if wanted in {"complete", "oauth", "success"}:
+        return kind == "complete"
+    if wanted in {"access_only", "access-only", "at_only", "at-only"}:
+        return kind == "access_only"
+    if wanted in {"partial", "incomplete", "pending", "not_complete", "not-complete"}:
+        return kind != "complete"
+    return True
+
+
+def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
     rows = _load_accounts()
     if archived in (True, "1", "true", "yes", "only"):
         rows = [r for r in rows if bool(r.get("archived"))]
@@ -1261,6 +1651,7 @@ def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filte
     else:
         rows = [r for r in rows if not bool(r.get("archived"))]
     decorated = [_decorate_account(r) for r in rows]
+    decorated = [r for r in decorated if _oauth_filter_matches(r, oauth_filter)]
     decorated = [r for r in decorated if _account_matches_plan_filter(r, plan_filter)]
     wanted_status = str(status_filter or "").strip().lower()
     if wanted_status and wanted_status not in {"all", "any"}:
@@ -1288,7 +1679,7 @@ def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filte
     return sorted(decorated, key=lambda x: int(x.get("id") or 0), reverse=True)
 
 
-def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None) -> dict:
+def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None) -> dict:
     """返回不含 Token/邮箱密码的套餐查询轻量状态快照。"""
     fields = (
         "id", "email", "archived",
@@ -1311,7 +1702,7 @@ def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archive
         "codex_agent_sub2api_mode", "codex_agent_sub2api_total",
     )
     with _LOCK:
-        all_rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q)
+        all_rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q)
         total = len(all_rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
@@ -1361,15 +1752,15 @@ def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archive
         return {"items": items, "total": total, "offset": offset, "limit": limit, "revision": f"{total}:{latest}:{revision_sig}"}
 
 
-def list_accounts(limit: int = 500, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+def list_accounts(limit: int = 500, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to)
         return rows[max(0, int(offset or 0)): max(0, int(offset or 0)) + max(1, int(limit))]
 
 
-def list_accounts_page(limit: int = 50, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> dict:
+def list_accounts_page(limit: int = 50, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> dict:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, q=q, date_from=date_from, date_to=date_to)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to)
         total = len(rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))

@@ -26,6 +26,7 @@ import logging
 import random
 import secrets
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs, quote
@@ -126,19 +127,24 @@ def _generate_state() -> str:
 
 
 def _build_authorize_url(state: str, code_challenge: str, prompt: str = "login") -> str:
-    """按 CLIProxyAPI openai_auth.go 的参数集拼 Codex 授权 URL。"""
+    """按 chatgpt2api OAuth 服务的参数集拼授权 URL。"""
     params = {
         "client_id": _cfg.CODEX_CLIENT_ID,
+        "audience": "https://api.openai.com/v1",
         "response_type": "code",
         "redirect_uri": _cfg.CODEX_REDIRECT_URI,
         "scope": _cfg.CODEX_SCOPE,
         "state": state,
+        "nonce": secrets.token_urlsafe(24),
+        "device_id": str(uuid.uuid4()),
+        "screen_hint": "login_or_signup",
+        "max_age": "0",
+        "auth0Client": getattr(_cfg, "CODEX_AUTH0_CLIENT", ""),
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
-        "prompt": prompt,
-        "id_token_add_organizations": "true",
-        "codex_cli_simplified_flow": "true",
     }
+    if prompt:
+        params["prompt"] = prompt
     return f"{_cfg.CODEX_AUTH_URL}?{urlencode(params)}"
 
 
@@ -1075,6 +1081,11 @@ def exchange_codex_token(session: BrowserSession, code: str, code_verifier: str)
     }
     base = session._get_common_headers()
     base.update(headers)
+    base.update({
+        "Origin": "https://auth.openai.com",
+        "Referer": "https://platform.openai.com/",
+        "auth0-client": str(getattr(_cfg, "CODEX_AUTH0_CLIENT", "") or ""),
+    })
     headers = base
 
     logger.info("[Codex] 用 authorization code 换 token...")
@@ -1132,6 +1143,7 @@ def build_codex_storage(token_resp: dict, id_claims: dict) -> dict:
         "id_token": token_resp.get("id_token", ""),
         "access_token": token_resp.get("access_token", ""),
         "refresh_token": token_resp.get("refresh_token", ""),
+        "oauth_client_id": _cfg.CODEX_CLIENT_ID,
         "account_id": id_claims.get("account_id", ""),
         "last_refresh": last_refresh_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "email": id_claims.get("email", ""),
@@ -1147,11 +1159,43 @@ def _timedelta_seconds(seconds: int):
 
 def _credential_file_name(email: str, plan_type: str) -> str:
     """对照 CLIProxyAPI filename.go：无 plan→codex-{email}.json，否则带 plan 后缀。"""
-    email = (email or "").strip()
+    email = (email or "").strip().replace("/", "_").replace("\\", "_")
     plan = (plan_type or "").strip().lower()
     if plan == "":
         return f"codex-{email}.json"
     return f"codex-{email}-{plan}.json"
+
+
+def _normalize_codex_credential(storage: dict, email: str = "", plan_type: str = "") -> dict:
+    """统一 CPA/Codex 字段别名，确保后续 refresh 所需字段完整。"""
+    raw = dict(storage) if isinstance(storage, dict) else {}
+    access_token = str(raw.get("access_token") or raw.get("accessToken") or "").strip()
+    refresh_token = str(raw.get("refresh_token") or raw.get("refreshToken") or "").strip()
+    id_token = str(raw.get("id_token") or raw.get("idToken") or "").strip()
+    client_id = str(raw.get("oauth_client_id") or raw.get("client_id") or _cfg.CODEX_CLIENT_ID).strip()
+    effective_email = str(raw.get("email") or email or "").strip()
+    account_id = str(raw.get("account_id") or raw.get("chatgpt_account_id") or "").strip()
+    expired = str(raw.get("expired") or raw.get("expires_at") or "").strip()
+    if not expired and raw.get("expires_in"):
+        try:
+            expired = (datetime.now(timezone.utc) + _timedelta_seconds(int(raw["expires_in"]))).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError):
+            expired = ""
+    normalized = dict(raw)
+    normalized.update({
+        "type": "codex",
+        "email": effective_email,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "oauth_client_id": client_id,
+        "account_id": account_id,
+        "last_refresh": str(raw.get("last_refresh") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        "expired": expired,
+    })
+    if plan_type and not normalized.get("plan_type"):
+        normalized["plan_type"] = plan_type
+    return normalized
 
 
 def save_codex_credential(storage: dict, email: str, plan_type: str) -> Path:
@@ -1160,10 +1204,10 @@ def save_codex_credential(storage: dict, email: str, plan_type: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     fname = _credential_file_name(email, plan_type)
     path = out_dir / fname
-    path.write_text(
-        json.dumps(storage, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    normalized = _normalize_codex_credential(storage, email=email, plan_type=plan_type)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
     return path
 
 
@@ -1293,6 +1337,7 @@ def run_codex_oauth(
     email: str,
     otp_provider=None,
     proxy: str | None = None,
+    proxy_selection: dict | None = None,
     force: bool = False,
     _cpa_reauth_round: int = 1,
 ) -> dict:
@@ -1334,27 +1379,14 @@ def run_codex_oauth(
             from core.skyvern_codex_oauth import run_skyvern_codex_oauth
             return run_skyvern_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)
         if oauth_driver in ("cloak", "cloakbrowser"):
-            from config import cloakbrowser as _cloak_cfg
-            from core.cloakbrowser_driver import build_cloak_driver
-            from core.roxy_codex_oauth import run_roxy_codex_oauth
-            driver, opened = build_cloak_driver(proxy=proxy)
-            try:
-                return run_roxy_codex_oauth(
-                    email,
-                    otp_provider=otp_provider,
-                    proxy=proxy,
-                    force=True,
-                    existing_driver=driver,
-                    existing_opened=opened,
-                    reuse_existing_profile=True,
-                    clear_existing_state=True,
-                )
-            finally:
-                if not bool(getattr(_cloak_cfg, "CLOAK_KEEP_BROWSER_OPEN", False)):
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
+            from core.roxy_codex_oauth import run_cloak_codex_oauth
+            return run_cloak_codex_oauth(
+                email,
+                otp_provider=otp_provider,
+                proxy=proxy,
+                proxy_selection=proxy_selection,
+                force=True,
+            )
         if oauth_driver not in ("protocol", "api", "http"):
             raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={oauth_driver!r}，可选 protocol / roxy / cloak / browser_use / skyvern")
     except ImportError:

@@ -456,13 +456,20 @@ def _detect_openai_route_geo(proxy_url: str | None = None) -> dict:
         country = str(fields.get("loc") or "").upper()
         colo = str(fields.get("colo") or "").upper()
         timezone = "America/Los_Angeles" if country == "US" else ""
-        return {
+        result = {
             "ip": fields.get("ip") or "",
             "country": country,
             "city": colo,
             "timezone": timezone,
             "source": "openai_cloudflare_trace",
         } if country else {}
+        if result:
+            logger.info(
+                "[Cloak] OpenAI 路由出口地理信息：ip=%s country=%s colo=%s timezone=%s",
+                result.get("ip") or "?", result.get("country") or "?",
+                result.get("city") or "?", result.get("timezone") or "?",
+            )
+        return result
     except Exception as exc:
         logger.debug("[Cloak] OpenAI 路由出口检测失败：%s: %s", type(exc).__name__, exc)
         return {}
@@ -479,10 +486,29 @@ def _assert_mihomo_us_exit(selection: dict | None, geo: dict | None) -> None:
         raise RuntimeError(f"OpenAI 注册出口非美国（country={country}）；已阻止继续注册")
 
 
+def _assert_registration_exit_country(selection: dict | None, geo: dict | None) -> None:
+    """执行 Resin/Mihomo 共享的出口国家策略；未知出口一律阻止注册。"""
+    data = selection if isinstance(selection, dict) else {}
+    allowed = {str(value).strip().upper() for value in (data.get("allowed_countries") or []) if str(value).strip()}
+    excluded = {str(value).strip().upper() for value in (data.get("excluded_countries") or []) if str(value).strip()}
+    if not allowed and not excluded:
+        return
+    country = str((geo or {}).get("country") or data.get("exit_country") or "").strip().upper()
+    if not country:
+        raise RuntimeError("无法确认注册出口国家；已阻止继续注册")
+    common_countries = {"US", "JP", "TW", "SG", "KR"}
+    allowed_other = "OTHER" in allowed and country not in common_countries
+    if allowed and country not in (allowed - {"OTHER"}) and not allowed_other:
+        raise RuntimeError(f"注册出口国家 {country} 不在允许地区内；已阻止继续注册")
+    if country in excluded:
+        raise RuntimeError(f"注册出口国家 {country} 属于排除地区；已阻止继续注册")
+
+
 def _build_cloak_locale_options(
     proxy_url: str | None = None,
     *,
     transparent_route: bool = False,
+    proxy_selection: dict | None = None,
 ) -> dict:
     """生成 Cloak/Playwright 双层语言时区配置。"""
     explicit_locale = str(getattr(_cfg, "CLOAK_LOCALE", "") or "").strip()
@@ -500,11 +526,22 @@ def _build_cloak_locale_options(
         return out
     try:
         from config.browser import build_browser_environment
-        geo = (
+        detected_geo = (
             _detect_openai_route_geo(proxy_url)
             if transparent_route
             else _detect_cloak_exit_geo(proxy_url)
         )
+        selection = proxy_selection if isinstance(proxy_selection, dict) else {}
+        fallback_geo = {}
+        for source in (selection.get("exit_geo"), selection.get("preflight")):
+            if isinstance(source, dict):
+                for key in ("ip", "country", "city", "region", "timezone", "org"):
+                    if source.get(key) and not fallback_geo.get(key):
+                        fallback_geo[key] = source.get(key)
+        if selection.get("exit_country") and not fallback_geo.get("country"):
+            fallback_geo["country"] = selection.get("exit_country")
+        geo = dict(fallback_geo)
+        geo.update({k: v for k, v in (detected_geo or {}).items() if v})
         profile = build_browser_environment(geo)
         out.setdefault("locale", str(profile.get("navigator_language") or ""))
         out.setdefault("timezone", str(profile.get("timezone_iana") or ""))
@@ -516,28 +553,33 @@ def _build_cloak_locale_options(
 
 
 def _allows_transparent_mihomo_route(selection: dict | None) -> bool:
-    """仅允许已完成 Mihomo 美国节点选择的透明路由省略显式代理 URL。"""
+    """允许已完成 Mihomo 节点选择的透明路由省略显式代理 URL。"""
     data = selection if isinstance(selection, dict) else {}
-    return bool(data.get("transparent")) and data.get("mode") == "mihomo_us"
+    return bool(data.get("transparent")) and data.get("mode") in {"mihomo_us", "mihomo_excluded"}
 
 
-def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
+def build_cloak_driver(
+    proxy: str | None = None,
+    proxy_selection: dict | None = None,
+) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
     """启动 CloakBrowser 并返回 Selenium 风格 driver。
 
-    proxy=None  时按 config.proxy.PROXY_POOL 随机抽取；
-    proxy=""    时显式禁用代理；
+    proxy=None 且没有 proxy_selection 时选择一次代理；
+    proxy_selection 由上游传入时沿用同一次节点选择，禁止二次轮换；
     proxy="..." 时使用指定代理。
     """
     from config import proxy as _proxy_cfg
-    proxy_selection: dict = {}
+    proxy_selection = dict(proxy_selection) if isinstance(proxy_selection, dict) else {}
     if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
         required = bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
-        if proxy is None or not required:
-            # Resin 关闭时忽略任意显式代理，强制走 Mihomo `chatgpt us` 美国组。
+        if proxy_selection:
+            proxy = str(proxy_selection.get("proxy_url") or proxy or "")
+        elif proxy is None or not required:
             proxy_selection = _proxy_cfg.pick_registration_proxy()
             proxy = str(proxy_selection.get("proxy_url") or "")
         elif not str(proxy or "").strip():
-            raise RuntimeError("注册代理为空；已阻止直连")
+            if required:
+                raise RuntimeError("注册代理为空；已阻止直连")
     if bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False)):
         if not bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
             raise RuntimeError("Resin 注册代理门禁已开启，但 CloakBrowser 代理开关未开启")
@@ -563,15 +605,20 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     locale_opts = _build_cloak_locale_options(
         proxy_url,
         transparent_route=transparent_route,
+        proxy_selection=proxy_selection,
     )
     exit_geo = locale_opts.get("geo") if isinstance(locale_opts.get("geo"), dict) else {}
+    _assert_registration_exit_country(proxy_selection, exit_geo)
     _assert_mihomo_us_exit(proxy_selection, exit_geo)
     if proxy_selection:
         proxy_selection["exit_ip"] = str(exit_geo.get("ip") or "")
+        proxy_selection["exit_country"] = str(exit_geo.get("country") or "")
+        proxy_selection["exit_geo"] = dict(exit_geo)
         logger.info(
-            "[Cloak] 注册代理已锁定：mode=%s group=%s node=%s exit_ip=%s selection_ms=%s",
+            "[Cloak] 注册代理已锁定：mode=%s group=%s node=%s exit_ip=%s country=%s selection_ms=%s",
             proxy_selection.get("mode"), proxy_selection.get("group") or "-",
             proxy_selection.get("node_name") or "-", proxy_selection.get("exit_ip") or "?",
+            proxy_selection.get("exit_country") or "?",
             proxy_selection.get("selection_ms") or 0,
         )
     # geoip=True 交给 CloakBrowser 根据当前出口 IP 自动匹配 timezone/locale/WebRTC。

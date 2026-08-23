@@ -17,6 +17,7 @@ from core.session import BrowserSession
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
+IMAGE_INIT_PATH = "/backend-api/conversation/init"
 
 
 def now_iso() -> str:
@@ -91,6 +92,78 @@ def resolve_plan_check_route(explicit_proxy: Optional[str] = None) -> dict:
         }
 
     from config import proxy as proxy_cfg
+
+    registration_source = str(getattr(proxy_cfg, "REGISTRATION_PROXY_SOURCE", "") or "").strip().lower()
+    registration_required = bool(getattr(proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
+
+    # Resin 与注册必须共用同一套出口预检。否则套餐查询会绕过 Resin 的
+    # 合格代理筛选，先把请求发到失效节点，直到 HTTP 失败后才知道要换路由。
+    if registration_required or registration_source == "resin":
+        from core.registration_preflight import preflight_proxy
+
+        selection = dict(proxy_cfg.pick_registration_proxy() or {})
+        selected = str(selection.get("proxy_url") or "").strip()
+        transparent = bool(selection.get("transparent"))
+        if not selected and not transparent:
+            raise ValueError("Resin 套餐查询未取得代理出口，已阻止直连")
+        preflight = selection.get("preflight") if isinstance(selection.get("preflight"), dict) else None
+        if not preflight or not preflight.get("ok"):
+            preflight = preflight_proxy(
+                selected,
+                require_country="",
+                allowed_countries=selection.get("allowed_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []),
+                excluded_countries=selection.get("excluded_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", ["HK"]),
+                allow_transparent=transparent,
+                route_identity=str(selection.get("node_name") or selected),
+                force=True,
+            )
+        if not preflight.get("ok"):
+            raise ValueError(f"Resin 套餐查询出口预检失败: {preflight.get('reason') or 'unknown'}")
+        return {
+            "proxy": selected,
+            "proxy_mode": "resin",
+            "network_route": "transparent" if transparent else "proxy",
+            "proxy_used": _mask_proxy(selected) or ("router-policy" if transparent else None),
+            "proxy_fallback_reason": None,
+            "proxy_group": selection.get("group") or "",
+            "proxy_node": selection.get("node_name") or "",
+            "selection_ms": selection.get("selection_ms") or 0,
+            "proxy_selection": selection,
+        }
+
+    if (
+        not registration_required
+        and registration_source == "mihomo"
+    ):
+        from core.registration_preflight import preflight_proxy
+
+        selection = dict(proxy_cfg.pick_registration_proxy() or {})
+        selected = str(selection.get("proxy_url") or "").strip()
+        transparent = bool(selection.get("transparent"))
+        if not selected and not transparent:
+            raise ValueError("Mihomo 套餐查询未取得代理出口，已阻止直连")
+        preflight = preflight_proxy(
+            selected,
+            require_country="",
+            allowed_countries=selection.get("allowed_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []),
+            excluded_countries=selection.get("excluded_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", ["HK"]),
+            allow_transparent=transparent,
+            route_identity=str(selection.get("node_name") or selected),
+            force=True,
+        )
+        if not preflight.get("ok"):
+            raise ValueError(f"Mihomo 套餐查询出口预检失败: {preflight.get('reason') or 'unknown'}")
+        return {
+            "proxy": selected,
+            "proxy_mode": "mihomo_transparent" if transparent else "mihomo",
+            "network_route": "transparent" if transparent else "proxy",
+            "proxy_used": _mask_proxy(selected) or ("router-policy" if transparent else None),
+            "proxy_fallback_reason": None,
+            "proxy_group": selection.get("group") or "",
+            "proxy_node": selection.get("node_name") or "",
+            "selection_ms": selection.get("selection_ms") or 0,
+            "proxy_selection": selection,
+        }
 
     mode = str(getattr(proxy_cfg, "PLAN_CHECK_PROXY_MODE", "auto") or "auto").strip().lower()
     if mode not in {"auto", "proxy", "direct"}:
@@ -187,6 +260,49 @@ def _common_headers(env: BrowserSession, token: str) -> dict[str, str]:
         "x-openai-target-route": ACCOUNTS_CHECK_PATH,
     })
     return headers
+
+
+def _probe_image_quota(env: BrowserSession, token: str, timeout: float) -> dict[str, Any]:
+    """复用套餐查询会话读取 image_gen 额度；失败只标记未知，不阻塞查活。"""
+    from core.image_quota import extract_image_quota
+
+    headers = _common_headers(env, token)
+    headers.update({
+        "content-type": "application/json",
+        "x-openai-target-path": IMAGE_INIT_PATH,
+        "x-openai-target-route": IMAGE_INIT_PATH,
+    })
+    try:
+        response = env.session.post(
+            f"https://chatgpt.com{IMAGE_INIT_PATH}",
+            headers=headers,
+            json={
+                "gizmo_id": None,
+                "requested_default_model": None,
+                "conversation_id": None,
+                "timezone_offset_min": -480,
+            },
+            timeout=max(0.1, float(timeout)),
+        )
+        if int(response.status_code) != 200:
+            return {
+                "image_quota": None,
+                "image_quota_reset_at": None,
+                "image_quota_unknown": True,
+                "image_quota_error": f"HTTP {int(response.status_code)}",
+            }
+        result = extract_image_quota(response.json())
+        result["image_quota_checked_at"] = now_iso()
+        result["image_quota_error"] = None
+        return result
+    except Exception as exc:
+        return {
+            "image_quota": None,
+            "image_quota_reset_at": None,
+            "image_quota_unknown": True,
+            "image_quota_checked_at": now_iso(),
+            "image_quota_error": type(exc).__name__,
+        }
 
 
 def parse_accounts_check(data: dict, *, token: str = "") -> dict:
@@ -293,7 +409,7 @@ def _plan_check_settings(
 def _retryable_plan_error(http_status: int | None) -> bool:
     if http_status is None:
         return True
-    return http_status in {408, 409, 425, 429} or http_status >= 500
+    return http_status in {403, 408, 409, 425, 429} or http_status >= 500
 
 
 def _retry_wait_seconds(resp: Any, base_delay: float, attempt: int) -> float:
@@ -361,10 +477,11 @@ def check_account_plan(
                 route = resolve_plan_check_route(None)
                 route_meta = {k: v for k, v in route.items() if k != "proxy"}
                 logger.info(
-                    "套餐查询重试已轮换 Resin 身份，第 %s/%s 次，route=%s",
+                    "套餐查询重试已轮换代理身份，第 %s/%s 次，route=%s node=%s",
                     attempt,
                     attempts,
                     route_meta.get("network_route") or "unknown",
+                    route_meta.get("proxy_node") or "-",
                 )
             except Exception as exc:
                 return {
@@ -423,6 +540,7 @@ def check_account_plan(
                     parsed["attempt_count"] = attempt
                     parsed["max_attempts"] = attempts
                     parsed["request_timeout"] = timeout_seconds
+                    parsed.update(_probe_image_quota(env, token, timeout_seconds))
                     parsed["retryable"] = False
                     parsed.update(route_meta)
                     return parsed

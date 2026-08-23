@@ -41,21 +41,51 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
 
 
 def _resolve_live_check_route(proxy: str | None) -> dict:
-    """查活跟随注册出口策略；Resin 关闭时只允许 Mihomo 美国组。"""
+    """查活跟随注册出口策略；Resin 关闭时使用通用 Mihomo 筛选。"""
     from config import proxy as proxy_cfg
 
     if not bool(getattr(proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False)):
         selection = proxy_cfg.pick_registration_proxy()
         selected = str(selection.get("proxy_url") or "")
         transparent = bool(selection.get("transparent"))
+        from core.registration_preflight import preflight_proxy
+
+        preflight = preflight_proxy(
+            selected,
+            require_country="",
+            allowed_countries=selection.get("allowed_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []),
+            excluded_countries=selection.get("excluded_countries") or getattr(proxy_cfg, "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", ["HK"]),
+            allow_transparent=transparent,
+            route_identity=str(selection.get("node_name") or selected),
+            force=True,
+        )
+        if not preflight.get("ok"):
+            raise RuntimeError(f"查活代理预检失败: {preflight.get('reason') or 'unknown'}")
+        selection = dict(selection)
+        selection.update({
+            "preflight": dict(preflight),
+            "exit_country": str(preflight.get("country") or ""),
+            "exit_ip": str(preflight.get("ip") or ""),
+            "exit_geo": {
+                key: preflight.get(key)
+                for key in ("ip", "country", "colo")
+                if preflight.get(key)
+            },
+        })
         return {
             "proxy": selected,
-            "proxy_mode": "mihomo_us_transparent" if transparent else "mihomo_us",
+            "proxy_mode": (
+                "mihomo_excluded_transparent" if transparent and selection.get("mode") == "mihomo_excluded"
+                else "mihomo_us_transparent" if transparent
+                else "mihomo_excluded" if selection.get("mode") == "mihomo_excluded"
+                else "mihomo_us"
+            ),
             "network_route": "transparent" if transparent else "proxy",
             "proxy_used": selected or ("router-policy" if transparent else ""),
             "proxy_fallback_reason": None,
             "proxy_group": selection.get("group"),
             "proxy_node": selection.get("node_name"),
+            "proxy_selection": selection,
         }
     return resolve_plan_check_route(explicit_proxy=proxy)
 
@@ -82,6 +112,7 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
             proxy=selected_proxy,
             clear_log=False,
             rotate_transparent_route=route.get("network_route") == "transparent",
+            proxy_selection=route.get("proxy_selection"),
         )
         db.update_account_liveness(account_id, result)
         if result.get("ok"):

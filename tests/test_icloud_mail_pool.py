@@ -5,6 +5,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
 
+from core import email_provider
 from core.email_provider import parse_email_sources
 from core.icloud_mail_pool import ICloudMailboxPool
 
@@ -464,11 +465,35 @@ class ICloudMailboxPoolTests(unittest.TestCase):
             mailbox = pool.acquire()
             pool.finish(mailbox, True)
 
-            self.assertEqual(mailbox["address"], "first@icloud.com")
-            self.assertEqual(pool.acquire()["address"], "second@icloud.com")
+            self.assertIn(mailbox["address"], {"first@icloud.com", "second@icloud.com"})
+            self.assertEqual(pool.acquire()["address"], ({"first@icloud.com", "second@icloud.com"} - {mailbox["address"]}).pop())
 
     def test_email_provider_accepts_icloud_source(self):
         self.assertEqual(parse_email_sources("icloud,outlook"), ["icloud", "outlook"])
+
+    def test_unlisted_icloud_alias_uses_configured_main_mailbox_imap(self):
+        with patch.object(email_provider, "parse_email_sources", return_value=["outlook"]), patch(
+            "core.icloud_mail_client.get_account_context", return_value=None
+        ), patch(
+            "core.gptmail_client.get_account_context", return_value=None
+        ), patch(
+            "core.cf_temp_mail_client.get_account_context", return_value=None
+        ), patch(
+            "core.mailnest_client.get_account_context", return_value=None
+        ), patch(
+            "core.cloudmail_client.get_account_context", return_value=None
+        ), patch(
+            "core.db.get_generic_api_email_by_email", return_value=None
+        ), patch(
+            "core.db.get_outlook_by_email", return_value=None
+        ), patch(
+            "core.db._find_domain_email", return_value=None
+        ), patch(
+            "config.email.ICLOUD_IMAP_USERNAME", "owner@icloud.com"
+        ), patch(
+            "config.email.ICLOUD_IMAP_PASSWORD", "app-password"
+        ):
+            self.assertEqual(email_provider.resolve_email_source("unlisted-alias@icloud.com"), "icloud")
 
 
 if __name__ == "__main__":

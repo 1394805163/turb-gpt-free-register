@@ -204,7 +204,12 @@ def run_registration(
         from config import proxy as _proxy_cfg
         from core.cloakbrowser_registration import is_proxy_rejection_error, run_cloak_registration
 
-        pool_size = len(_proxy_cfg.get_proxy_pool())
+        configured_source = str(getattr(_proxy_cfg, "REGISTRATION_PROXY_SOURCE", "") or "").strip().lower()
+        use_mihomo_source = configured_source == "mihomo" or (
+            not configured_source
+            and not bool(getattr(_proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False))
+        )
+        pool_size = len(_proxy_cfg.get_proxy_pool()) if not use_mihomo_source else 1
         # 可恢复失败继续轮换；配置为 0 或负数表示最多无重复走完当前代理池。
         configured_attempts = int(getattr(_cloak_cfg, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0) or 0)
         max_attempts = pool_size if configured_attempts <= 0 else min(configured_attempts, pool_size or 1)
@@ -220,20 +225,42 @@ def run_registration(
                 check_stop_requested()
             except ImportError:
                 pass
-            selected_proxy = _proxy_cfg.acquire_registration_proxy(
-                excluded=attempted_proxies,
-                preferred=proxy if attempt == 1 else None,
-            )
-            if not selected_proxy:
+            proxy_selection = {}
+            if use_mihomo_source:
+                try:
+                    proxy_selection = _proxy_cfg.pick_registration_proxy()
+                except Exception as exc:
+                    last_result = {"success": False, "email": email, "error": f"Mihomo 代理选择失败: {type(exc).__name__}"}
+                    break
+                selected_proxy = str(proxy_selection.get("proxy_url") or "")
+                proxy_identity = str(proxy_selection.get("node_name") or selected_proxy or f"mihomo-{attempt + 1}")
+            else:
+                selected_proxy = _proxy_cfg.acquire_registration_proxy(
+                    excluded=attempted_proxies,
+                    preferred=proxy if attempt == 1 else None,
+                )
+                proxy_identity = selected_proxy
+            if not selected_proxy and not bool(proxy_selection.get("transparent")):
                 last_result = {"success": False, "email": email, "error": "当前无可分配的新代理身份"}
                 break
-            attempted_proxies.add(selected_proxy)
+            attempted_proxies.add(proxy_identity)
             try:
-                # Exit country is recorded for routing quality analysis, not
-                # used as a registration gate.  A route must still pass the
-                # connectivity and duplicate-egress checks below.
-                preflight = preflight_proxy(selected_proxy, require_country="", force=True)
+                # Resin/Mihomo 都先执行 OpenAI 同域出口预检；国家策略不通过时
+                # 当前尝试直接结束，禁止回落到 VPS 直连。
                 next_attempt = attempt + 1
+                if use_mihomo_source:
+                    # Mihomo 没有可供 acquire_registration_proxy 消耗的静态地址池，
+                    # 每次节点选择都视为一次独立尝试，避免预检失败后无限循环。
+                    attempt = next_attempt
+                preflight = preflight_proxy(
+                    selected_proxy,
+                    require_country="",
+                    allowed_countries=getattr(_proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []),
+                    excluded_countries=getattr(_proxy_cfg, "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", ["HK"]),
+                    allow_transparent=bool(proxy_selection.get("transparent")),
+                    route_identity=proxy_identity,
+                    force=True,
+                )
                 logger.info(
                     "[Cloak注册][预检] attempt=%s/%s ok=%s country=%s latency_ms=%s reason=%s",
                     next_attempt, max_attempts, preflight.get("ok"), preflight.get("country") or "?",
@@ -242,6 +269,17 @@ def run_registration(
                 if not preflight.get("ok"):
                     last_result = {"success": False, "email": email, "error": f"代理预检失败: {preflight.get('reason') or 'unknown'}"}
                     continue
+                proxy_selection = dict(proxy_selection or {})
+                proxy_selection.update({
+                    "preflight": dict(preflight),
+                    "exit_country": str(preflight.get("country") or ""),
+                    "exit_ip": str(preflight.get("ip") or ""),
+                    "exit_geo": {
+                        key: preflight.get(key)
+                        for key in ("ip", "country", "colo")
+                        if preflight.get(key)
+                    },
+                })
                 exit_ip = str(preflight.get("ip") or "").strip().lower()
                 if exit_ip and exit_ip in attempted_exit_ips:
                     exit_fingerprint = __import__("hashlib").sha256(exit_ip.encode()).hexdigest()[:10]
@@ -263,6 +301,13 @@ def run_registration(
                     otp_code=otp_code,
                     batch_dir=batch_dir,
                     defer_email_release=True,
+                    proxy_selection=proxy_selection or {
+                        "mode": "resin",
+                        "proxy_url": selected_proxy,
+                        "allowed_countries": getattr(_proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []),
+                        "excluded_countries": getattr(_proxy_cfg, "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", ["HK"]),
+                        "exit_country": preflight.get("country") or "",
+                    },
                 )
                 # 看门狗/用户停止可能在浏览器 RPC 内触发；不要再进入下一代理尝试。
                 try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 import traceback
@@ -102,7 +103,17 @@ _PROXY_REJECTION_MARKERS = (
 def is_proxy_rejection_error(error: object) -> bool:
     """识别应立即更换代理的 ChatGPT/Cloudflare 页面拒绝。"""
     text = str(error or "").lower()
-    return any(marker in text for marker in _PROXY_REJECTION_MARKERS)
+    if any(marker in text for marker in _PROXY_REJECTION_MARKERS):
+        return True
+    # OAuth/代理客户端经常只把 HTTP 状态和拦截原因写入异常，未带页面标题。
+    # 仅对 403/407/429/5xx 与代理、挑战或拒绝语义组合判定，避免把账号业务错误
+    # （例如 account_deactivated）误交给代理轮换。
+    status_hit = re.search(r"(?<!\d)(?:403|407|429|5\d\d)(?!\d)", text)
+    proxy_context = (
+        "proxy", "forbidden", "access denied", "challenge", "cf-ray",
+        "intercept", "blocked", "拦截", "代理", "风控",
+    )
+    return bool(status_hit and any(marker in text for marker in proxy_context))
 
 
 def _assert_login_gate_not_blocked(driver) -> None:
@@ -141,6 +152,7 @@ def run_cloak_registration(
     batch_dir: Path | None = None,
     *,
     defer_email_release: bool = False,
+    proxy_selection: dict | None = None,
 ) -> dict:
     """CloakBrowser 自动化注册入口。"""
     driver = None
@@ -148,7 +160,7 @@ def run_cloak_registration(
     create_acknowledged = False
     openai_password: str | None = None
     try:
-        driver, opened = build_cloak_driver(proxy=proxy)
+        driver, opened = build_cloak_driver(proxy=proxy, proxy_selection=proxy_selection)
         logger.info("[Cloak注册] 开始：%s，profile=%s", redact_email(email), opened.profile_id)
 
         otp_after_ts = time.time()

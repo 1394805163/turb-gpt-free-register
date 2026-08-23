@@ -93,6 +93,32 @@ class Chatgpt2ApiPushTests(unittest.TestCase):
         self.assertNotIn("secret-access-token", stored["push_token_fingerprint"])
 
     @patch("core.chatgpt2api_push.requests.post")
+    def test_push_retains_oauth_persistence_fields_after_liveness(self, post):
+        post.return_value = self._response()
+        db.update_account_chatgpt_oauth("live@example.com", {
+            "access_token": "oauth-access-token",
+            "refresh_token": "oauth-refresh-token",
+            "id_token": "oauth-id-token",
+            "account_id": "account-1",
+            "oauth_client_id": "app_2SKx67EdpoN0G6j64rFvigXD",
+        })
+        account = db.get_account(self.account_id)
+        db.update_account_liveness(self.account_id, {
+            "ok": True,
+            "status": "live",
+            "method": "token",
+            "access_token": account["access_token"],
+        })
+
+        result = push_account(self.account_id, sleep_fn=lambda _seconds: None)
+
+        self.assertTrue(result["ok"])
+        sent = post.call_args.kwargs["json"]["accounts"][0]
+        self.assertEqual(sent["refresh_token"], "oauth-refresh-token")
+        self.assertEqual(sent["id_token"], "oauth-id-token")
+        self.assertEqual(sent["oauth_client_id"], "app_2SKx67EdpoN0G6j64rFvigXD")
+
+    @patch("core.chatgpt2api_push.requests.post")
     def test_retries_transient_errors_with_exponential_backoff_without_logging_token(self, post):
         post.side_effect = [
             self._response(503),

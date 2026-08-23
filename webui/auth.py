@@ -105,7 +105,7 @@ def register_auth_routes(app: Any) -> None:
     @app.before_request
     def _require_auth_code():
         endpoint = request.endpoint or ""
-        if endpoint in {"auth_login", "auth_logout", "static"}:
+        if endpoint in {"auth_login", "auth_login_slash", "auth_logout", "static"}:
             return None
         if request.path in ("/favicon.ico",):
             return Response(status=204)
@@ -128,6 +128,11 @@ def register_auth_routes(app: Any) -> None:
                 return redirect(next_url)
             error = "授权码错误"
         return render_template("login.html", error=error, next_url=next_url, login_url=url_for("auth_login"))
+
+    @app.route("/login/", methods=["GET", "POST"], endpoint="auth_login_slash")
+    def _auth_login_slash():
+        """兼容历史入口 /login/，直接复用无尾斜杠登录页。"""
+        return _auth_login()
 
     @app.post("/logout", endpoint="auth_logout")
     def _auth_logout():

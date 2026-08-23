@@ -144,9 +144,10 @@ def _random_roxy_profile_name() -> str:
 
 
 class RoxyBrowserClient:
-    def __init__(self, api_base: str | None = None, token: str | None = None):
+    def __init__(self, api_base: str | None = None, token: str | None = None, proxy: str | None = None):
         self.api_base = (api_base or _cfg.ROXY_API_BASE).strip()
         self.token = (token if token is not None else _cfg.ROXY_API_TOKEN).strip()
+        self.proxy = str(proxy or "").strip()
         self.http = requests.Session()
         if self.token:
             # 官方文档要求所有接口请求头必须加 token。这里同时兼容 token / Authorization。
@@ -401,7 +402,17 @@ class RoxyBrowserClient:
         project_id = _project_id_value()
         if project_id:
             body.setdefault("projectId", project_id)
-        if bool(getattr(_cfg, "ROXY_CREATE_USE_PROXY_POOL", False)) and not body.get("proxyInfo"):
+        proxy_url = self.proxy
+        if proxy_url and not body.get("proxyInfo"):
+            proxy_info = _proxy_url_to_roxy_info(proxy_url)
+            body["proxyInfo"] = proxy_info
+            logger.info(
+                "[Roxy] 创建 OAuth 环境使用显式代理：type=%s host=%s port=%s",
+                proxy_info.get("protocol") or proxy_info.get("proxyCategory"),
+                proxy_info.get("host"),
+                proxy_info.get("port"),
+            )
+        elif bool(getattr(_cfg, "ROXY_CREATE_USE_PROXY_POOL", False)) and not body.get("proxyInfo"):
             from config import proxy as _proxy_cfg
 
             proxy_url = _proxy_cfg.pick_proxy()

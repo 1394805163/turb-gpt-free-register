@@ -10,6 +10,7 @@
     - socks5h://           SOCKS5（DNS 在代理端解析，推荐，避免 DNS-IP 错配）
 """
 from config.env_loader import apply_env_overrides
+import base64
 import logging
 import random
 import re
@@ -90,18 +91,34 @@ PROXY_POOL_FILE: str = "../data/register-proxies.txt"
 # 避免 CloakBrowser 悄悄回退到 VPS 直连出口。
 REGISTRATION_PROXY_REQUIRED = False
 
+# 公共注册出口来源：resin / mihomo。留空时兼容旧配置。
+REGISTRATION_PROXY_SOURCE = ""
+
 # 只用于 WebUI 显示和跳转管理面板，不作为浏览器 forward proxy 地址。
 RESIN_MANAGEMENT_URL = ""
 
-# Resin 门禁关闭后的唯一注册回退：通过 Mihomo Controller 切换 `chatgpt us`
-# 组中的美国节点，再把浏览器指向本地 Mihomo 代理端口。该路径不允许直连兜底。
+# Resin 门禁关闭后的注册回退：通过 Mihomo Controller 切换指定代理组
+# 中的合格节点，再把浏览器指向本地 Mihomo 代理端口。该路径不允许直连兜底。
 MIHOMO_US_FALLBACK_ENABLED = True
 MIHOMO_CONTROLLER_URL = "http://127.0.0.1:9090"
 MIHOMO_CONTROLLER_SECRET = ""
+MIHOMO_CONTROLLER_USERNAME = ""
+MIHOMO_CONTROLLER_PASSWORD = ""
 MIHOMO_US_GROUP = "chatgpt us"
+MIHOMO_REGISTRATION_GROUP = ""
 MIHOMO_PROXY_URL = "socks5h://127.0.0.1:7897"
 MIHOMO_TRANSPARENT_ROUTING = False
 MIHOMO_CONTROLLER_TIMEOUT = 5.0
+
+# exclude 模式默认允许全部地区，只排除香港；allowed 非空时才额外限定地区。
+MIHOMO_REGISTRATION_ROUTE = "exclude"
+MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES = ["HK"]
+MIHOMO_REGISTRATION_ALLOWED_COUNTRIES = []
+MIHOMO_REGISTRATION_EXCLUDED_MULTIPLIERS = ["0.2"]
+
+# 所有注册出口共同使用的国家策略；空列表表示除固定排除国家外均可用。
+REGISTRATION_PROXY_EXCLUDED_COUNTRIES = ["HK"]
+REGISTRATION_PROXY_ALLOWED_COUNTRIES = []
 
 # 套餐/Plus 试用资格查询与 Codex Agent Token 生成共用这组独立网络策略，
 # 避免批量请求被注册代理池中的临时本地代理拖垮，也避免无条件直连造成出口策略失控。
@@ -248,28 +265,188 @@ def is_us_node_name(node_name: str) -> bool:
     )
 
 
-def select_mihomo_us_proxy(
+_NODE_COUNTRY_MARKERS = {
+    "HK": ("🇭🇰", "香港", "HONG KONG"),
+    "JP": ("🇯🇵", "日本", "JAPAN"),
+    "TW": ("🇹🇼", "台湾", "TAIWAN"),
+    "SG": ("🇸🇬", "新加坡", "SINGAPORE"),
+    "US": ("🇺🇸", "美国", "UNITED STATES"),
+    "KR": ("🇰🇷", "韩国", "SOUTH KOREA", "KOREA"),
+    "CA": ("🇨🇦", "加拿大", "CANADA"),
+    "GB": ("🇬🇧", "英国", "UNITED KINGDOM"),
+    "DE": ("🇩🇪", "德国", "GERMANY"),
+}
+
+_REGISTRATION_COMMON_COUNTRIES = {"US", "JP", "SG", "KR", "TW"}
+
+# Mihomo 目标组的 `all` 同时包含叶子代理和动态代理组。组内当前节点会随
+# URLTest/自动选择漂移，不能把 Selector/URLTest 等类型提交回目标组。
+_MIHOMO_GROUP_TYPES = {
+    "SELECTOR",
+    "URLTEST",
+    "FALLBACK",
+    "LOADBALANCE",
+    "RELAY",
+    "COMPATIBLE",
+}
+_MIHOMO_GROUP_NAME_MARKERS = (
+    "节点",
+    "选择",
+    "其他地区",
+    "家宽",
+    "低倍率",
+    "全球直连",
+)
+
+
+def _normalize_country_codes(values: object) -> set[str]:
+    if isinstance(values, str):
+        values = re.split(r"[,;\n\s]+", values)
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return set()
+    return {
+        item.strip().upper()
+        for value in values
+        for item in re.split(r"[,;\n\s]+", str(value))
+        if item.strip()
+    }
+
+
+def node_matches_country(node_name: str, country_code: str) -> bool:
+    name = str(node_name or "").strip()
+    upper = name.upper()
+    code = str(country_code or "").strip().upper()
+    if not name or upper in {"DIRECT", "REJECT", "GLOBAL", "COMPATIBLE"}:
+        return False
+    for marker in _NODE_COUNTRY_MARKERS.get(code, ()):
+        if marker.isascii() and marker in upper:
+            return True
+        if not marker.isascii() and marker in name:
+            return True
+    return bool(re.search(rf"(?:^|[\s\-_|/]){re.escape(code)}(?:$|[\s\-_|/0-9])", upper))
+
+
+def node_matches_registration_region(
+    node_name: str,
+    region_code: str,
+    proxy_types: dict[str, str] | None = None,
+) -> bool:
+    """匹配注册 UI 的常用地区或 OTHER 冷门地区。"""
+    region = str(region_code or "").strip().upper()
+    if not _is_mihomo_leaf_node(node_name, proxy_types):
+        return False
+    if region == "OTHER":
+        if node_matches_country(node_name, "HK"):
+            return False
+        return not any(node_matches_country(node_name, code) for code in _REGISTRATION_COMMON_COUNTRIES)
+    return node_matches_country(node_name, region)
+
+
+def _mihomo_proxy_type_map(client, base: str, headers: dict[str, str], timeout: float) -> dict[str, str]:
+    """读取 Mihomo provider 元数据，建立代理名到协议/分组类型的索引。"""
+    try:
+        response = client.get(f"{base}/providers/proxies", headers=headers, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        # 兼容旧版控制器或只实现 /proxies/{group} 的测试桩；调用方会使用名称兜底。
+        return {}
+
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if not isinstance(providers, dict):
+        return {}
+    result: dict[str, str] = {}
+    for provider in providers.values():
+        items = provider.get("proxies") if isinstance(provider, dict) else None
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            proxy_type = str(item.get("type") or "").strip().upper()
+            if name and proxy_type:
+                result[name] = proxy_type
+    return result
+
+
+def _is_mihomo_leaf_node(node_name: str, proxy_types: dict[str, str] | None = None) -> bool:
+    """只允许真实单节点，拒绝动态分组和直连/拒绝保留项。"""
+    name = str(node_name or "").strip()
+    upper = name.upper()
+    if not name or upper in {"DIRECT", "REJECT", "GLOBAL", "COMPATIBLE"}:
+        return False
+    known_type = str((proxy_types or {}).get(name) or "").strip().upper()
+    if known_type:
+        return known_type not in _MIHOMO_GROUP_TYPES and known_type not in {"DIRECT", "REJECT"}
+    return not any(marker in name for marker in _MIHOMO_GROUP_NAME_MARKERS)
+
+
+def node_matches_multiplier(node_name: str, multiplier: object) -> bool:
+    name = str(node_name or "")
+    value = str(multiplier or "").strip().replace(",", ".")
+    if not name or not value:
+        return False
+    if value == "0.2" and any(marker in name for marker in ("低倍率", "低倍", "低速倍率")):
+        return True
+    return bool(re.search(
+        rf"(?<![0-9.]){re.escape(value)}(?:\s*[xX×倍]|(?=$|[\s\-_|/]))",
+        name,
+    ))
+
+
+def _normalize_multipliers(values: object) -> set[str]:
+    if isinstance(values, str):
+        values = re.split(r"[,;\n\s]+", values)
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return set()
+    return {str(value).strip().replace(",", ".") for value in values if str(value).strip()}
+
+
+def _mihomo_headers(secret: str, username: str = "", password: str = "") -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    user = str(username or "").strip()
+    if user:
+        raw = f"{user}:{str(password or '')}".encode("utf-8")
+        headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+    elif str(secret or "").strip():
+        headers["Authorization"] = f"Bearer {str(secret).strip()}"
+    return headers
+
+
+def select_mihomo_proxy(
     *,
     controller_url: str,
     secret: str,
     group: str,
     proxy_url: str,
+    excluded_countries: object = None,
+    allowed_countries: object = None,
+    excluded_multipliers: object = None,
     allow_transparent: bool = False,
+    mode: str = "mihomo_excluded",
+    username: str = "",
+    password: str = "",
     session=None,
 ) -> dict:
-    """从指定 Mihomo 组选择美国节点；缺失/失败时抛错，绝不返回直连。"""
+    """通用选择器：默认仅排除 HK/0.2，其他地区均可轮换。"""
     import requests
 
     base = str(controller_url or "").strip().rstrip("/")
     group_name = str(group or "").strip()
+    excluded = _normalize_country_codes(
+        MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES if excluded_countries is None else excluded_countries
+    ) | {"HK"}
+    allowed = _normalize_country_codes(allowed_countries)
+    multipliers = _normalize_multipliers(
+        MIHOMO_REGISTRATION_EXCLUDED_MULTIPLIERS if excluded_multipliers is None else excluded_multipliers
+    ) | {"0.2"}
     transparent = bool(allow_transparent)
     local_proxy = None if transparent else _normalize_proxy_line(proxy_url)
     if not base or not group_name or (not local_proxy and not transparent):
-        raise RuntimeError("Mihomo 美国代理配置不完整")
+        raise RuntimeError("Mihomo 代理配置不完整")
     client = session or requests
-    headers = {"Accept": "application/json"}
-    if str(secret or "").strip():
-        headers["Authorization"] = f"Bearer {str(secret).strip()}"
+    headers = _mihomo_headers(secret, username=username, password=password)
     timeout = max(0.2, float(globals().get("MIHOMO_CONTROLLER_TIMEOUT", 5.0) or 5.0))
     endpoint = f"{base}/proxies/{quote(group_name, safe='')}"
     started = time.monotonic()
@@ -277,9 +454,16 @@ def select_mihomo_us_proxy(
     response.raise_for_status()
     payload = response.json()
     names = payload.get("all") if isinstance(payload, dict) else []
-    candidates = [str(name) for name in (names or []) if is_us_node_name(str(name))]
+    proxy_types = _mihomo_proxy_type_map(client, base, headers, timeout)
+    candidates = [
+        str(name) for name in (names or [])
+        if _is_mihomo_leaf_node(str(name), proxy_types)
+        and (not allowed or any(node_matches_registration_region(str(name), code, proxy_types) for code in allowed))
+        and not any(node_matches_country(str(name), code) for code in excluded)
+        and not any(node_matches_multiplier(str(name), value) for value in multipliers)
+    ]
     if not candidates:
-        raise RuntimeError(f"Mihomo 组 {group_name!r} 中没有美国节点；已阻止直连")
+        raise RuntimeError(f"Mihomo 组 {group_name!r} 中没有符合筛选条件的节点；已阻止直连")
     current = str(payload.get("now") or "") if isinstance(payload, dict) else ""
     alternatives = [name for name in candidates if name != current]
     if alternatives:
@@ -293,36 +477,126 @@ def select_mihomo_us_proxy(
     )
     switched.raise_for_status()
     return {
-        "mode": "mihomo_us",
+        "mode": mode,
         "group": group_name,
         "node_name": node_name,
         "proxy_url": local_proxy or "",
         "transparent": transparent,
+        "excluded_countries": sorted(excluded),
+        "allowed_countries": sorted(allowed),
+        "excluded_multipliers": sorted(multipliers),
+        "node_type": proxy_types.get(node_name, ""),
         "selection_ms": round((time.monotonic() - started) * 1000),
     }
 
 
+def select_mihomo_us_proxy(
+    *,
+    controller_url: str,
+    secret: str,
+    group: str,
+    proxy_url: str,
+    allow_transparent: bool = False,
+    username: str = "",
+    password: str = "",
+    session=None,
+) -> dict:
+    """兼容入口：从指定 Mihomo 组选择美国节点。"""
+    return select_mihomo_proxy(
+        controller_url=controller_url,
+        secret=secret,
+        group=group,
+        proxy_url=proxy_url,
+        allowed_countries={"US"},
+        excluded_countries={"HK"},
+        excluded_multipliers={"0.2"},
+        allow_transparent=allow_transparent,
+        mode="mihomo_us",
+        username=username,
+        password=password,
+        session=session,
+    )
+
+
 def pick_registration_proxy() -> dict:
-    """选择注册代理；Resin 关闭时强制 Mihomo 美国组，任何失败都终止注册。"""
+    """选择注册代理；Resin 和 Mihomo 均不允许失败时回退直连。"""
+    source = str(REGISTRATION_PROXY_SOURCE or "").strip().lower()
+    explicit_source = source
     if bool(REGISTRATION_PROXY_REQUIRED):
-        selected = pick_proxy()
-        if not selected:
+        # 旧版开关仍是硬门禁：只要开启就必须走 Resin，避免历史 .env
+        # 与新版来源字段不一致时意外切到 Mihomo。
+        source = "resin"
+    elif source not in {"resin", "mihomo"}:
+        source = "resin" if bool(REGISTRATION_PROXY_REQUIRED) else "mihomo"
+
+    allowed = _normalize_country_codes(REGISTRATION_PROXY_ALLOWED_COUNTRIES)
+    excluded = _normalize_country_codes(REGISTRATION_PROXY_EXCLUDED_COUNTRIES) or {"HK"}
+
+    if source == "resin":
+        pool = get_proxy_pool()
+        if not pool:
             raise RuntimeError("Resin 注册代理池为空；已阻止直连")
-        return {"mode": "resin", "proxy_url": selected, "node_name": "", "selection_ms": 0}
-    if not bool(MIHOMO_US_FALLBACK_ENABLED):
+        from core.registration_preflight import preflight_proxy
+
+        attempted: set[str] = set()
+        for _ in range(max(1, len(pool))):
+            selected = pick_proxy()
+            if not selected or selected in attempted:
+                continue
+            attempted.add(selected)
+            result = preflight_proxy(
+                selected,
+                require_country="",
+                allowed_countries=allowed,
+                excluded_countries=excluded,
+            )
+            if result.get("ok"):
+                return {
+                    "mode": "resin",
+                    "proxy_url": selected,
+                    "node_name": "",
+                    "selection_ms": 0,
+                    "preflight": result,
+                    "exit_country": result.get("country") or "",
+                    "allowed_countries": sorted(allowed),
+                    "excluded_countries": sorted(excluded),
+                }
+        raise RuntimeError(f"Resin 代理池没有通过 OpenAI 出口预检（已尝试 {len(attempted)} 个）")
+
+    if not bool(MIHOMO_US_FALLBACK_ENABLED) and explicit_source != "mihomo":
         raise RuntimeError("Mihomo 美国代理回退未启用；已阻止直连")
-    if not str(MIHOMO_US_GROUP or "").strip():
-        raise RuntimeError("Mihomo 美国代理配置不完整；已阻止直连")
+    route = str(MIHOMO_REGISTRATION_ROUTE or "exclude").strip().lower()
+    group = str(MIHOMO_REGISTRATION_GROUP or MIHOMO_US_GROUP or "").strip()
+    if not group:
+        raise RuntimeError("Mihomo 代理组配置不完整；已阻止直连")
     try:
-        return select_mihomo_us_proxy(
+        if route in {"us", "usa"}:
+            return select_mihomo_us_proxy(
+                controller_url=MIHOMO_CONTROLLER_URL,
+                secret=MIHOMO_CONTROLLER_SECRET,
+                group=group,
+                proxy_url=MIHOMO_PROXY_URL,
+                allow_transparent=MIHOMO_TRANSPARENT_ROUTING,
+                username=MIHOMO_CONTROLLER_USERNAME,
+                password=MIHOMO_CONTROLLER_PASSWORD,
+            )
+        mihomo_allowed = allowed or _normalize_country_codes(MIHOMO_REGISTRATION_ALLOWED_COUNTRIES)
+        mihomo_excluded = excluded | {"HK"}
+        return select_mihomo_proxy(
             controller_url=MIHOMO_CONTROLLER_URL,
             secret=MIHOMO_CONTROLLER_SECRET,
-            group=MIHOMO_US_GROUP,
+            group=group,
             proxy_url=MIHOMO_PROXY_URL,
+            excluded_countries=mihomo_excluded,
+            allowed_countries=mihomo_allowed,
+            excluded_multipliers={"0.2"},
             allow_transparent=MIHOMO_TRANSPARENT_ROUTING,
+            mode="mihomo_excluded",
+            username=MIHOMO_CONTROLLER_USERNAME,
+            password=MIHOMO_CONTROLLER_PASSWORD,
         )
     except Exception as exc:
-        raise RuntimeError(f"Mihomo 美国代理选择失败；已阻止直连: {type(exc).__name__}") from exc
+        raise RuntimeError(f"Mihomo 代理选择失败；已阻止直连: {type(exc).__name__}") from exc
 
 
 # 兼容入口：默认每次进程启动随机选一个，作为本次注册全程的固定代理
@@ -333,14 +607,24 @@ apply_env_overrides(globals(), {
     'PROXY_POOL': 'list_str_multiline',
     'PROXY_POOL_FILE': 'str',
     'REGISTRATION_PROXY_REQUIRED': 'bool',
+    'REGISTRATION_PROXY_SOURCE': 'str',
     'RESIN_MANAGEMENT_URL': 'str',
     'MIHOMO_US_FALLBACK_ENABLED': 'bool',
     'MIHOMO_CONTROLLER_URL': 'str',
     'MIHOMO_CONTROLLER_SECRET': 'str',
+    'MIHOMO_CONTROLLER_USERNAME': 'str',
+    'MIHOMO_CONTROLLER_PASSWORD': 'str',
     'MIHOMO_US_GROUP': 'str',
+    'MIHOMO_REGISTRATION_GROUP': 'str',
     'MIHOMO_PROXY_URL': 'str',
     'MIHOMO_TRANSPARENT_ROUTING': 'bool',
     'MIHOMO_CONTROLLER_TIMEOUT': 'float',
+    'MIHOMO_REGISTRATION_ROUTE': 'str',
+    'MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES': 'list_str_delimited',
+    'MIHOMO_REGISTRATION_ALLOWED_COUNTRIES': 'list_str_delimited',
+    'MIHOMO_REGISTRATION_EXCLUDED_MULTIPLIERS': 'list_str_delimited',
+    'REGISTRATION_PROXY_EXCLUDED_COUNTRIES': 'list_str_delimited',
+    'REGISTRATION_PROXY_ALLOWED_COUNTRIES': 'list_str_delimited',
     'PLAN_CHECK_PROXY_MODE': 'str',
     'PLAN_CHECK_PROXY': 'str',
     'PLAN_CHECK_TIMEOUT': 'float',

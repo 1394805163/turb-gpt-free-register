@@ -79,7 +79,8 @@ class ICloudMailboxPool:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temp_name, stat.S_IMODE(previous.st_mode) if previous else 0o600)
-            if previous and os.geteuid() == 0:
+            # Windows 没有 geteuid/chown；Linux 上保留原文件属主，跨平台时跳过。
+            if previous and getattr(os, "geteuid", lambda: -1)() == 0:
                 os.chown(temp_name, previous.st_uid, previous.st_gid)
             os.replace(temp_name, self.state_file)
         finally:

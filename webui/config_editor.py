@@ -43,7 +43,7 @@ EDITABLE_FIELDS = [
     # ---- 功能开关 ----
     {
         "key": "ENABLE_CODEX_AUTO", "file": "codex.py", "type": "bool", "group": "功能开关",
-        "label": "启用 Codex OAuth", "help": "注册成功后自动跑 Codex 授权（全新session+接码），落盘 codex-邮箱.json",
+        "label": "启用 Codex OAuth", "help": "注册成功后自动跑 Codex 授权；默认不调用短信平台，落盘 codex-邮箱.json",
     },
     {
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "注册方式",
@@ -284,7 +284,19 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "CODEX_OAUTH_DRIVER", "file": "codex.py", "type": "str", "group": "Codex",
-        "label": "Codex授权驱动", "help": "默认推荐 roxy；protocol=原协议授权；roxy=用 RoxyBrowser；cloak=用 CloakBrowser；browser_use=用 Browser Use Cloud；skyvern=用 Skyvern；same_as_registration=跟随注册驱动",
+        "label": "Codex授权驱动", "help": "默认推荐 cloak；protocol=原协议授权；roxy=用 RoxyBrowser；cloak=用 CloakBrowser；browser_use=用 Browser Use Cloud；skyvern=用 Skyvern；same_as_registration=跟随注册驱动",
+    },
+    {
+        "key": "CODEX_OAUTH_SKIP_PHONE_VERIFICATION", "file": "codex.py", "type": "bool", "group": "Codex",
+        "label": "OAuth 不接短信", "help": "开启后不调用短信平台；若 OpenAI 强制手机号，任务会记录失败原因",
+    },
+    {
+        "key": "CODEX_OAUTH_MIN_AGE_DAYS", "file": "codex.py", "type": "int", "group": "Codex",
+        "label": "OAuth 最小账号年龄(天)", "help": "账号达到该年龄后才允许完整 OAuth；未达到时自动改走轻量查活",
+    },
+    {
+        "key": "CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN", "file": "codex.py", "type": "bool", "group": "Codex",
+        "label": "OAuth 旧版到期门禁（默认关闭）", "help": "兼容旧版策略；开启后，已知 access_token 未到期的账号只能轻量查活。正常流程只按最小账号年龄控制",
     },
     {
         "key": "ROXY_CODEX_CALLBACK_TIMEOUT", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
@@ -504,11 +516,16 @@ EDITABLE_FIELDS = [
     # ---- 代理池 ----
     {
         "key": "PROXY_POOL_FILE", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "已验证代理文件", "help": "非空文件优先于下方代理池；相对路径以项目根目录为基准，仅只读加载",
+        "label": "已验证代理文件", "help": "Resin 通用代理池使用；非空文件优先于手动代理池，相对路径以项目根目录为基准",
+    },
+    {
+        "key": "REGISTRATION_PROXY_SOURCE", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "注册出口来源", "help": "resin=通用代理池，mihomo=Mihomo 节点；留空兼容旧开关配置",
     },
     {
         "key": "REGISTRATION_PROXY_REQUIRED", "file": "proxy.py", "type": "bool", "group": "代理池",
         "label": "注册强制使用 Resin", "help": "开启后代理池为空时后端阻止注册，避免 CloakBrowser 回退到 VPS 直连出口",
+        "ui_hidden": True,
     },
     {
         "key": "RESIN_MANAGEMENT_URL", "file": "proxy.py", "type": "str", "group": "代理池",
@@ -517,6 +534,7 @@ EDITABLE_FIELDS = [
     {
         "key": "MIHOMO_US_FALLBACK_ENABLED", "file": "proxy.py", "type": "bool", "group": "代理池",
         "label": "启用 Mihomo 美国回退", "help": "Resin 门禁关闭时只允许通过 Mihomo 的 chatgpt us 组注册；失败时阻止直连",
+        "ui_hidden": True,
     },
     {
         "key": "MIHOMO_CONTROLLER_URL", "file": "proxy.py", "type": "str", "group": "代理池",
@@ -528,8 +546,53 @@ EDITABLE_FIELDS = [
         "storage": "env", "secret": True,
     },
     {
+        "key": "MIHOMO_CONTROLLER_USERNAME", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo 用户名", "help": "Controller 启用用户名密码认证时填写；与密码一起使用 Basic 认证",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "MIHOMO_CONTROLLER_PASSWORD", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo 密码", "help": "仅保存在 .env，不写日志；填写用户名后优先使用 Basic 认证",
+        "storage": "env", "secret": True,
+    },
+    {
         "key": "MIHOMO_US_GROUP", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "Mihomo 美国组", "help": "固定使用 chatgpt us；只会选择名称可识别为美国的节点",
+        "label": "Mihomo 兼容组", "help": "旧版 US 模式使用的代理组；通用模式优先使用下方注册代理组",
+        "ui_hidden": True,
+    },
+    {
+        "key": "MIHOMO_REGISTRATION_GROUP", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo 注册代理组", "help": "通用轮换使用的 Selector 组；留空时复用 Mihomo 兼容组",
+    },
+    {
+        "key": "MIHOMO_REGISTRATION_ROUTE", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "Mihomo 地区策略", "help": "exclude=按排除/允许地区通用轮换（默认）；us=仅美国兼容模式",
+        "ui_hidden": True,
+    },
+    {
+        "key": "MIHOMO_REGISTRATION_EXCLUDED_COUNTRIES", "file": "proxy.py", "type": "list_str_delimited", "group": "代理池",
+        "label": "Mihomo 排除地区", "help": "逗号/换行分隔国家码；默认 HK。GeoIP 自动探测仍保留用于真实出口校验",
+        "ui_hidden": True,
+    },
+    {
+        "key": "MIHOMO_REGISTRATION_ALLOWED_COUNTRIES", "file": "proxy.py", "type": "list_str_delimited", "group": "代理池",
+        "label": "Mihomo 允许地区", "help": "逗号/换行分隔国家码；留空表示除排除地区外全部可选",
+        "ui_hidden": True,
+    },
+    {
+        "key": "MIHOMO_REGISTRATION_EXCLUDED_MULTIPLIERS", "file": "proxy.py", "type": "list_str_delimited", "group": "代理池",
+        "label": "Mihomo 固定排除规则", "help": "由后端固定排除 HK 和 0.2 倍率节点；此字段仅兼容旧配置，不在新版 UI 手填",
+        "ui_hidden": True,
+    },
+    {
+        "key": "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", "file": "proxy.py", "type": "list_str_delimited", "group": "代理池",
+        "label": "注册排除地区", "help": "公共注册策略；Resin 与 Mihomo 都执行，默认排除 HK",
+        "ui_hidden": True,
+    },
+    {
+        "key": "REGISTRATION_PROXY_ALLOWED_COUNTRIES", "file": "proxy.py", "type": "list_str_delimited", "group": "代理池",
+        "label": "注册允许地区", "help": "公共注册策略；Resin 与 Mihomo 都执行，空列表表示除排除地区外均可用",
+        "ui_hidden": True,
     },
     {
         "key": "MIHOMO_PROXY_URL", "file": "proxy.py", "type": "str", "group": "代理池",
@@ -661,7 +724,7 @@ EDITABLE_FIELDS = [
     # ---- Codex：基础 / CPA / sub2api 配置 ----
     {
         "key": "CODEX_AUTH_URL_SOURCE", "file": "codex.py", "type": "str", "group": "Codex",
-        "label": "授权地址来源", "help": "cpa=CPA生成并上传CPA；sub2=sub2生成并上传sub2；local=本地PKCE",
+        "label": "授权地址来源", "help": "local=本地生成与 chatgpt2api 兼容的 PKCE；cpa/sub2 仅为旧兼容路径",
     },
     {
         "key": "CPA_MANAGEMENT_URL", "file": "codex.py", "type": "str", "group": "Codex",
@@ -863,7 +926,7 @@ def _coerce_raw_value(raw: str, fallback, vtype: str):
             return int(str(raw).strip())
         if vtype == "float":
             return float(str(raw).strip())
-        if vtype == "list_str_multiline":
+        if vtype in ("list_str_multiline", "list_str_delimited"):
             text = str(raw)
             try:
                 val = ast.literal_eval(text)
@@ -871,7 +934,7 @@ def _coerce_raw_value(raw: str, fallback, vtype: str):
                     return [str(x).strip() for x in val if str(x).strip()]
             except Exception:
                 pass
-            return [line.strip() for line in text.splitlines() if line.strip()]
+            return [item.strip() for item in re.split(r"[,;\\n\\s]+", text) if item.strip()]
         return str(raw)
     except Exception:
         return fallback
@@ -904,7 +967,7 @@ def get_config() -> list[dict]:
         else:
             value = fallback
 
-        if field["type"] in ("str", "list_str_multiline"):
+        if field["type"] in ("str", "list_str_multiline", "list_str_delimited"):
             value = _normalize_config_value(value, field["type"])
         item = dict(field)
         item["storage"] = "env"
@@ -930,11 +993,11 @@ def _normalize_config_value(value, vtype: str):
         if s.lower() in {x.lower() for x in _PLACEHOLDER_EMPTY}:
             return ""
         return s
-    if vtype == "list_str_multiline":
+    if vtype in ("list_str_multiline", "list_str_delimited"):
         if value is None:
             return []
         if isinstance(value, str):
-            lines = value.splitlines()
+            lines = value.splitlines() if vtype == "list_str_multiline" else re.split(r"[,;\n\s]+", value)
         elif isinstance(value, (list, tuple)):
             lines = list(value)
         else:
@@ -1033,9 +1096,9 @@ def _format_env_value(value, vtype: str) -> str:
         return str(int(value))
     if vtype == "float":
         return repr(float(value))
-    if vtype == "list_str_multiline":
+    if vtype in ("list_str_multiline", "list_str_delimited"):
         lines = _normalize_config_value(value, vtype)
-        return "\n".join(lines) if lines else "[]"
+        return ("\n" if vtype == "list_str_multiline" else ",").join(lines) if lines else "[]"
     if vtype == "str":
         return _normalize_config_value(value, vtype)
     return "" if value is None else str(value)

@@ -3,8 +3,8 @@
 注册成功后自动跑 Codex OAuth 授权的配置项。
 设置 ENABLE_CODEX = False 可完全跳过此步骤。
 
-参数来源：CLIProxyAPI 源码 internal/auth/codex/openai_auth.go + pkce.go，
-对照 https://github.com/router-for-me/CLIProxyAPI 逐行确认。
+参数与 chatgpt2api 的 services/oauth_login_service.py 保持一致，
+生成的 refresh_token 可直接进入 chatgpt2api 的自动续期流程。
 """
 from config.env_loader import env_str, apply_env_overrides
 
@@ -12,21 +12,24 @@ from config.env_loader import env_str, apply_env_overrides
 # 是否启用 Codex OAuth 授权（False = 跳过，不影响注册结果）
 ENABLE_CODEX: bool = False
 
-# Codex OAuth 客户端 ID（固定值，来自 CLIProxyAPI openai_auth.go:27 ClientID）
-CODEX_CLIENT_ID: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+# OAuth 客户端 ID 与 chatgpt2api 的 OAuth 登录服务保持一致，确保 refresh_token 可续期。
+CODEX_CLIENT_ID: str = "app_2SKx67EdpoN0G6j64rFvigXD"
 
 # 授权端点（openai_auth.go:25 AuthURL）
-CODEX_AUTH_URL: str = "https://auth.openai.com/oauth/authorize"
+CODEX_AUTH_URL: str = "https://auth.openai.com/api/accounts/authorize"
 
 # 换 token 端点（openai_auth.go:26 TokenURL）
-CODEX_TOKEN_URL: str = "https://auth.openai.com/oauth/token"
+CODEX_TOKEN_URL: str = "https://auth.openai.com/api/accounts/oauth/token"
 
 # 回调地址（openai_auth.go:28 RedirectURI）
 # 注意：本地并不真的起这个 server，只用来拦截重定向并从 Location 提取 code。
-CODEX_REDIRECT_URI: str = "http://localhost:1455/auth/callback"
+CODEX_REDIRECT_URI: str = "https://platform.openai.com/auth/callback"
 
 # OAuth scopes（openai_auth.go:75 GenerateAuthURL 里的 scope）
-CODEX_SCOPE: str = "openid email profile offline_access"
+CODEX_SCOPE: str = "openid profile email offline_access"
+
+# 与 chatgpt2api OAuth 桥使用的 Auth0 客户端标识保持一致。
+CODEX_AUTH0_CLIENT: str = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
 
 # 输出目录名（仅名字，运行时拼到项目根；与 OUTLOOK_ACCOUNTS_FILE 同级风格）
 CODEX_OUTPUT_DIRNAME: str = "codex_accounts"
@@ -49,24 +52,30 @@ ENABLE_CODEX_AUTO: bool = False
 
 # Codex OAuth 授权驱动：
 #   "protocol" = 原有 curl_cffi 协议授权
-#   "roxy"     = 调用 RoxyBrowser 指纹浏览器完成授权页面/手机验证/回调捕获
-#   "cloak"       = 调用 CloakBrowser 完成授权页面/手机验证/回调捕获
+#   "roxy"     = 调用 RoxyBrowser 指纹浏览器完成授权页面/回调捕获
+#   "cloak"    = 调用 CloakBrowser 完成授权页面/回调捕获
 #   "browser_use" = 调用 Browser Use Cloud 完成授权页面/手机验证/回调捕获
 #   "same_as_registration" = 跟随 REGISTRATION_DRIVER
-CODEX_OAUTH_DRIVER: str = "roxy"
+CODEX_OAUTH_DRIVER: str = "cloak"
+
+# 不购买/调用短信平台；如果 OpenAI 强制要求手机号，本次授权明确失败并记录原因。
+CODEX_OAUTH_SKIP_PHONE_VERIFICATION: bool = True
+
+# OAuth 批次门禁：默认只要求账号达到最小年龄；旧版 access_token 到期门禁保留为兼容开关并默认关闭。
+CODEX_OAUTH_MIN_AGE_DAYS: int = 7
+CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN: bool = False
 
 
 
 
 # ============================================================
-# CPA 管理接口（Codex 授权地址由 CPA 生成，本地只负责跑登录并提交回调）
+# 旧 CPA/sub2 兼容配置；当前直接推送链路不读取这些字段。
 # ============================================================
 
 # 授权地址来源：
-#   "cpa"   = 通过 CPA 管理接口 /v0/management/codex-auth-url 生成（推荐）
-#   "sub2"  = 通过 sub2 管理接口生成，并把 callback 上传到 sub2
-#   "local" = 使用本模块保留的本地 PKCE 生成逻辑（兼容旧方案）
-CODEX_AUTH_URL_SOURCE: str = "cpa"
+#   "local" = 本地生成与 chatgpt2api 兼容的 PKCE 授权地址（当前使用）
+#   "cpa"/"sub2" = 旧兼容路径
+CODEX_AUTH_URL_SOURCE: str = "local"
 
 # CPA 管理页面或服务地址，例如 http://localhost:8317/admin/oauth
 # 实际请求会取 origin，调用：
@@ -161,4 +170,4 @@ L_ADMIN_AUTH_CODE: str = env_str("L_ADMIN_AUTH_CODE", "")
 L_PHONE_PREFIX: str = ""
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_AUTH_URL_SOURCE': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})
+apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_OAUTH_SKIP_PHONE_VERIFICATION': 'bool', 'CODEX_OAUTH_MIN_AGE_DAYS': 'int', 'CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN': 'bool', 'CODEX_AUTH_URL_SOURCE': 'str', 'CODEX_AUTH0_CLIENT': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})

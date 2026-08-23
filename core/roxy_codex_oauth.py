@@ -91,12 +91,11 @@ def _is_callback_url(url: str) -> bool:
         parsed = urlparse(url)
     except Exception:
         return False
-    return (
-        parsed.scheme in ("http", "https")
-        and parsed.hostname in ("localhost", "127.0.0.1")
-        and parsed.port == 1455
-        and parsed.path == "/auth/callback"
-    )
+    if parsed.scheme not in ("http", "https") or parsed.path != "/auth/callback":
+        return False
+    if parsed.hostname in ("localhost", "127.0.0.1"):
+        return parsed.port == 1455
+    return parsed.hostname == "platform.openai.com"
 
 
 def _extract_callback_url_from_page(driver) -> str:
@@ -250,6 +249,10 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
     human_delay("navigate")
     logger.info("[Codex][Browser] 授权页加载完成，检查是否需要邮箱登录")
     _maybe_accept(driver)
+    # 与注册流程共用 Cloudflare/拦截页识别；否则挑战页会被当作“找不到邮箱框”，
+    # 上层无法区分页面拦截，也就不会触发代理轮换。
+    from core.cloakbrowser_registration import _assert_login_gate_not_blocked
+    _assert_login_gate_not_blocked(driver)
 
     # 可能已经处于账号选择/授权页；如果有邮箱输入框则完整登录。
     # 非日本出口时按钮文案/顺序会变，不能按可见文字点“继续”，否则可能误点 Google。
@@ -261,8 +264,24 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         logger.info("[Codex][Browser] 已提交邮箱，等待邮箱 OTP 页面")
         _maybe_click_passwordless_after_email(driver, email, timeout=18)
     except Exception as exc:
-        logger.info("[Codex][Browser] 未检测到邮箱输入框，可能已登录或进入下一步：%s", str(exc)[:120])
-        return
+        current = str(getattr(driver, "current_url", "") or "")
+        lower = current.lower()
+        accepted_state = (
+            _is_callback_url(current)
+            or any(marker in lower for marker in ("phone-verification", "add-phone", "workspace", "consent"))
+        )
+        if accepted_state:
+            logger.info("[Codex][Browser] 未检测到邮箱输入框，但当前已处于后续授权阶段：url=%s", current[:180])
+            return
+        state = _email_otp_page_state(driver)
+        logger.error(
+            "[Codex][Browser] OAuth 登录入口识别失败：url=%s inputs=%s buttons=%s text=%s",
+            str(state.get("url") or current)[:220],
+            len(state.get("inputs") or []),
+            [(b.get("text") or "")[:32] for b in (state.get("buttons") or [])][:8],
+            str(state.get("text") or "")[:200],
+        )
+        raise RuntimeError(f"未找到邮箱输入框/邮箱入口，当前页面不是可跳过登录的后续阶段: {current[:160]}") from exc
 
     # 提交邮箱后不再执行任何全局“继续/授权/分支”兜底点击；后续只等待验证码页。
     # 避免页面已进入 OAuth consent 时误点授权按钮。
@@ -278,6 +297,8 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         driver.get(auth_url)
         human_delay("navigate")
         _maybe_accept(driver)
+        from core.cloakbrowser_registration import _assert_login_gate_not_blocked
+        _assert_login_gate_not_blocked(driver)
         try:
             _type_email_address(driver, email, timeout=12)
             human_delay("form")
@@ -1059,6 +1080,10 @@ def _sleep_before_phone_retry(attempt: int, max_retries: int, *, prefix: str = "
 
 def _do_phone_verification_if_present(driver) -> None:
     """如果页面要求手机号验证，则用当前 sms_provider 自动完成。"""
+    from config import codex as codex_cfg
+    if bool(getattr(codex_cfg, "CODEX_OAUTH_SKIP_PHONE_VERIFICATION", True)):
+        logger.info("[Codex][Browser] 已关闭短信接码；检测到手机号步骤时直接交给后续流程，不调用短信平台")
+        return
     provider = str(getattr(sms_provider._cfg, "SMS_PROVIDER", "") or "").strip().lower() if hasattr(sms_provider, "_cfg") else ""
     http = sms_provider._http()
     max_retries = int(getattr(sms_provider._cfg, "SMS_MAX_RETRIES", 10) or 10) if hasattr(sms_provider, "_cfg") else 10
@@ -1243,6 +1268,7 @@ def _run_roxy_codex_oauth_once(
     existing_opened=None,
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
+    auth_context: dict | None = None,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口。
 
@@ -1258,15 +1284,23 @@ def _run_roxy_codex_oauth_once(
     if otp_provider is None:
         otp_provider = wait_for_otp
 
-    client = None if reuse_existing_profile else RoxyBrowserClient()
-    opened = existing_opened if reuse_existing_profile else client.open_profile()
-    browser_kind_token = _CODEX_BROWSER_KIND.set(_detect_browser_kind(opened))
-    driver = existing_driver if reuse_existing_profile else None
-    owns_driver = not reuse_existing_profile
+    client = None
+    opened = existing_opened
+    browser_kind_token = _CODEX_BROWSER_KIND.set(_detect_browser_kind(opened)) if opened is not None else None
+    driver = existing_driver
+    owns_driver = False
     try:
         auth_source = proto._codex_auth_url_source()
         code_verifier = None
-        if auth_source == "cpa":
+        if isinstance(auth_context, dict):
+            auth_source = str(auth_context.get("source") or auth_source).strip().lower()
+            state = str(auth_context.get("state") or "")
+            auth_url = str(auth_context.get("auth_url") or "")
+            code_verifier = auth_context.get("code_verifier")
+            if not state or not auth_url:
+                raise RuntimeError("预生成 OAuth 授权上下文不完整")
+            logger.info("[Codex][Browser] 已取得授权地址后再启动浏览器：source=%s url=%s", auth_source, auth_url)
+        elif auth_source == "cpa":
             cpa_auth = proto._request_cpa_authorize_url()
             state = cpa_auth["state"]
             auth_url = cpa_auth["auth_url"]
@@ -1284,6 +1318,14 @@ def _run_roxy_codex_oauth_once(
         else:
             raise RuntimeError(f"[Codex][Browser] 不支持的 CODEX_AUTH_URL_SOURCE={auth_source!r}")
 
+        if not reuse_existing_profile:
+            client = RoxyBrowserClient(proxy=proxy)
+            opened = client.open_profile()
+            owns_driver = True
+        if opened is None:
+            raise RuntimeError("OAuth 浏览器环境未创建")
+        if browser_kind_token is None:
+            browser_kind_token = _CODEX_BROWSER_KIND.set(_detect_browser_kind(opened))
         if not driver:
             driver = _build_driver(opened)
             _center_browser_window(driver)
@@ -1395,6 +1437,7 @@ def run_roxy_codex_oauth(
     existing_opened=None,
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
+    auth_context: dict | None = None,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
@@ -1416,6 +1459,7 @@ def run_roxy_codex_oauth(
             existing_opened=existing_opened,
             reuse_existing_profile=reuse_existing_profile,
             clear_existing_state=clear_existing_state,
+            auth_context=auth_context,
         )
         last_result = result
         if result.get("ok"):
@@ -1428,3 +1472,48 @@ def run_roxy_codex_oauth(
         last_result["message"] = f"CPA callback 超时，已重新授权 {max_rounds} 轮仍失败：{last_result.get('message') or ''}"
         return last_result
     return proto._codex_result(status="failed", email=email, message="CPA callback 超时，重新授权失败")
+
+
+def run_cloak_codex_oauth(
+    email: str,
+    otp_provider=None,
+    proxy: str | None = None,
+    proxy_selection: dict | None = None,
+    force: bool = False,
+) -> dict:
+    """CloakBrowser OAuth 入口；不创建 Roxy profile。页面流程复用同一套回调逻辑。"""
+    from config import cloakbrowser as cloak_cfg
+    from core import codex_oauth as proto
+    from core.cloakbrowser_driver import build_cloak_driver
+
+    auth_context = None
+    if proto._codex_auth_url_source() == "local":
+        code_verifier, code_challenge = proto._generate_pkce()
+        state = proto._generate_state()
+        auth_url = proto._build_authorize_url(state, code_challenge, prompt="login")
+        auth_context = {
+            "source": "local",
+            "state": state,
+            "auth_url": auth_url,
+            "code_verifier": code_verifier,
+        }
+        logger.info("[Codex][Cloak] 已生成本地 OAuth 授权地址，准备启动浏览器：%s", auth_url)
+    driver, opened = build_cloak_driver(proxy=proxy, proxy_selection=proxy_selection)
+    try:
+        return run_roxy_codex_oauth(
+            email,
+            otp_provider=otp_provider,
+            proxy=proxy,
+            force=force,
+            existing_driver=driver,
+            existing_opened=opened,
+            reuse_existing_profile=True,
+            clear_existing_state=True,
+            auth_context=auth_context,
+        )
+    finally:
+        if not bool(getattr(cloak_cfg, "CLOAK_KEEP_BROWSER_OPEN", False)):
+            try:
+                driver.quit()
+            except Exception:
+                pass

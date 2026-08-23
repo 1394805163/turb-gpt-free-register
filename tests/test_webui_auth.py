@@ -39,6 +39,11 @@ class WebUiAuthTests(unittest.TestCase):
         r = self.client.get("/api/summary")
         self.assertEqual(r.status_code, 200)
 
+    def test_login_trailing_slash_renders_the_same_login_page(self):
+        r = self.client.get("/login/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("授权码", r.get_data(as_text=True))
+
 
 if __name__ == "__main__":
     unittest.main()
