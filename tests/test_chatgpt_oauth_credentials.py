@@ -136,6 +136,36 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
         self.assertEqual(row["access_token"], "access-only-token")
         self.assertFalse(row.get("oauth_status"))
 
+    def test_import_account_credentials_uses_chatgpt_oauth_fields_to_overwrite_pool(self):
+        row_id = db.insert_account(
+            email="overwrite@icloud.com",
+            access_token="stale-access-token",
+            email_source="icloud",
+        )
+        with patch("core.email_provider.release_email") as release_email:
+            result = db.import_account_credentials([{
+                "email": "overwrite@icloud.com",
+                "access_token": "stale-access-token",
+                "chatgpt_oauth_access_token": "oauth-access-token",
+                "chatgpt_refresh_token": "oauth-refresh-token",
+                "chatgpt_id_token": "oauth-id-token",
+                "chatgpt_oauth_client_id": "oauth-client",
+                "chatgpt_account_id": "chatgpt-account-id",
+                "email_source": "icloud",
+            }])
+
+        self.assertEqual(result["oauth_status"], {"complete": 1})
+        self.assertEqual(result["updated"], 1)
+        row = db.get_account(row_id)
+        self.assertEqual(row["access_token"], "oauth-access-token")
+        self.assertEqual(row["chatgpt_refresh_token"], "oauth-refresh-token")
+        self.assertEqual(row["refresh_token"], "oauth-refresh-token")
+        self.assertEqual(row["id_token"], "oauth-id-token")
+        self.assertEqual(row["oauth_client_id"], "oauth-client")
+        self.assertEqual(row["account_id"], "chatgpt-account-id")
+        release_email.assert_called_once()
+        self.assertEqual(release_email.call_args.kwargs["status"], "used")
+
     def test_save_codex_credential_normalizes_cpa_aliases(self):
         with patch("core.codex_oauth._PROJECT_ROOT", self.root):
             with patch("core.codex_oauth._cfg.CODEX_OUTPUT_DIRNAME", "codex_accounts"):

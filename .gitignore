@@ -13,6 +13,7 @@
 注册成功的邮箱.txt
 注册成功的token.txt
 accounts/
+exports/
 H_API.md
 
 # Codex 授权凭证（含 access/refresh/id token）

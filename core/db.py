@@ -850,8 +850,21 @@ def _extract_chatgpt_oauth_credential(value: object) -> dict | None:
         if isinstance(item, dict):
             candidates.append(item)
     for item in candidates:
-        access_token = str(item.get("access_token") or item.get("accessToken") or "").strip()
-        refresh_token = str(item.get("refresh_token") or item.get("refreshToken") or "").strip()
+        # 账号池自身使用 chatgpt_* 字段保存持久化凭据；导入器也要识别这组
+        # 字段，否则从“注册成功的邮箱.json”导出的完整 OAuth 会被误判为 AT-only。
+        access_token = str(
+            item.get("chatgpt_oauth_access_token")
+            or item.get("chatgpt_access_token")
+            or item.get("access_token")
+            or item.get("accessToken")
+            or ""
+        ).strip()
+        refresh_token = str(
+            item.get("chatgpt_refresh_token")
+            or item.get("refresh_token")
+            or item.get("refreshToken")
+            or ""
+        ).strip()
         if not access_token or not refresh_token:
             continue
         return {
@@ -859,9 +872,23 @@ def _extract_chatgpt_oauth_credential(value: object) -> dict | None:
             "email": str(item.get("email") or "").strip(),
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "id_token": str(item.get("id_token") or item.get("idToken") or "").strip(),
-            "oauth_client_id": str(item.get("oauth_client_id") or item.get("client_id") or "").strip(),
-            "account_id": str(item.get("account_id") or item.get("chatgpt_account_id") or "").strip(),
+            "id_token": str(
+                item.get("chatgpt_id_token")
+                or item.get("id_token")
+                or item.get("idToken")
+                or ""
+            ).strip(),
+            "oauth_client_id": str(
+                item.get("oauth_client_id")
+                or item.get("chatgpt_oauth_client_id")
+                or item.get("client_id")
+                or ""
+            ).strip(),
+            "account_id": str(
+                item.get("account_id")
+                or item.get("chatgpt_account_id")
+                or ""
+            ).strip(),
             "expires_at": str(item.get("expires_at") or item.get("expired") or "").strip(),
             "last_refresh": str(item.get("last_refresh") or "").strip(),
             "source": str(item.get("source") or "codex_oauth").strip(),
@@ -998,10 +1025,27 @@ def import_account_credentials(records: list[dict], source: str | None = None) -
     for raw in records or []:
         if not isinstance(raw, dict):
             continue
-        access_token = str(raw.get("access_token") or raw.get("accessToken") or "").strip()
-        refresh_token = str(raw.get("refresh_token") or raw.get("refreshToken") or "").strip()
-        id_token = str(raw.get("id_token") or raw.get("idToken") or "").strip()
-        if access_token and refresh_token and id_token:
+        normalized = _extract_chatgpt_oauth_credential(raw)
+        access_token = str(
+            raw.get("chatgpt_oauth_access_token")
+            or raw.get("chatgpt_access_token")
+            or raw.get("access_token")
+            or raw.get("accessToken")
+            or ""
+        ).strip()
+        refresh_token = str(
+            raw.get("chatgpt_refresh_token")
+            or raw.get("refresh_token")
+            or raw.get("refreshToken")
+            or ""
+        ).strip()
+        id_token = str(
+            raw.get("chatgpt_id_token")
+            or raw.get("id_token")
+            or raw.get("idToken")
+            or ""
+        ).strip()
+        if normalized and access_token and refresh_token and id_token:
             oauth_records.append(raw)
         elif access_token:
             access_only_records.append(raw)
@@ -1012,7 +1056,13 @@ def import_account_credentials(records: list[dict], source: str | None = None) -
     access_only_count = 0
     for raw in access_only_records:
         email = str(raw.get("email") or "").strip()
-        token = str(raw.get("access_token") or raw.get("accessToken") or "").strip()
+        token = str(
+            raw.get("chatgpt_oauth_access_token")
+            or raw.get("chatgpt_access_token")
+            or raw.get("access_token")
+            or raw.get("accessToken")
+            or ""
+        ).strip()
         if not email or not token:
             result["skipped"] += 1
             result["errors"].append({"email": email, "error": "AT-only 凭据缺少 email 或 access_token"})
