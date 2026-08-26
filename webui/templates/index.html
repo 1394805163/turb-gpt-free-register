@@ -3368,6 +3368,8 @@ function getAccountById(id) {
 }
 function hasCompleteOAuthCredential(account) {
   if (!account) return false;
+  // 紧凑列表不会下发敏感凭据；OAuth 状态已成功时不应回退到历史 Codex 状态。
+  if (String(account.oauth_status || '').trim().toLowerCase() === 'success') return true;
   const source = String(account.email_source || '').trim().toLowerCase();
   const mailboxSources = new Set(['outlook', 'generic_api', 'cloudmail', 'mailnest', 'cloudflare', 'cloudflare_domain']);
   const refreshToken = String(
