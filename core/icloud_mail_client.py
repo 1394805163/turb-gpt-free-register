@@ -291,6 +291,7 @@ def fetch_latest_otp(
     state = otp_state if otp_state is not None else {}
     seen_uids = state.setdefault("seen_uids", set())
     pending_uids = state.setdefault("pending_uids", set())
+    backfill_uids = state.setdefault("backfill_uids", set())
     seen_message_ids = state.setdefault("seen_message_ids", set())
     seen_code_hashes = state.setdefault("seen_code_hashes", set())
     used_code_hashes = state.setdefault("used_code_hashes", set())
@@ -302,6 +303,7 @@ def fetch_latest_otp(
         "_seen": seen_message_ids,
         "_seen_uids": seen_uids,
         "_pending_uids": pending_uids,
+        "_backfill_uids": backfill_uids,
         "_seen_message_ids": seen_message_ids,
         "_seen_code_hashes": seen_code_hashes,
         "_used_code_hashes": used_code_hashes,

@@ -107,7 +107,27 @@ def run_cloak_liveness_flow(
                     redact_email(email),
                     attempt,
                 )
-                current_otp = otp_wait_session.wait(email, after_ts=otp_after_ts, max_wait=otp_wait)
+                try:
+                    current_otp = otp_wait_session.wait(email, after_ts=otp_after_ts, max_wait=otp_wait)
+                except TimeoutError as exc:
+                    logger.warning(
+                        "[Cloak查活][OTP] 第 %s 次等待验证码超时，准备复用一次重发机会：%s",
+                        attempt,
+                        type(exc).__name__,
+                    )
+                    # 邮件接口超时与验证码错误一样，都需要给新邮件一次机会；
+                    # 但如果浏览器已经跳回 ChatGPT，优先信任登录态。
+                    if _is_chatgpt_logged_in_page(driver):
+                        logger.info("[Cloak查活][OTP] 等待取码期间已检测到 ChatGPT 首页，按成功继续")
+                        break
+                    if resend_used:
+                        raise RuntimeError("邮箱验证码等待超时，重发机会已用尽") from exc
+                    resend_used = True
+                    resend_result = _click_resend_email_otp(driver, timeout=25)
+                    if resend_result.get("reason") == "otp_page_left":
+                        break
+                    otp_after_ts = time.time()
+                    continue
             otp_wait_session.mark_used(current_otp)
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
@@ -116,6 +136,9 @@ def run_cloak_liveness_flow(
             outcome = _wait_after_email_otp_submit(driver, timeout=otp_submit_timeout)
             logger.info("[Cloak查活][OTP] 提交结果：%s", outcome)
             if outcome == "accepted":
+                break
+            if _is_chatgpt_logged_in_page(driver):
+                logger.info("[Cloak查活][OTP] 提交结果为 %s 但页面已登录，跳过重发并继续", outcome)
                 break
             if outcome == "invalid" and attempt >= 3:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import imaplib
 import json
+import logging
 import os
 import re
 import secrets
@@ -19,6 +20,7 @@ from typing import Any
 
 
 _state_lock = Lock()
+logger = logging.getLogger(__name__)
 
 
 class ICloudMailboxPool:
@@ -212,7 +214,13 @@ class ICloudMailboxPool:
             imap.login(username, password)
             self._bind_deadline(imap, deadline, fallback=request_timeout)
             status, _ = imap.select(str(self.config.get("imap_mailbox") or "INBOX"), readonly=True)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[iCloud IMAP] 连接/登录收件箱失败 host=%s port=%s error=%s",
+                str(self.config.get("imap_host") or "imap.mail.me.com"),
+                int(self.config.get("imap_port") or 993),
+                type(exc).__name__,
+            )
             self._close_imap(imap, deadline=deadline)
             raise
         if status != "OK":
@@ -303,13 +311,33 @@ class ICloudMailboxPool:
     def _candidate_uid_window(self, all_uids: list[bytes], mailbox: dict[str, Any]) -> list[bytes]:
         seen_uids = mailbox.setdefault("_seen_uids", set())
         pending_uids = mailbox.setdefault("_pending_uids", set())
+        backfill_uids = mailbox.setdefault("_backfill_uids", set())
         last_uid = int(mailbox.get("_last_uid") or 0)
         initial_limit = max(1, min(100, int(self.config.get("initial_scan_limit") or 20)))
         if last_uid > 0:
             candidates = [uid for uid in all_uids if int(uid) > last_uid or uid in pending_uids]
+            current_uids = set(all_uids)
+            backfill_uids.intersection_update(current_uids)
+            candidates.extend(sorted(backfill_uids, key=lambda value: int(value), reverse=True)[:initial_limit])
         else:
             candidates = all_uids[-initial_limit:]
-        return [uid for uid in candidates if uid not in seen_uids]
+            backfill_uids.update(all_uids[:-initial_limit])
+        unique: list[bytes] = []
+        included: set[bytes] = set()
+        for uid in candidates:
+            if uid not in seen_uids and uid not in included:
+                unique.append(uid)
+                included.add(uid)
+        logger.debug(
+            "[iCloud IMAP] UID 窗口 all=%s candidates=%s pending=%s backfill=%s seen=%s last_uid=%s",
+            len(all_uids),
+            len(unique),
+            len(pending_uids),
+            len(backfill_uids),
+            len(seen_uids),
+            last_uid,
+        )
+        return unique
 
     def _parse_uid_message(self, uid: bytes, raw: bytes) -> tuple[str, str, datetime | None, str, set[str]] | None:
         if not raw:
@@ -420,6 +448,7 @@ class ICloudMailboxPool:
                     if previous_uidvalidity and uidvalidity and previous_uidvalidity != uidvalidity:
                         mailbox.setdefault("_seen_uids", set()).clear()
                         mailbox.setdefault("_pending_uids", set()).clear()
+                        mailbox.setdefault("_backfill_uids", set()).clear()
                         mailbox["_last_uid"] = 0
                     if uidvalidity:
                         mailbox["_uidvalidity"] = uidvalidity
@@ -427,11 +456,12 @@ class ICloudMailboxPool:
                     all_uids = self._all_uids(imap, deadline=deadline)
                     candidates = self._candidate_uid_window(all_uids, mailbox)
                     if all_uids:
-                        # 在可能提前返回验证码前推进基线；临时 FETCH 失败由 pending_uids 保证重试。
+                        # 新 UID 基线可以前移；首轮窗口之外的旧 UID 由 backfill_uids 逐批回补。
                         mailbox["_last_uid"] = max(int(uid) for uid in all_uids)
                     target = str(mailbox["address"]).strip().lower()
                     seen_uids = mailbox.setdefault("_seen_uids", set())
                     pending_uids = mailbox.setdefault("_pending_uids", set())
+                    backfill_uids = mailbox.setdefault("_backfill_uids", set())
                     seen_message_ids = mailbox.setdefault("_seen_message_ids", mailbox.setdefault("_seen", set()))
                     seen_code_hashes = mailbox.setdefault("_seen_code_hashes", set())
                     used_code_hashes = mailbox.setdefault("_used_code_hashes", set())
@@ -441,27 +471,54 @@ class ICloudMailboxPool:
                         parsed = self._fetch_uid_message(imap, uid, deadline=deadline)
                         if parsed is None:
                             pending_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s FETCH 无正文，保留 pending", uid.decode(errors="replace"))
                             continue
-                        pending_uids.discard(uid)
-                        seen_uids.add(uid)
                         message_id, text, received, _headers, recipients = parsed
                         if target not in recipients:
+                            pending_uids.discard(uid)
+                            backfill_uids.discard(uid)
+                            seen_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 跳过非当前别名收件人", uid.decode(errors="replace"))
+                            continue
+                        if received and received < not_before:
+                            pending_uids.discard(uid)
+                            backfill_uids.discard(uid)
+                            seen_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 跳过 code_not_before 之前的邮件", uid.decode(errors="replace"))
+                            continue
+                        match = re.search(r"(?:Verification code|code is|代码为|验证码)[:\s]*(\d{6})", text, re.I) or re.search(r"(?<![#&])\b(\d{6})\b", text)
+                        if not match or match.group(1) == "177010":
+                            # iCloud 有时先返回同一封邮件的无码/不完整版本；不要
+                            # 把 UID 或 Message-ID 标成已完成，下一轮继续 FETCH。
+                            pending_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 当前邮件未抽取到可用验证码，保留 pending", uid.decode(errors="replace"))
                             continue
                         fingerprint = message_id or hashlib.sha256(text.encode()).hexdigest()
                         if fingerprint in seen_message_ids:
+                            pending_uids.discard(uid)
+                            backfill_uids.discard(uid)
+                            seen_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 跳过重复 Message-ID", uid.decode(errors="replace"))
                             continue
+                        code = match.group(1)
+                        code_hash = hashlib.sha256(code.encode()).hexdigest()
+                        if code_hash in used_code_hashes or code_hash in seen_code_hashes:
+                            pending_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 验证码已使用，保留 pending 等待更新", uid.decode(errors="replace"))
+                            continue
+                        pending_uids.discard(uid)
+                        backfill_uids.discard(uid)
+                        seen_uids.add(uid)
                         seen_message_ids.add(fingerprint)
-                        if received and received < not_before:
-                            continue
-                        match = re.search(r"(?:Verification code|code is|代码为|验证码)[:\s]*(\d{6})", text, re.I) or re.search(r"(?<![#&])\b(\d{6})\b", text)
-                        if match and match.group(1) != "177010":
-                            code = match.group(1)
-                            code_hash = hashlib.sha256(code.encode()).hexdigest()
-                            if code_hash in used_code_hashes or code_hash in seen_code_hashes:
-                                continue
-                            seen_code_hashes.add(code_hash)
-                            return code
-                except (imaplib.IMAP4.error, OSError):
+                        seen_code_hashes.add(code_hash)
+                        return code
+                except (imaplib.IMAP4.error, OSError) as exc:
+                    logger.warning(
+                        "[iCloud IMAP] 轮询失败，将重连 error=%s pending=%s backfill=%s",
+                        type(exc).__name__,
+                        len(mailbox.get("_pending_uids") or set()),
+                        len(mailbox.get("_backfill_uids") or set()),
+                    )
                     self._close_imap(imap, deadline=deadline)
                     imap = None
                 remaining_budget = deadline - time.monotonic()
