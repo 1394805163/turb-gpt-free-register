@@ -466,7 +466,29 @@ def _quick_auth_state(page) -> dict:
         return {"state": "other", "url": _page_url(page), "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
+_EMAIL_INPUT_SELECTORS = [
+    "input[type='email']",
+    "input[name='email']",
+    "input[name='username']",
+    "input[name='loginfmt']",
+    "input[name='identifier']",
+    "input[autocomplete='email']",
+    "input[autocomplete='username']",
+    "input[inputmode='email']",
+    "input[id*='email' i]",
+    "input[id*='username' i]",
+    "input[aria-label*='email' i]",
+    "input[aria-label*='メール']",
+    "input[aria-label*='邮箱']",
+    "input[placeholder*='email' i]",
+    "input[placeholder*='メール']",
+    "input[placeholder*='邮箱']",
+    "input[placeholder*='電子郵件']",
+]
+
+
+def _wait_for_email_input_pw(page, timeout_ms: int | None = None):
+    """等待可见邮箱输入框；在此之前不领取自动邮箱。"""
     # 有的登录页要先点 “Continue with email”
     _click_first(
         page,
@@ -491,37 +513,18 @@ def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
     )
     _assert_not_external_idp(page, "邮箱入口")
 
-    fill_timeout_ms = timeout_ms if timeout_ms is not None else min(_timeout_ms(), 20000)
-    ok = _fill_first(
-        page,
-        [
-            "input[type='email']",
-            "input[name='email']",
-            "input[name='username']",
-            "input[name='loginfmt']",
-            "input[name='identifier']",
-            "input[autocomplete='email']",
-            "input[autocomplete='username']",
-            "input[inputmode='email']",
-            "input[id*='email' i]",
-            "input[id*='username' i]",
-            "input[aria-label*='email' i]",
-            "input[aria-label*='メール']",
-            "input[aria-label*='邮箱']",
-            "input[placeholder*='email' i]",
-            "input[placeholder*='メール']",
-            "input[placeholder*='邮箱']",
-            "input[placeholder*='電子郵件']",
-        ],
-        email,
-        timeout_ms=fill_timeout_ms,
-        typing_delay_range=(120, 320) if _fast_mode() else (160, 420),
-        per_char=True,
-    )
-    if not ok:
-        raise RuntimeError("找不到邮箱输入框")
+    end = time.time() + ((timeout_ms if timeout_ms is not None else min(_timeout_ms(), 20000)) / 1000)
+    while time.time() < end:
+        loc = _visible_locator(page, _EMAIL_INPUT_SELECTORS, timeout_ms=800)
+        if loc is not None:
+            return loc
+        time.sleep(0.15 if _fast_mode() else 0.3)
+    raise RuntimeError("找不到邮箱输入框")
 
-    if not _click_first(
+
+def _submit_email_step_pw(page, timeout_ms: int = 8000) -> bool:
+    """点击邮箱表单的提交按钮；没有按钮时由调用方回退到回车。"""
+    return _click_first(
         page,
         [
             "button[type='submit']",
@@ -536,12 +539,35 @@ def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
             "button:has-text('下一步')",
             "form button",
         ],
-        timeout_ms=8000,
-    ):
+        timeout_ms=timeout_ms,
+    )
+
+
+def _type_email(page, email: str | None, timeout_ms: int | None = None, email_supplier=None) -> str:
+    """确认邮箱输入框后领取（如需）并填写邮箱，再提交表单。"""
+    loc = _wait_for_email_input_pw(page, timeout_ms=timeout_ms)
+    actual_email = str(email or "").strip()
+    if not actual_email:
+        if email_supplier is None:
+            raise RuntimeError("已找到邮箱输入框，但没有配置邮箱供应器")
+        actual_email = str(email_supplier() or "").strip()
+        if not actual_email:
+            raise RuntimeError("邮箱供应器返回空邮箱")
+    _human_fill_locator(
+        page,
+        loc,
+        actual_email,
+        timeout=5000,
+        typing_delay_range=(120, 320) if _fast_mode() else (160, 420),
+        per_char=True,
+    )
+
+    if not _submit_email_step_pw(page):
         # 回车提交
         _human_pause(0.12, 0.35)
         page.keyboard.press("Enter")
     _bu_delay("form")
+    return actual_email
 
 
 def _wait_after_email_submit_transition(page, context=None, timeout: int = 14) -> str:
@@ -575,7 +601,7 @@ def _wait_after_email_submit_transition(page, context=None, timeout: int = 14) -
     return last_state
 
 
-def _submit_email_until_transition(page, context, email: str, *, attempts: int = 2, timeout_ms: int | None = None) -> str:
+def _submit_email_until_transition(page, context, email: str | None, *, attempts: int = 2, timeout_ms: int | None = None, email_supplier=None) -> str:
     """
     填写并提交邮箱，并确认进入 password/OTP/后续页面。
     若仍停留 chatgpt.com/auth/login?email=...，重试一次，避免无效等待邮箱验证码。
@@ -584,7 +610,7 @@ def _submit_email_until_transition(page, context, email: str, *, attempts: int =
     for attempt in range(1, max(1, attempts) + 1):
         _check_manual_stop()
         logger.info("[BrowserUse] 提交邮箱尝试 %s/%s：%s", attempt, attempts, redact_email(email))
-        _type_email(page, email, timeout_ms=timeout_ms)
+        email = _type_email(page, email, timeout_ms=timeout_ms, email_supplier=email_supplier)
         _check_manual_stop()
         last_state = _wait_after_email_submit_transition(page, context=context, timeout=10 if _fast_mode() else 16)
         logger.info("[BrowserUse] 邮箱提交后状态：%s url=%s", last_state, _page_url(page) or "-")
@@ -1823,6 +1849,7 @@ def run_browser_use_registration(
     otp_code: str | None = None,
     batch_dir: Path | None = None,
     cloud_provider: str = "browser_use",
+    on_email_acquired=None,
 ) -> dict:
     """Browser Use / Skyvern 云端浏览器注册入口。proxy 参数保留兼容。"""
     try:
@@ -1851,6 +1878,19 @@ def run_browser_use_registration(
     browser = None
     context = None
     page = None
+
+    def _supply_email() -> str:
+        nonlocal email
+        was_empty = not str(email or "").strip()
+        from core.email_provider import acquire_email_after_input
+
+        email = acquire_email_after_input(email)
+        if was_empty and on_email_acquired:
+            try:
+                on_email_acquired(email)
+            except Exception as exc:
+                logger.warning("[%s] 已领取邮箱但任务状态回写失败：%s: %s", cloud_label, type(exc).__name__, exc)
+        return email
 
     logger.info(
         "[%s] 开始注册：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
@@ -1905,7 +1945,14 @@ def run_browser_use_registration(
             # OpenAI 可能在点击提交后立刻发 OTP，甚至邮件 ReceivedDateTime 早于 Playwright
             # 点击函数返回的本地时间；先记录时间戳，配合 _is_after 的时钟容忍，避免过滤掉首次验证码。
             otp_after_ts = time.time()
-            _submit_email_until_transition(page, context, email, attempts=2, timeout_ms=20000)
+            _submit_email_until_transition(
+                page,
+                context,
+                email,
+                attempts=2,
+                timeout_ms=20000,
+                email_supplier=_supply_email,
+            )
             _t_email.done()
             logger.info("[BrowserUse] 已提交邮箱：%s", redact_email(email))
             _assert_not_external_idp(page, "提交邮箱后")
@@ -1942,6 +1989,7 @@ def run_browser_use_registration(
                         email,
                         attempts=1,
                         timeout_ms=12000 if _fast_mode() else 18000,
+                        email_supplier=_supply_email,
                     )
                     _check_manual_stop()
                     logger.info("[BrowserUse][OTP] 已重新提交邮箱：%s", redact_email(email))

@@ -315,7 +315,6 @@ def _prepare_registration_args() -> tuple[str, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
     from config import register as _r, email as _e
-    from core.email_provider import acquire_email
     from core.profile_utils import generate_random_birthday
 
     email = str(getattr(_r, "REGISTER_EMAIL", "") or "").strip()
@@ -330,10 +329,10 @@ def _prepare_registration_args() -> tuple[str, str, str]:
 
     birthday = generate_random_birthday()
 
-    # 邮箱领取会把池状态置为 used，因此放在所有其他准备逻辑之后。
+    # 自动邮箱领取延迟到浏览器确认可见邮箱输入框后，避免拦截/空白页面消耗邮箱池。
     if not email:
         if _e.USE_EMAIL_SERVICE:
-            email = acquire_email()
+            return "", name, birthday
         else:
             raise RuntimeError(
                 "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
@@ -513,8 +512,16 @@ def _registration_process_entry(
         with _JobLogContext(log_file):
             from main import run_registration
 
+            def _on_email_acquired(acquired_email: str) -> None:
+                result_queue.put({"kind": "email_acquired", "email": str(acquired_email or "").strip()})
+
             logging.getLogger(__name__).info("[注册子进程] 已启动，浏览器调用与 WebUI 进程隔离")
-            result = run_registration(email=email, name=name, birthday=birthday)
+            result = run_registration(
+                email=email,
+                name=name,
+                birthday=birthday,
+                on_email_acquired=_on_email_acquired,
+            )
         result_queue.put({"kind": "result", "result": result})
     except BaseException as exc:
         try:
@@ -529,7 +536,7 @@ def _registration_process_entry(
 def _run_registration_isolated(job_id: int, log_file: str, email: str, name: str, birthday: str) -> dict:
     """Wait for a registration child while keeping stop/timeout handling in the parent."""
     context = mp.get_context("spawn")
-    result_queue = context.Queue(maxsize=1)
+    result_queue = context.Queue(maxsize=4)
     process = context.Process(
         target=_registration_process_entry,
         args=(result_queue, log_file, email, name, birthday),
@@ -588,6 +595,14 @@ def _run_registration_isolated(job_id: int, log_file: str, email: str, name: str
                 continue
             if not isinstance(message, dict):
                 raise RuntimeError("注册子进程返回了无效结果")
+            if message.get("kind") == "email_acquired":
+                acquired_email = str(message.get("email") or "").strip()
+                if not acquired_email:
+                    raise RuntimeError("注册子进程回传了空邮箱")
+                email = acquired_email
+                db.update_job(job_id, email=email)
+                _append_job_log(job_id, f"已在页面确认后领取邮箱：{redact_email(email)}")
+                continue
             if message.get("kind") == "error":
                 raise RuntimeError(str(message.get("error") or "注册子进程失败"))
             result = message.get("result")

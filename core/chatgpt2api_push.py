@@ -51,19 +51,66 @@ def _retryable_status(status_code: int) -> bool:
 
 
 def _account_payload(account: dict) -> dict:
-    """发送完整账号对象；仅移除前端计算字段，保留认证与账号元数据。"""
-    payload = dict(account)
-    payload.pop("copy_line", None)
-    # chatgpt2api 的 source_type 表示账号进入号池的路径，而 email_source
-    # 仍保留邮箱供应方（icloud/outlook 等）。两者不能混用。
-    payload["source_type"] = "register"
-    payload["type"] = str(
-        payload.get("current_plan_type")
-        or payload.get("plan_type")
-        or payload.get("type")
-        or "free"
-    ).strip().lower()
-    return payload
+    """转换为 chatgpt2api/CPA 可识别的 Codex 凭据对象。
+
+    CPA 导出使用 ``type=codex``、``email`` 和 OAuth 凭据字段。当前阶段保留
+    旧 access token，新的凭据按新 token 写入；email 和完整凭据元数据同时
+    传递，方便下游后续按邮箱归并。这里不发送注册机内部状态或邮箱池密钥。
+    """
+    access_token = str(
+        account.get("access_token")
+        or account.get("chatgpt_oauth_access_token")
+        or ""
+    ).strip()
+    email_source = str(account.get("email_source") or "").strip().lower()
+    oauth_refresh_token = str(account.get("chatgpt_refresh_token") or "").strip()
+    # Outlook 的顶层 refresh_token 属于邮箱池登录凭据，不能当成 ChatGPT
+    # OAuth refresh_token 推送；iCloud/其他邮箱的顶层字段才兼容旧格式。
+    if not oauth_refresh_token and email_source != "outlook":
+        oauth_refresh_token = str(account.get("refresh_token") or "").strip()
+    id_token = str(account.get("chatgpt_id_token") or account.get("id_token") or "").strip()
+    credential_kind = "complete" if oauth_refresh_token and id_token else "access_only"
+    payload = {
+        "type": "codex",
+        "credential_kind": credential_kind,
+        "email": str(account.get("email") or "").strip(),
+        "access_token": access_token,
+        "refresh_token": oauth_refresh_token,
+        "id_token": id_token,
+        "account_id": str(
+            account.get("chatgpt_account_id")
+            or account.get("account_id")
+            or account.get("user_id")
+            or ""
+        ).strip(),
+        "session_token": str(account.get("session_token") or "").strip(),
+        "expired": str(
+            account.get("chatgpt_token_expires_at")
+            or account.get("token_expires_at")
+            or account.get("expires_at")
+            or ""
+        ).strip(),
+        "last_refresh": str(account.get("last_refresh") or "").strip(),
+        "oauth_client_id": str(
+            account.get("chatgpt_oauth_client_id")
+            or account.get("oauth_client_id")
+            or ""
+        ).strip(),
+        "oauth_status": str(account.get("oauth_status") or ("success" if credential_kind == "complete" else "access_only")).strip(),
+        "email_source": str(account.get("email_source") or "").strip(),
+        "email_pool_status": str(
+            account.get("email_pool_status")
+            or account.get("email_status")
+            or ""
+        ).strip(),
+        "disabled": bool(account.get("disabled"))
+        or str(account.get("status") or "").strip().lower() in {"disabled", "禁用"},
+    }
+    for key in ("user_id", "user_name", "plan_type", "current_plan_type", "status", "quota", "proxy"):
+        value = account.get(key)
+        if value not in (None, ""):
+            payload[key] = value
+    return {key: value for key, value in payload.items() if value not in (None, "")}
 
 
 def push_account(
@@ -134,7 +181,14 @@ def push_account(
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    body = {"accounts": [_account_payload(account)], "refresh_after_import": False}
+    body = {
+        # 远端 AccountCreateRequest 要求 tokens；accounts 用于保留 CPA OAuth
+        # 三件套和 email 等账号元数据。当前服务端要求 tokens；保留旧 AT
+        # 时允许新 token 形成新记录，避免在覆盖前丢失旧凭据。
+        "tokens": [token],
+        "accounts": [_account_payload(account)],
+        "refresh_after_import": False,
+    }
     last_error = "push_failed"
     last_http_status = None
 

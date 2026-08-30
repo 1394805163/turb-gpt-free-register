@@ -2200,6 +2200,15 @@
               <option value="incomplete">未完成</option>
             </select>
           </label>
+          <label class="acc-v2-inline" title="按 2FA/TOTP 配置状态筛选全部账号">2FA
+            <select id="totpStatusFilterV2">
+              <option value="">全部</option>
+              <option value="enabled">已启用</option>
+              <option value="disabled">未启用</option>
+              <option value="pending">处理中</option>
+              <option value="failed">失败</option>
+            </select>
+          </label>
           <div class="acc-v2-date-select" id="dateSelectAccountsV2">
             <button type="button" class="acc-v2-date-select-btn" id="btnDateFilterAccountsV2" title="按注册时间筛选日期范围">📅 日期筛选</button>
             <div class="acc-v2-date-select-menu" id="dateFilterPanelAccountsV2"></div>
@@ -2542,6 +2551,7 @@ let SHOW_ARCHIVED_ACCOUNTS = false;
 let SHOW_PLUS_ACCOUNTS_ONLY = false;
 let SHOW_CONFIRMED_DEAD_ACCOUNTS = false;
 let ACCOUNT_OAUTH_FILTER = '';
+let ACCOUNT_TOTP_FILTER = '';
 const ACCOUNT_SELECTED = new Set();
 const ACCOUNT_CACHE = new Map();
 const OUTLOOK_SELECTED = new Set();
@@ -3306,7 +3316,7 @@ function openLog(jobId) {
   $('#logContent').textContent = '加载中…';
   pollLog();
   clearInterval(logTimer);
-  logTimer = setInterval(pollLog, 2000);
+  logTimer = setInterval(pollLog, 5000);
 }
 async function pollLog() {
   if (activeLogJob == null) return;
@@ -3349,11 +3359,12 @@ async function loadAccounts() {
     const plan = SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '';
     const status = SHOW_CONFIRMED_DEAD_ACCOUNTS ? 'confirmed_dead' : '';
     const oauth = ACCOUNT_OAUTH_FILTER;
+    const totp = ACCOUNT_TOTP_FILTER;
     const q = getAccountsQuery();
     const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
     const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
     const p = PAGERS.accounts;
-    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&status=${encodeURIComponent(status)}&oauth=${encodeURIComponent(oauth)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&status=${encodeURIComponent(status)}&oauth=${encodeURIComponent(oauth)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
     ACCOUNTS = res.items || [];
     ACCOUNTS.forEach(row => ACCOUNT_CACHE.set(Number(row.id), row));
     ACCOUNTS_TOTAL = Number(res.total || ACCOUNTS.length || 0);
@@ -3388,10 +3399,11 @@ function accountSelectionQuery(page, pageSize) {
   const plan = SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '';
   const status = SHOW_CONFIRMED_DEAD_ACCOUNTS ? 'confirmed_dead' : '';
   const oauth = ACCOUNT_OAUTH_FILTER;
+  const totp = ACCOUNT_TOTP_FILTER;
   const q = getAccountsQuery();
   const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
   const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
-  return `/api/accounts?paged=1&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&status=${encodeURIComponent(status)}&oauth=${encodeURIComponent(oauth)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`;
+  return `/api/accounts?paged=1&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&status=${encodeURIComponent(status)}&oauth=${encodeURIComponent(oauth)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`;
 }
 async function fetchAllAccountRowsForSelection() {
   const pageSize = 500;
@@ -3424,9 +3436,10 @@ async function pollAccountPlanStatuses() {
     const plan = SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '';
     const status = SHOW_CONFIRMED_DEAD_ACCOUNTS ? 'confirmed_dead' : '';
     const oauth = ACCOUNT_OAUTH_FILTER;
+    const totp = ACCOUNT_TOTP_FILTER;
     const q = getAccountsQuery();
     const p = PAGERS.accounts;
-    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&status=${encodeURIComponent(status)}&oauth=${encodeURIComponent(oauth)}&q=${encodeURIComponent(q)}`);
+    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&status=${encodeURIComponent(status)}&oauth=${encodeURIComponent(oauth)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}`);
     const items = snapshot.items || [];
     const accountById = new Map(ACCOUNTS.map(r => [Number(r.id), r]));
     const hasUnknown = items.some(item => !accountById.has(Number(item.id)));
@@ -3792,7 +3805,7 @@ function openRetryLog(email) {
   $('#retryLogContent').textContent = '加载中…';
   pollRetryLog();
   clearInterval(retryLogTimer);
-  retryLogTimer = setInterval(pollRetryLog, 2000);
+  retryLogTimer = setInterval(pollRetryLog, 5000);
 }
 async function pollRetryLog() {
   if (!retryLogEmail) return;
@@ -3821,7 +3834,7 @@ function openLiveLog(email) {
   $('#liveLogContent').textContent = '加载中…';
   pollLiveLog();
   clearInterval(liveLogTimer);
-  liveLogTimer = setInterval(pollLiveLog, 2000);
+  liveLogTimer = setInterval(pollLiveLog, 5000);
 }
 async function pollLiveLog() {
   if (!liveLogEmail) return;
@@ -4089,6 +4102,13 @@ async function applyAccountsOauthFilter(value) {
   await loadAccounts();
   await pollAccountPlanStatuses();
 }
+async function applyAccountsTotpFilter(value) {
+  ACCOUNT_TOTP_FILTER = String(value || '').trim().toLowerCase();
+  ACCOUNT_SELECTED.clear();
+  PAGERS.accounts.page = 1;
+  await loadAccounts();
+  await pollAccountPlanStatuses();
+}
 async function refreshAccountsList(btn) {
   if (!btn) return;
   const old = btn.textContent;
@@ -4129,6 +4149,8 @@ async function refreshAccountsList(btn) {
   });
   const oauthV2 = $('#oauthFilterAccountsV2');
   if (oauthV2) oauthV2.addEventListener('change', () => applyAccountsOauthFilter(oauthV2.value));
+  const totpV2 = $('#totpStatusFilterV2');
+  if (totpV2) totpV2.addEventListener('change', () => applyAccountsTotpFilter(totpV2.value));
   const refreshV2 = $('#btnRefreshAccountsV2');
   if (refreshV2) refreshV2.addEventListener('click', () => refreshAccountsList(refreshV2));
 
@@ -4953,7 +4975,7 @@ async function retrySelectedCodex() {
     loadAccounts();
     const first = (r.started || [])[0];
     if (first && first.email) openRetryLog(first.email);
-    const poll = setInterval(loadAccounts, 5000);
+    const poll = setInterval(loadAccounts, 15000);
     setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
   } catch(err) {
     showToast('批量补跑失败: ' + err.message);

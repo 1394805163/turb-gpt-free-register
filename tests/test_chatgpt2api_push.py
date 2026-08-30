@@ -80,11 +80,15 @@ class Chatgpt2ApiPushTests(unittest.TestCase):
         self.assertEqual(post.call_args.args[0], "http://TARGET:PORT/api/accounts")
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer admin-secret")
         self.assertFalse(kwargs["json"]["refresh_after_import"])
+        self.assertEqual(kwargs["json"]["tokens"], ["secret-access-token"])
         self.assertEqual(len(kwargs["json"]["accounts"]), 1)
         sent = kwargs["json"]["accounts"][0]
-        self.assertEqual(sent["id"], self.account_id)
+        self.assertEqual(sent["type"], "codex")
+        self.assertEqual(sent["credential_kind"], "access_only")
         self.assertEqual(sent["email"], "live@example.com")
         self.assertEqual(sent["access_token"], "secret-access-token")
+        self.assertEqual(sent["account_id"], "user-1")
+        self.assertNotIn("id", sent)
 
         stored = db.get_account(self.account_id)
         self.assertEqual(stored["pipeline_status"], "pushed")
@@ -114,8 +118,13 @@ class Chatgpt2ApiPushTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         sent = post.call_args.kwargs["json"]["accounts"][0]
+        self.assertEqual(post.call_args.kwargs["json"]["tokens"], ["oauth-access-token"])
+        self.assertEqual(sent["type"], "codex")
+        self.assertEqual(sent["credential_kind"], "complete")
+        self.assertEqual(sent["oauth_status"], "success")
         self.assertEqual(sent["refresh_token"], "oauth-refresh-token")
         self.assertEqual(sent["id_token"], "oauth-id-token")
+        self.assertEqual(sent["account_id"], "account-1")
         self.assertEqual(sent["oauth_client_id"], "app_2SKx67EdpoN0G6j64rFvigXD")
 
     @patch("core.chatgpt2api_push.requests.post")

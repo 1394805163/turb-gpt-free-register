@@ -515,16 +515,15 @@ def _click_email_entry_option(driver) -> bool:
     return False
 
 
-def _type_email_address(driver, email: str, timeout: int | None = None) -> None:
-    """进入邮箱登录/注册方式并填写邮箱。全程不依赖页面可见文字，避免非日本出口本地化后误点 Google。"""
+def _wait_for_email_input(driver, timeout: int | None = None):
+    """进入邮箱登录/注册方式并等待可见输入框，不消耗邮箱池素材。"""
     end = time.time() + (timeout or int(_cfg.ROXY_SELENIUM_TIMEOUT))
     last_state = None
     clicked_email_option = False
     while time.time() < end:
         el = _find_visible_email_input_js(driver)
         if el:
-            _human_type_text(driver, el, email, clear=True)
-            return
+            return el
         last_state = _email_entry_state(driver)
         if not clicked_email_option and _click_email_entry_option(driver):
             clicked_email_option = True
@@ -533,6 +532,12 @@ def _type_email_address(driver, email: str, timeout: int | None = None) -> None:
             continue
         time.sleep(0.4)
     raise RuntimeError(f"找不到邮箱输入框/邮箱入口（未使用文字识别），state={last_state}")
+
+
+def _type_email_address(driver, email: str, timeout: int | None = None) -> None:
+    """等待邮箱输入框后填写邮箱。"""
+    el = _wait_for_email_input(driver, timeout=timeout)
+    _human_type_text(driver, el, email, clear=True)
 
 
 def _submit_nearest_form_for_active_input(driver) -> bool:
@@ -1072,11 +1077,20 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     return "email_page" if _is_email_login_page_still_present(driver) else "unknown"
 
 
-def _submit_email_and_wait_next(driver, email: str, attempts: int = 3, timeout: int = 20) -> str:
+def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, timeout: int = 20, email_supplier=None) -> str:
     """填写并提交邮箱，必须确认进入 password/otp/logged_in 才返回。"""
     last_state = None
     for attempt in range(1, attempts + 1):
-        _type_email_address(driver, email, timeout=20)
+        if str(email or "").strip():
+            _type_email_address(driver, email, timeout=20)
+        else:
+            email_input = _wait_for_email_input(driver, timeout=20)
+            if email_supplier is None:
+                raise RuntimeError("已找到邮箱输入框，但没有配置邮箱供应器")
+            email = str(email_supplier() or "").strip()
+            if not email:
+                raise RuntimeError("邮箱供应器返回空邮箱")
+            _human_type_text(driver, email_input, email, clear=True)
         state = _email_input_value_state(driver)
         last_state = state
         values = [str(i.get("value") or "") for i in (state.get("inputs") or [])]
@@ -2121,13 +2135,27 @@ def _check_manual_stop() -> None:
         return
 
 
-def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = None, otp_code: str = None, batch_dir: Path | None = None) -> dict:
+def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = None, otp_code: str = None, batch_dir: Path | None = None, on_email_acquired=None) -> dict:
     """Roxy 指纹浏览器自动化注册入口。"""
     client = RoxyBrowserClient()
     opened = client.open_profile()
     driver = None
     create_acknowledged = False
     openai_password: str | None = None
+
+    def _supply_email() -> str:
+        nonlocal email
+        was_empty = not str(email or "").strip()
+        from core.email_provider import acquire_email_after_input
+
+        email = acquire_email_after_input(email)
+        if was_empty and on_email_acquired:
+            try:
+                on_email_acquired(email)
+            except Exception as exc:
+                logger.warning("[Roxy注册] 已领取邮箱但任务状态回写失败：%s: %s", type(exc).__name__, exc)
+        return email
+
     try:
         driver = _build_driver(opened)
         _center_browser_window(driver)
@@ -2155,7 +2183,12 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
 
         # 填邮箱。OpenAI UI 会随出口 IP/语言变化；这里只按 DOM 技术属性找邮箱入口，
         # 并排除 Google/Apple/Microsoft 等第三方入口，不依赖按钮可见文字。
-        next_state = _submit_email_and_wait_next(driver, email, attempts=3)
+        next_state = _submit_email_and_wait_next(
+            driver,
+            email,
+            attempts=3,
+            email_supplier=_supply_email,
+        )
         _check_manual_stop()
 
         # 新版注册流可能先进入 /create-account/password；参考 FlowPilot 的 fill-password 步骤，

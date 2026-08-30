@@ -11,6 +11,7 @@ Flask 本地控制台。
 默认绑定 127.0.0.1，仅本地访问。
 """
 import logging
+import gzip
 import threading
 import time
 import uuid
@@ -95,6 +96,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "user_name", "email_source", "note", "archived", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "oauth_status", "codex_agent_status",
+        "totp_status", "totp_enabled", "totp_setup_status",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -174,11 +176,62 @@ def _job_status_counts(rows: list[dict]) -> dict:
     counts["active"] = sum(int(counts.get(s, 0) or 0) for s in ("pending", "running", "stopping"))
     return counts
 
+
+def _client_accepts_gzip(accept_encoding: str | None) -> bool:
+    """按 HTTP Accept-Encoding 的 q 值判断客户端是否明确接受 gzip。"""
+    for item in str(accept_encoding or "").split(","):
+        parts = [part.strip() for part in item.split(";")]
+        encoding = parts[0].lower()
+        if encoding not in {"gzip", "*"}:
+            continue
+        quality = 1.0
+        for param in parts[1:]:
+            key, separator, value = param.partition("=")
+            if key.strip().lower() != "q" or not separator:
+                continue
+            try:
+                quality = float(value.strip())
+            except ValueError:
+                quality = 0.0
+            break
+        return quality > 0
+    return False
+
+
+def _maybe_compress_json_response(response: Response, accept_encoding: str | None) -> Response:
+    """压缩较大的 JSON 响应，且不改变未声明 gzip 能力的客户端语义。"""
+    if (
+        response.direct_passthrough
+        or response.headers.get("Content-Encoding")
+        or not _client_accepts_gzip(accept_encoding)
+        or (response.mimetype or "").lower() != "application/json"
+    ):
+        return response
+    data = response.get_data()
+    if len(data) < 1024:
+        return response
+    compressed = gzip.compress(data, compresslevel=6, mtime=0)
+    if len(compressed) >= len(data):
+        return response
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(compressed))
+    vary = response.headers.get("Vary")
+    response.headers["Vary"] = "Accept-Encoding" if not vary else f"{vary}, Accept-Encoding"
+    return response
+
+
 def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
     _prepared_downloads_lock = threading.Lock()
     _prepared_download_ttl_seconds = 600
+
+    @app.after_request
+    def _compress_json_response(response: Response):
+        if request.method == "HEAD":
+            return response
+        return _maybe_compress_json_response(response, request.headers.get("Accept-Encoding"))
 
     def _put_prepared_download(content: bytes, filename: str, mimetype: str = "application/zip") -> str:
         now = time.time()
@@ -353,6 +406,14 @@ def create_app(auth_code: str | None = None) -> Flask:
         plan_filter = str(request.args.get("plan", default="") or "").lower()
         status_filter = str(request.args.get("status", default="") or "").lower()
         oauth_filter = str(request.args.get("oauth", default="") or "").lower()
+        totp_filter = next(
+            (
+                str(request.args.get(key) or "").strip().lower()
+                for key in ("totp_status", "totp_filter", "twofa_status")
+                if str(request.args.get(key) or "").strip()
+            ),
+            "",
+        )
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
@@ -364,11 +425,11 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to)
+            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, totp_filter=totp_filter, q=q, date_from=date_from, date_to=date_to)
             result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
             result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
             return jsonify(result)
-        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to))
+        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, totp_filter=totp_filter, q=q, date_from=date_from, date_to=date_to))
 
     @app.get("/api/accounts/confirmed-dead.txt")
     def api_confirmed_dead_accounts_txt():
@@ -400,6 +461,14 @@ def create_app(auth_code: str | None = None) -> Flask:
         plan_filter = str(request.args.get("plan", default="") or "").lower()
         status_filter = str(request.args.get("status", default="") or "").lower()
         oauth_filter = str(request.args.get("oauth", default="") or "").lower()
+        totp_filter = next(
+            (
+                str(request.args.get(key) or "").strip().lower()
+                for key in ("totp_status", "totp_filter", "twofa_status")
+                if str(request.args.get(key) or "").strip()
+            ),
+            "",
+        )
         q = str(request.args.get("q", default="") or "").strip()
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
@@ -407,10 +476,10 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, totp_filter=totp_filter, q=q)
             snapshot.update({"page": page, "page_size": page_size})
         else:
-            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, totp_filter=totp_filter, q=q)
         snapshot["queue"] = plan_check_service.queue_settings()
         return jsonify(snapshot)
 

@@ -153,12 +153,27 @@ def run_cloak_registration(
     *,
     defer_email_release: bool = False,
     proxy_selection: dict | None = None,
+    on_email_acquired=None,
 ) -> dict:
     """CloakBrowser 自动化注册入口。"""
     driver = None
     opened = None
     create_acknowledged = False
     openai_password: str | None = None
+
+    def _supply_email() -> str:
+        nonlocal email
+        was_empty = not str(email or "").strip()
+        from core.email_provider import acquire_email_after_input
+
+        email = acquire_email_after_input(email)
+        if was_empty and on_email_acquired:
+            try:
+                on_email_acquired(email)
+            except Exception as exc:
+                logger.warning("[Cloak注册] 已领取邮箱但任务状态回写失败：%s: %s", type(exc).__name__, exc)
+        return email
+
     try:
         driver, opened = build_cloak_driver(proxy=proxy, proxy_selection=proxy_selection)
         logger.info("[Cloak注册] 开始：%s，profile=%s", redact_email(email), opened.profile_id)
@@ -181,7 +196,13 @@ def run_cloak_registration(
         # 相同出口提交失败后继续在同一页面重试意义很小；单次确认失败即交给上层换代理。
         email_step_timeout = max(20, int(getattr(_cfg, "CLOAK_EMAIL_STEP_TIMEOUT", 120) or 120))
         with _stage_deadline(driver, "登录页进入下一步", email_step_timeout):
-            next_state = _submit_email_and_wait_next(driver, email, attempts=1, timeout=email_step_timeout)
+            next_state = _submit_email_and_wait_next(
+                driver,
+                email,
+                attempts=1,
+                timeout=email_step_timeout,
+                email_supplier=_supply_email,
+            )
             _check_manual_stop()
 
         password_timeout = max(15, int(getattr(_cfg, "CLOAK_PASSWORD_PAGE_TIMEOUT", 45) or 45))

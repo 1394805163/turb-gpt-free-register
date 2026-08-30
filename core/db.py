@@ -579,6 +579,8 @@ def _decorate_account(row: dict) -> dict:
     out = dict(row)
     out["note"] = out.get("note") or ""
     out["note_updated_at"] = out.get("note_updated_at") or ""
+    out["totp_status"] = _totp_status(out)
+    out["totp_enabled"] = out["totp_status"] == "enabled"
     if "image_quota" in out and "生图额度:" not in out["note"]:
         if out.get("image_quota_unknown"):
             quota_note = "生图额度: 未知"
@@ -1692,7 +1694,43 @@ def _oauth_filter_matches(row: dict, oauth_filter: str | None) -> bool:
     return True
 
 
-def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+def _totp_status(row: dict) -> str:
+    setup_status = str(row.get("totp_setup_status") or "").strip().lower()
+    if setup_status in {"queued", "running"}:
+        return "pending"
+    if setup_status == "failed":
+        return "failed"
+    return "enabled" if str(row.get("totp_secret") or "").strip() else "disabled"
+
+
+def _matches_totp_status_filter(row: dict, totp_filter: str | None = None) -> bool:
+    wanted = str(totp_filter or "").strip().lower()
+    if not wanted or wanted in {"all", "any"}:
+        return True
+    aliases = {
+        "on": "enabled",
+        "active": "enabled",
+        "off": "disabled",
+        "none": "disabled",
+        "processing": "pending",
+        "error": "failed",
+    }
+    wanted = aliases.get(wanted, wanted)
+    has_secret = bool(str(row.get("totp_secret") or "").strip())
+    setup_status = str(row.get("totp_setup_status") or "").strip().lower()
+    if wanted == "enabled":
+        return has_secret
+    if wanted == "disabled":
+        return not has_secret
+    if wanted == "pending":
+        return setup_status in {"queued", "running"}
+    if wanted == "failed":
+        return setup_status == "failed"
+    # 保留对未来 setup 状态的兼容：未知筛选值按原始状态精确匹配。
+    return str(row.get("totp_setup_status") or "").strip().lower() == wanted
+
+
+def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None, totp_filter: str | None = None) -> list[dict]:
     rows = _load_accounts()
     if archived in (True, "1", "true", "yes", "only"):
         rows = [r for r in rows if bool(r.get("archived"))]
@@ -1702,6 +1740,7 @@ def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filte
         rows = [r for r in rows if not bool(r.get("archived"))]
     decorated = [_decorate_account(r) for r in rows]
     decorated = [r for r in decorated if _oauth_filter_matches(r, oauth_filter)]
+    decorated = [r for r in decorated if _matches_totp_status_filter(r, totp_filter)]
     decorated = [r for r in decorated if _account_matches_plan_filter(r, plan_filter)]
     wanted_status = str(status_filter or "").strip().lower()
     if wanted_status and wanted_status not in {"all", "any"}:
@@ -1729,7 +1768,7 @@ def _filtered_decorated_accounts(archived: str | bool | None = False, plan_filte
     return sorted(decorated, key=lambda x: int(x.get("id") or 0), reverse=True)
 
 
-def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None) -> dict:
+def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, totp_filter: str | None = None) -> dict:
     """返回不含 Token/邮箱密码的套餐查询轻量状态快照。"""
     fields = (
         "id", "email", "archived",
@@ -1750,9 +1789,10 @@ def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archive
         "codex_agent_status", "codex_agent_message",
         "codex_agent_runtime_id", "codex_agent_sub2api_url",
         "codex_agent_sub2api_mode", "codex_agent_sub2api_total",
+        "totp_status", "totp_enabled", "totp_setup_status",
     )
     with _LOCK:
-        all_rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q)
+        all_rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, totp_filter=totp_filter, q=q)
         total = len(all_rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
@@ -1802,15 +1842,15 @@ def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archive
         return {"items": items, "total": total, "offset": offset, "limit": limit, "revision": f"{total}:{latest}:{revision_sig}"}
 
 
-def list_accounts(limit: int = 500, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+def list_accounts(limit: int = 500, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None, totp_filter: str | None = None) -> list[dict]:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, totp_filter=totp_filter, q=q, date_from=date_from, date_to=date_to)
         return rows[max(0, int(offset or 0)): max(0, int(offset or 0)) + max(1, int(limit))]
 
 
-def list_accounts_page(limit: int = 50, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None) -> dict:
+def list_accounts_page(limit: int = 50, offset: int = 0, archived: str | bool | None = False, plan_filter: str | None = None, status_filter: str | None = None, oauth_filter: str | None = None, q: str | None = None, date_from: str | None = None, date_to: str | None = None, totp_filter: str | None = None) -> dict:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, q=q, date_from=date_from, date_to=date_to)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, status_filter=status_filter, oauth_filter=oauth_filter, totp_filter=totp_filter, q=q, date_from=date_from, date_to=date_to)
         total = len(rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))

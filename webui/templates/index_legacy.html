@@ -480,6 +480,15 @@
             <label class="inline-num" title="只查询/显示已开通 Plus 的账号">
               <input id="showPlusAccountsOnly" type="checkbox" style="width:auto;min-height:auto;"> 已开通Plus
             </label>
+            <label class="inline-num" title="按 2FA/TOTP 配置状态筛选全部账号">2FA
+              <select id="totpStatusFilter">
+                <option value="">全部</option>
+                <option value="enabled">已启用</option>
+                <option value="disabled">未启用</option>
+                <option value="pending">处理中</option>
+                <option value="failed">失败</option>
+              </select>
+            </label>
             <button class="btn" id="btnRefreshAccounts" title="重新加载当前筛选条件和当前页账号列表">刷新账号</button>
           </div>
         </div>
@@ -683,6 +692,7 @@ let ACCOUNTS_TOTAL = 0;
 let OUTLOOK_TOTAL = 0;
 let SHOW_ARCHIVED_ACCOUNTS = false;
 let SHOW_PLUS_ACCOUNTS_ONLY = false;
+let ACCOUNT_TOTP_FILTER = '';
 const ACCOUNT_SELECTED = new Set();
 const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
@@ -1178,7 +1188,7 @@ function openLog(jobId) {
   $('#logContent').textContent = '加载中…';
   pollLog();
   clearInterval(logTimer);
-  logTimer = setInterval(pollLog, 2000);
+  logTimer = setInterval(pollLog, 5000);
 }
 async function pollLog() {
   if (activeLogJob == null) return;
@@ -1206,9 +1216,10 @@ async function loadAccounts() {
   try {
     const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
     const plan = SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '';
+    const totp = ACCOUNT_TOTP_FILTER;
     const q = $('#qAccounts') ? $('#qAccounts').value.trim() : '';
     const p = PAGERS.accounts;
-    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&q=${encodeURIComponent(q)}`);
+    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}`);
     ACCOUNTS = res.items || [];
     ACCOUNTS_TOTAL = Number(res.total || ACCOUNTS.length || 0);
     const totalPages = Math.max(1, Math.ceil(ACCOUNTS_TOTAL / p.size));
@@ -1223,9 +1234,10 @@ async function pollAccountPlanStatuses() {
   try {
     const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
     const plan = SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '';
+    const totp = ACCOUNT_TOTP_FILTER;
     const q = $('#qAccounts') ? $('#qAccounts').value.trim() : '';
     const p = PAGERS.accounts;
-    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&q=${encodeURIComponent(q)}`);
+    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}`);
     const items = snapshot.items || [];
     const accountById = new Map(ACCOUNTS.map(r => [Number(r.id), r]));
     const hasUnknown = items.some(item => !accountById.has(Number(item.id)));
@@ -1544,7 +1556,7 @@ function openRetryLog(email) {
   $('#retryLogContent').textContent = '加载中…';
   pollRetryLog();
   clearInterval(retryLogTimer);
-  retryLogTimer = setInterval(pollRetryLog, 2000);
+  retryLogTimer = setInterval(pollRetryLog, 5000);
 }
 async function pollRetryLog() {
   if (!retryLogEmail) return;
@@ -1573,7 +1585,7 @@ function openLiveLog(email) {
   $('#liveLogContent').textContent = '加载中…';
   pollLiveLog();
   clearInterval(liveLogTimer);
-  liveLogTimer = setInterval(pollLiveLog, 2000);
+  liveLogTimer = setInterval(pollLiveLog, 5000);
 }
 async function pollLiveLog() {
   if (!liveLogEmail) return;
@@ -1795,6 +1807,13 @@ $('#showArchivedAccounts').addEventListener('change', async (e) => {
 });
 $('#showPlusAccountsOnly').addEventListener('change', async (e) => {
   SHOW_PLUS_ACCOUNTS_ONLY = !!e.target.checked;
+  ACCOUNT_SELECTED.clear();
+  PAGERS.accounts.page = 1;
+  await loadAccounts();
+  await pollAccountPlanStatuses();
+});
+$('#totpStatusFilter').addEventListener('change', async (e) => {
+  ACCOUNT_TOTP_FILTER = String(e.target.value || '').trim().toLowerCase();
   ACCOUNT_SELECTED.clear();
   PAGERS.accounts.page = 1;
   await loadAccounts();
@@ -2402,7 +2421,7 @@ async function retrySelectedCodex() {
     loadAccounts();
     const first = (r.started || [])[0];
     if (first && first.email) openRetryLog(first.email);
-    const poll = setInterval(loadAccounts, 5000);
+    const poll = setInterval(loadAccounts, 15000);
     setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
   } catch(err) {
     showToast('批量补跑失败: ' + err.message);

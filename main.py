@@ -38,7 +38,7 @@ from core.account_export import (
     create_batch_archive_dir,
 )
 from core.pipeline_concurrency import pipeline_limited
-from core.email_provider import acquire_email, wait_for_otp
+from core.email_provider import acquire_email_after_input, wait_for_otp
 from core.humanize import delay as human_delay
 from core.log_safety import redact_email, redact_emails
 from core.name_samples import random_display_name
@@ -136,11 +136,10 @@ def prepare_registration_inputs() -> tuple[str, str, str]:
     name = REGISTER_NAME
     birthday = generate_random_birthday()
 
-    # 邮箱：留空 + USE_EMAIL_SERVICE=True 时从 Outlook 池领取
+    # 自动邮箱延迟到浏览器确认输入框后领取，避免 Cloudflare/空白页面消耗邮箱池素材。
     if not email:
         if _email_cfg.USE_EMAIL_SERVICE:
-            email = acquire_email()
-            logger.debug("自动获取邮箱: %s", redact_email(email))
+            logger.debug("自动邮箱模式：等待注册驱动确认邮箱输入框后领取")
         else:
             email = input("请输入注册邮箱: ").strip()
 
@@ -153,7 +152,7 @@ def prepare_registration_inputs() -> tuple[str, str, str]:
         else:
             name = input("请输入显示名称: ").strip()
 
-    if not all([email, name]):
+    if not name:
         raise RuntimeError("邮箱和名称不能为空")
 
     return email, name, birthday
@@ -166,6 +165,7 @@ def run_registration(
     proxy: str = None,
     otp_code: str = None,
     batch_dir=None,
+    on_email_acquired=None,
 ):
     """
     执行完整的 ChatGPT 注册流程（OTP-only，无密码）。
@@ -189,6 +189,19 @@ def run_registration(
     #   browser_use  = Browser Use Cloud stealth Chromium + Playwright
     #   skyvern      = Skyvern Browser Sessions + Playwright
     driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+
+    def _handle_email_acquired(acquired_email: str) -> None:
+        nonlocal email, redacted_email
+        email = str(acquired_email or "").strip()
+        if not email:
+            raise RuntimeError("邮箱供应器返回空邮箱")
+        redacted_email = redact_email(email)
+        if on_email_acquired:
+            try:
+                on_email_acquired(email)
+            except Exception as exc:
+                logger.warning("[注册] 已领取邮箱但任务状态回写失败：%s: %s", type(exc).__name__, exc)
+
     if driver_mode in ("roxy", "roxybrowser", "fingerprint", "browser"):
         from core.roxy_registration import run_roxy_registration
         return run_roxy_registration(
@@ -198,6 +211,7 @@ def run_registration(
             proxy=proxy,
             otp_code=otp_code,
             batch_dir=batch_dir,
+            on_email_acquired=_handle_email_acquired,
         )
     if driver_mode in ("cloak", "cloakbrowser"):
         from config import cloakbrowser as _cloak_cfg
@@ -301,6 +315,7 @@ def run_registration(
                     otp_code=otp_code,
                     batch_dir=batch_dir,
                     defer_email_release=True,
+                    on_email_acquired=_handle_email_acquired,
                     proxy_selection=proxy_selection or {
                         "mode": "resin",
                         "proxy_url": selected_proxy,
@@ -359,6 +374,7 @@ def run_registration(
             proxy=proxy,
             otp_code=otp_code,
             batch_dir=batch_dir,
+            on_email_acquired=_handle_email_acquired,
         )
     if driver_mode in ("skyvern", "sv"):
         from core.skyvern_registration import run_skyvern_registration
@@ -369,6 +385,7 @@ def run_registration(
             proxy=proxy,
             otp_code=otp_code,
             batch_dir=batch_dir,
+            on_email_acquired=_handle_email_acquired,
         )
     if driver_mode not in ("protocol", "api", "http"):
         raise RuntimeError(
@@ -376,6 +393,8 @@ def run_registration(
         )
 
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
+    if not str(email or "").strip():
+        _handle_email_acquired(acquire_email_after_input(email))
     session = BrowserSession(proxy=proxy)
 
     # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印

@@ -134,6 +134,21 @@ def acquire_email() -> str:
     raise RuntimeError(f"所有邮箱来源均领取失败: {sources}; last={last_exc}")
 
 
+def acquire_email_after_input(email: str | None = None) -> str:
+    """固定邮箱直接复用；自动模式延迟到页面确认输入框后再领取邮箱。"""
+    fixed = str(email or "").strip()
+    if fixed:
+        return fixed
+    try:
+        from config import email as _email_cfg
+        use_service = bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
+    except Exception:
+        use_service = True
+    if not use_service:
+        raise RuntimeError("当前未启用自动邮箱服务，无法延迟领取邮箱")
+    return acquire_email()
+
+
 def resolve_email_source(email: str) -> str:
     """根据邮箱在各池中的归属判断实际来源。"""
     from core.icloud_mail_client import get_account_context as get_icloud_context
