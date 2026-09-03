@@ -138,4 +138,4 @@ sudo journalctl -u turb-gpt-register.service -n 100 --no-pager
 - 账号 JSON、OAuth `access_token/refresh_token/id_token`、iCloud 邮箱池、IMAP 专用密码、`.env` 都是运行时秘密，禁止提交 GitHub、日志和工单。
 - 备份只允许保存在服务器受限目录；目录 `700`，文件 `600`，服务使用非 root 用户运行。
 - 更新失败时先停止服务并恢复本次更新前的 `.env`、`data/` 和账号池备份，再启动验收；不要删除旧备份。
-- 生产环境先保持总在途工作峰值为 `2`，确认 Resin 预检、Cloak doctor、账号导入和查活稳定后再调整并发。
+- 生产环境先保持总在途工作峰值为 `1`，确认 Resin 预检、Cloak doctor、账号导入和查活稳定后再调整并发。

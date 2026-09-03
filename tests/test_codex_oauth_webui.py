@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 from pathlib import Path
 
@@ -19,6 +20,10 @@ def _account(account_id: int, email: str, *, created_at: str, token_expires_at: 
     }
 
 
+def _iso_days_ago(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
 class CodexOAuthWebUiTests(unittest.TestCase):
     def setUp(self):
         self.app = webui_app.create_app(auth_code="test-auth")
@@ -29,8 +34,8 @@ class CodexOAuthWebUiTests(unittest.TestCase):
         account = _account(
             1,
             "new@example.com",
-            created_at="2026-08-22T12:00:00+00:00",
-            token_expires_at="2026-08-30T12:00:00+00:00",
+            created_at=_iso_days_ago(1),
+            token_expires_at=_iso_days_ago(-5),
             token_expired=False,
         )
         queued = {"accepted": True, "status": "queued", "account_id": 1}
@@ -56,15 +61,15 @@ class CodexOAuthWebUiTests(unittest.TestCase):
         old = _account(
             1,
             "old@example.com",
-            created_at="2026-08-12T12:00:00+00:00",
-            token_expires_at="2026-08-21T12:00:00+00:00",
+            created_at=_iso_days_ago(10),
+            token_expires_at=_iso_days_ago(1),
             token_expired=True,
         )
         new = _account(
             2,
             "new@example.com",
-            created_at="2026-08-22T12:00:00+00:00",
-            token_expires_at="2026-08-30T12:00:00+00:00",
+            created_at=_iso_days_ago(1),
+            token_expires_at=_iso_days_ago(-5),
             token_expired=False,
         )
         accounts = {1: old, 2: new}
