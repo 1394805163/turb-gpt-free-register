@@ -1418,14 +1418,31 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
   }
 
   const tokenText = await context.SentinelSDK.token(flow);
-  clearTimers();
-  if (!writeOutput) return tokenText;
-  if (args.pretty || process.env.SENTINEL_PRETTY === "1") {
-    process.stdout.write(`${JSON.stringify(JSON.parse(tokenText), null, 2)}\n`);
-  } else {
-    process.stdout.write(`${tokenText}\n`);
+  let mergedText = tokenText;
+  try {
+    if (typeof context.SentinelSDK.sessionObserverToken === "function") {
+      const soResult = await context.SentinelSDK.sessionObserverToken(flow);
+      const soValue = soResult && typeof soResult === "object" ? soResult.so : soResult;
+      if (soValue) {
+        const merged = JSON.parse(tokenText);
+        merged.so = soValue;
+        mergedText = JSON.stringify(merged);
+        process.stderr.write("[SentinelRunner] SO token 已生成\n");
+      } else {
+        process.stderr.write("[SentinelRunner] sessionObserverToken 未返回 SO\n");
+      }
+    }
+  } catch (soError) {
+    process.stderr.write(`[SentinelRunner] SO 生成失败: ${soError && soError.message}\n`);
   }
-  return tokenText;
+  clearTimers();
+  if (!writeOutput) return mergedText;
+  if (args.pretty || process.env.SENTINEL_PRETTY === "1") {
+    process.stdout.write(`${JSON.stringify(JSON.parse(mergedText), null, 2)}\n`);
+  } else {
+    process.stdout.write(`${mergedText}\n`);
+  }
+  return mergedText;
 }
 
 if (require.main === module) {

@@ -314,8 +314,31 @@ def build_sentinel_header(session: BrowserSession, sentinel_resp: dict, flow: st
     # 解析 runner 输出，单独抽出 so 字段填充 openai-sentinel-so-token
     so_header = None
     try:
+        import base64 as _b64
+
         parsed = json.loads(header_value)
         so_value = parsed.get("so")
+        if so_value:
+            # SDK 内部异常时会返回带 base64 错误信息的 SO 字段（形如
+            # {"so":"MDogU3ludGF4..."}），这种值不能当 token 使用，直接丢弃。
+            def _so_invalid(value: object) -> bool:
+                text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                try:
+                    inner = json.loads(text)
+                except Exception:
+                    inner = None
+                candidate = str(inner.get("so") or "") if isinstance(inner, dict) else text
+                if not candidate:
+                    return True
+                try:
+                    decoded = _b64.b64decode(candidate + "==", validate=False)[:80]
+                except Exception:
+                    decoded = b""
+                return b"Error" in decoded or b"error" in decoded
+
+            if _so_invalid(so_value):
+                logger.warning("[Sentinel] SO 字段疑似 SDK 错误输出，已丢弃")
+                so_value = None
         if so_value:
             so_header = json.dumps(
                 {
