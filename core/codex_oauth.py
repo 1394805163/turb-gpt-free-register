@@ -127,7 +127,7 @@ def _generate_state() -> str:
 
 
 def _build_authorize_url(state: str, code_challenge: str, prompt: str = "login") -> str:
-    """按 chatgpt2api OAuth 服务的参数集拼授权 URL。"""
+    """按 v0.9.2 的 OAuth 兼容参数集拼授权 URL。"""
     params = {
         "client_id": _cfg.CODEX_CLIENT_ID,
         "audience": "https://api.openai.com/v1",
@@ -840,6 +840,32 @@ def _submit_email_otp(session: BrowserSession, code: str) -> None:
             f"[Codex] 邮箱 OTP 验证失败 status={resp.status_code}: {(resp.text or '')[:300]}"
         )
     logger.info("[Codex] 邮箱 OTP 验证通过")
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def _pass_mfa_challenge(session: BrowserSession, email: str, challenge_resp: dict) -> str:
+    """账号启用 2FA：用本地 totp_secret 生成动态码通过 mfa_challenge。"""
+    page = (challenge_resp or {}).get("page") or {}
+    page = page if isinstance(page, dict) else {}
+    factors = (page.get("payload") or {}).get("factors") or []
+    factor_id = str((factors[0] or {}).get("id") or "") if factors else ""
+    from core import db
+
+    secret = str((db.get_account_by_email(email) or {}).get("totp_secret") or "").strip()
+    if not secret:
+        raise RuntimeError("[Codex] 账号已启用 2FA 但本地缺少 totp_secret，无法自动登录")
+    if not factor_id:
+        raise RuntimeError(f"[Codex] mfa_challenge 缺少 factor id: {page.get('payload')}")
+    import pyotp
+    from core.openai_auth import validate_mfa_totp
+
+    referer = str((challenge_resp or {}).get("continue_url") or "https://auth.openai.com/mfa-challenge")
+    continue_url = validate_mfa_totp(session, pyotp.TOTP(secret).now(), factor_id, referer=referer)
+    logger.info("[Codex] 2FA 动态码已通过：%s", redact_email(email))
+    return continue_url
 
 
 # ============================================================
@@ -1460,7 +1486,9 @@ def run_codex_oauth(
                 human_delay("api")
         logger.info("[Codex] 邮箱 OTP 已收到，code_len=%s", len(str(email_otp or "")))
         human_delay("otp_input")
-        _submit_email_otp(session, email_otp)
+        otp_resp = _submit_email_otp(session, email_otp)
+        if str(((otp_resp or {}).get("page") or {}).get("type") or "") == "mfa_challenge":
+            _pass_mfa_challenge(session, email, otp_resp)
         human_delay("api")
 
         # 5. 手机号验证（接码，自动重试换号）

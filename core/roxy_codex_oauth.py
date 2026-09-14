@@ -32,6 +32,7 @@ from core.roxy_registration import (
     _is_email_verification_page,
     _is_login_password_page,
     _click_passwordless_signup_if_present,
+    _pass_mfa_challenge_if_needed,
 )
 
 _base_logger = logging.getLogger(__name__)
@@ -358,6 +359,8 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         outcome = _wait_after_email_otp_submit(driver, timeout=45)
         logger.info("[Codex][Browser] 邮箱 OTP 提交后状态：%s", outcome)
         if outcome == "accepted":
+            if _pass_mfa_challenge_if_needed(driver, email):
+                logger.info("[Codex][Browser] 2FA 动态码已通过，继续授权流程")
             return
         if str(outcome).startswith("deactivated:"):
             error_code = str(outcome).split(":", 1)[1] or "account_deactivated"
