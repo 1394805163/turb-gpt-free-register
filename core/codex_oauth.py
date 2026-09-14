@@ -895,6 +895,9 @@ def _do_phone_verification(session: BrowserSession) -> None:
         - SMS_PROVIDER="grizzly"：GrizzlySMS handler_api.php
         - SMS_PROVIDER="l"：L_API.md 的 /take-phone 和 /fetch-code JSON 接口
     """
+    if bool(getattr(_cfg, "CODEX_OAUTH_SKIP_PHONE_VERIFICATION", True)):
+        logger.info("[Codex] 已关闭短信接码；手机号步骤直接交给后续流程，不调用短信平台")
+        return
     http = sms_provider._http()
     max_retries = _cfg.SMS_MAX_RETRIES
     provider = _sms_provider_name()
