@@ -19,6 +19,7 @@ from core.roxy_registration import (
     _is_chatgpt_logged_in_page,
     _is_email_verification_page,
     _maybe_accept,
+    _pass_mfa_challenge_if_needed,
     _submit_email_and_wait_next,
     _type_otp,
     _wait_after_email_otp_submit,
@@ -136,6 +137,8 @@ def run_cloak_liveness_flow(
             outcome = _wait_after_email_otp_submit(driver, timeout=otp_submit_timeout)
             logger.info("[Cloak查活][OTP] 提交结果：%s", outcome)
             if outcome == "accepted":
+                if _pass_mfa_challenge_if_needed(driver, email, timeout=max(otp_submit_timeout, 25)):
+                    logger.info("[Cloak查活][OTP] 2FA 动态码已通过，继续读取登录态")
                 break
             if _is_chatgpt_logged_in_page(driver):
                 logger.info("[Cloak查活][OTP] 提交结果为 %s 但页面已登录，跳过重发并继续", outcome)

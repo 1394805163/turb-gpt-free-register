@@ -1113,6 +1113,38 @@ def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, ti
     raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")
 
 
+def _is_mfa_challenge_page(driver) -> bool:
+    """检测是否进入 2FA（mfa-challenge）页面。"""
+    try:
+        url = str(driver.current_url or "").lower()
+    except Exception:
+        return False
+    return "mfa-challenge" in url or "mfa_challenge" in url
+
+
+def _pass_mfa_challenge_if_needed(driver, email: str, timeout: int = 25) -> bool:
+    """账号启用 2FA 时，用本地保存的 totp_secret 生成动态码通过 mfa-challenge。"""
+    if not _is_mfa_challenge_page(driver):
+        return False
+    from core import db
+
+    acc = db.get_account_by_email(email) or {}
+    secret = str(acc.get("totp_secret") or "").strip()
+    if not secret:
+        raise RuntimeError("账号已启用 2FA 但本地缺少 totp_secret，无法自动登录")
+    import pyotp
+
+    code = pyotp.TOTP(secret).now()
+    logger.info("%s 检测到 2FA 挑战页，提交动态码（totp_secret 已配置）", _log_prefix(driver))
+    _clear_otp_inputs(driver)
+    _type_otp(driver, code)
+    human_delay("otp_input")
+    _click_continue(driver)
+    outcome = _wait_after_email_otp_submit(driver, timeout=timeout)
+    logger.info("%s 2FA 动态码提交结果：%s", _log_prefix(driver), outcome)
+    return outcome == "accepted"
+
+
 def _type_otp(driver, code: str) -> None:
     from selenium.webdriver.common.by import By
 

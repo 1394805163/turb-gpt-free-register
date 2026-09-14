@@ -499,6 +499,32 @@ def validate_email_otp(session: BrowserSession, code: str, sentinel_header: str 
     return data
 
 
+def validate_mfa_totp(session: BrowserSession, code: str, factor_id: str, *, referer: str = "") -> str:
+    """步骤10.6: 提交 TOTP 动态码，通过 mfa_challenge（账号已启用 2FA）。
+
+    POST https://auth.openai.com/api/accounts/mfa/verify
+    Body: {"type": "totp", "code": "<6位>", "id": "<factor_id>"}
+
+    Returns:
+        continue_url（下一步地址，通常是 OAuth callback）
+    """
+    url = "https://auth.openai.com/api/accounts/mfa/verify"
+    headers = session.get_auth_headers(referer=referer or "https://auth.openai.com/mfa-challenge")
+    body = json.dumps({"type": "totp", "code": str(code or ""), "id": str(factor_id or "")})
+
+    logger.info("[MFA] 提交 TOTP 动态码，code_len=%s", len(str(code or "")))
+    resp = session.post(url, headers=headers, data=body)
+    if resp.status_code != 200:
+        logger.error("[MFA] TOTP 提交失败 status=%s", resp.status_code)
+        resp.raise_for_status()
+    data = resp.json()
+    continue_url = data.get("continue_url") or data.get("url")
+    if not continue_url:
+        raise RuntimeError(f"MFA 验证响应缺少 continue_url: {sorted(str(k) for k in data.keys())}")
+    logger.info("[MFA] TOTP 验证通过，continue_url=%s", str(continue_url)[:90])
+    return str(continue_url)
+
+
 def create_account(session: BrowserSession, name: str, birthday: str, sentinel_header: str, so_header: str = None) -> dict:
     """
     步骤12: 提交用户信息，完成注册。

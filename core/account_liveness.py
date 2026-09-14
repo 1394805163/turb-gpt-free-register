@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from core import db
 from core.session import BrowserSession
 from core.chatgpt_auth import get_providers, get_csrf_token, signin_openai
 from core.openai_auth import (
@@ -138,6 +139,27 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _pass_mfa_challenge(session: BrowserSession, email: str, challenge: dict) -> dict:
+    """账号已启用 2FA：用本地 totp_secret 生成动态码通过 mfa_challenge。"""
+    page = challenge.get("page") if isinstance(challenge, dict) else {}
+    page = page if isinstance(page, dict) else {}
+    factors = ((page.get("payload") or {}).get("factors") or [])
+    factor_id = str((factors[0] or {}).get("id") or "") if factors else ""
+    acc = db.get_account_by_email(email) or {}
+    secret = str(acc.get("totp_secret") or "").strip()
+    if not secret:
+        raise RuntimeError("账号已启用 2FA 但本地缺少 totp_secret，无法自动登录")
+    if not factor_id:
+        raise RuntimeError(f"mfa_challenge 缺少 factor id: {page.get('payload')}")
+    import pyotp
+    from core.openai_auth import validate_mfa_totp
+
+    referer = str(challenge.get("continue_url") or "https://auth.openai.com/mfa-challenge")
+    continue_url = validate_mfa_totp(session, pyotp.TOTP(secret).now(), factor_id, referer=referer)
+    logger.info("[查活] 2FA 动态码已通过：%s", redact_email(email))
+    return {"continue_url": continue_url, "page": {}}
+
+
 def log_path(email: str) -> Path:
     return _LOG_DIR / f"live-check-email-{email_fingerprint(email)}.log"
 
@@ -264,6 +286,11 @@ def check_account_liveness(
         page = validate_result.get("page") if isinstance(validate_result, dict) else {}
         page = page if isinstance(page, dict) else {}
         page_type = str(page.get("type") or "")
+        if page_type == "mfa_challenge":
+            validate_result = _pass_mfa_challenge(session, email, validate_result)
+            page = validate_result.get("page") if isinstance(validate_result, dict) else {}
+            page = page if isinstance(page, dict) else {}
+            page_type = str(page.get("type") or "")
         continue_url = (
             validate_result.get("continue_url")
             or validate_result.get("external_url")
