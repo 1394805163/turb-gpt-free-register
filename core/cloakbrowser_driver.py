@@ -13,6 +13,18 @@ from config import cloakbrowser as _cfg
 
 logger = logging.getLogger(__name__)
 
+# 页面跳转会销毁 JS 执行上下文（Playwright 报 "Execution context was
+# destroyed, most likely because of a navigation"）；这类错误等页面稳定后重试。
+_NAVIGATION_CONTEXT_ERROR_HINTS = (
+    "execution context was destroyed",
+    "because of a navigation",
+)
+
+
+def _is_navigation_context_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(hint in text for hint in _NAVIGATION_CONTEXT_ERROR_HINTS)
+
 
 def _proxy_log_label(proxy_url: str | None) -> str:
     """生成不含账号、密码和 sticky identity 的代理日志标签。"""
@@ -272,6 +284,28 @@ class CloakSeleniumDriver:
             return self.page.locator(f"xpath={selector}")
         return self.page.locator(selector)
 
+    def _wait_navigation_settle(self) -> None:
+        """页面正在跳转时先等 DOM 就绪，再重试同一段脚本。"""
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        try:
+            self.page.wait_for_timeout(250)
+        except Exception:
+            time.sleep(0.25)
+
+    def _call_page_js(self, call: Any) -> Any:
+        """page 级 evaluate/evaluate_handle：导航销毁上下文时等待稳定重试一次。"""
+        try:
+            return call()
+        except Exception as exc:
+            if not _is_navigation_context_error(exc):
+                raise
+            logger.info("[Cloak] 页面跳转销毁 JS 执行上下文，等待稳定后重试：%s", str(exc)[:160])
+            self._wait_navigation_settle()
+            return call()
+
     def execute_script(self, script: str, *args: Any) -> Any:
         return self._evaluate(script, args=args, async_mode=False)
 
@@ -359,7 +393,9 @@ class CloakSeleniumDriver:
             if first_el is not None:
                 result = first_el._eval(element_wrapper, {"script": script, "args": serial_args})
             else:
-                result = self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+                result = self._call_page_js(
+                    lambda: self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+                )
             if isinstance(result, dict) and result.get("__cloak_timeout"):
                 raise TimeoutError("execute_async_script timeout")
             return result
@@ -377,7 +413,9 @@ class CloakSeleniumDriver:
         if first_el is not None:
             handle = first_el._eval_handle(element_wrapper, {"script": script, "args": serial_args})
         else:
-            handle = self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
+            handle = self._call_page_js(
+                lambda: self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
+            )
         return self._unwrap_js_result(self.page, handle)
 
 
