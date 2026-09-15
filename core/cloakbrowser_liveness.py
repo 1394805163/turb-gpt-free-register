@@ -87,7 +87,7 @@ def run_cloak_liveness_flow(
         human_delay("navigate")
 
         email_timeout = _setting_int("CLOAK_EMAIL_STEP_TIMEOUT", 120, 20)
-        _submit_email_and_wait_next(driver, email, attempts=1, timeout=email_timeout)
+        _submit_email_and_wait_next(driver, email, attempts=2, timeout=email_timeout)
         _fill_password_page_if_present(
             driver,
             email,

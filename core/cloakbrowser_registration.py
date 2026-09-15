@@ -223,7 +223,7 @@ def run_cloak_registration(
             next_state = _submit_email_and_wait_next(
                 driver,
                 email,
-                attempts=1,
+                attempts=2,
                 timeout=email_step_timeout,
                 email_supplier=_supply_email,
             )
