@@ -30,6 +30,10 @@ SENTINEL_POST_PATHS = (
     "/api/accounts/phone-otp/validate",
     "/api/accounts/user/register",
     "/api/accounts/create_account",
+    # 无密码账号"补设密码"走的重置流程：同样需要 sentinel，否则被 Cloudflare 403。
+    "/api/accounts/passwordless/send-otp",
+    "/api/accounts/password/send-otp",
+    "/api/accounts/password/reset",
 )
 
 _FETCH_JS = r"""
