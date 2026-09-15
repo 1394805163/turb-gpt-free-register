@@ -464,7 +464,7 @@
 
   <!-- ============ 账号 ============ -->
   <div id="tab-accounts" class="hidden">
-    <div class="banner info">快速测活/查套餐：验证现有 Token，无需邮箱 OTP；OAuth 持久化：账号满 7 天且没有 refresh_token 即可处理，未满年龄的账号自动转轻量查活。</div>
+    <div class="banner info">快速测活/查套餐：验证现有 Token，无需邮箱 OTP；OAuth 持久化：账号达到当前配置的最小年龄（{{ codex_oauth_min_age_days }} 天）且没有 refresh_token 即可处理，未满年龄的账号自动转轻量查活。</div>
     <section class="card">
       <div class="toolbar accounts-toolbar">
         <div class="accounts-topbar">
@@ -507,7 +507,7 @@
           </div>
           <div class="btn-group">
             <span class="btn-group-title">Codex</span>
-            <button class="btn primary" id="btnRetrySelectedCodex" disabled title="批量执行 OAuth 持久化；未满 7 天的账号自动转轻量查活">OAuth持久化（满7天）</button>
+            <button class="btn primary" id="btnRetrySelectedCodex" disabled title="批量执行 OAuth 持久化；未达到当前配置年龄的账号自动转轻量查活">OAuth持久化（按配置年龄）</button>
             <button class="btn good" id="btnDownloadSelectedCpa" disabled title="导出选中账号本地已持久化的完整 OAuth 凭据，并打包 ZIP">导出完整OAuth</button>
             <button class="btn danger" id="btnStopSelectedCodex" disabled title="停止选中账号中正在补跑的 Codex 授权">停止</button>
           </div>
@@ -1388,6 +1388,21 @@ function _planCell(r) {
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
   return `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
 }
+function _imageQuotaCell(r) {
+  const hasQuotaState = ['image_quota', 'image_quota_unknown', 'image_quota_checked_at', 'image_quota_error']
+    .some(key => Object.prototype.hasOwnProperty.call(r, key));
+  if (!hasQuotaState) return '';
+  const raw = r.image_quota;
+  const number = Number(raw);
+  const unknown = r.image_quota_unknown === true || raw === null || raw === undefined || raw === '' || Number.isNaN(number);
+  const value = unknown ? '未知' : String(Math.max(0, Math.trunc(number)));
+  const checkedAt = r.image_quota_checked_at ? `查询: ${r.image_quota_checked_at}` : '尚未完成额度查询';
+  const resetAt = r.image_quota_reset_at ? `重置: ${r.image_quota_reset_at}` : '';
+  const error = r.image_quota_error ? `错误: ${r.image_quota_error}` : '';
+  const title = [checkedAt, resetAt, error].filter(Boolean).join('；');
+  const cls = unknown ? 'status-failed' : number <= 5 ? 'status-running' : 'status-success';
+  return `<div class="sub-cell" title="${esc(title)}"><span class="pill ${cls}">生图额度: ${esc(value)}</span></div>`;
+}
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {
     const automatic = r.plan_check_trigger === 'registration_auto';
@@ -1447,8 +1462,9 @@ function _codexAction(r) {
   }
   if (s === 'deactivated') return '';
   const eligibility = r.oauth_eligibility || {};
+  const minAgeDays = Number.isFinite(Number(eligibility.min_age_days)) ? Number(eligibility.min_age_days) : {{ codex_oauth_min_age_days }};
   if (eligibility.eligible === false && eligibility.reason_code !== 'oauth_already_persisted') {
-    return `<button disabled title="${esc(eligibility.reason || '账号未满 7 天，当前只允许轻量查活')}">待满7天·查活</button>`;
+    return `<button disabled title="${esc(eligibility.reason || ('账号未达到 ' + minAgeDays + ' 天，当前只允许轻量查活'))}">待${minAgeDays}天·查活</button>`;
   }
   if (eligibility.reason_code === 'oauth_already_persisted') {
     return `<span class="pill status-success" title="${esc(eligibility.reason || 'OAuth 凭据已持久化')}">OAuth已完成</span>`;
@@ -1478,7 +1494,7 @@ function renderAccounts() {
       <td><div class="main-cell">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div><div class="sub-cell">${esc(r.user_name || '-')}</div></td>
       <td>${esc(r.email_source || '-')}</td>
       <td><span class="mono" title="列表仅显示预览，完整 Token 请点复制">${r.has_access_token ? '有Token' : '<span class="muted">无Token</span>'}</span>${_liveStatusSub(r)}</td>
-      <td>${_planCell(r)}<div class="sub-cell">${_extractLinkCell(r)}</div></td>
+      <td>${_planCell(r)}${_imageQuotaCell(r)}<div class="sub-cell">${_extractLinkCell(r)}</div></td>
       <td class="wrap" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="muted">-</span>'}</td>
       <td>${r.totp_enabled ? '已启用' : '<span class="muted">未启用</span>'}</td>
       <td>${_codexCell(r)}</td>
@@ -2402,7 +2418,7 @@ async function retrySelectedCodex() {
 
 并发线程数：${workers}
 
-达到条件的账号会消耗邮箱 OTP 和接码短信；未满 7 天的账号自动改为轻量查活。`;
+达到条件的账号会消耗邮箱 OTP 和接码短信；未达到当前配置年龄（{{ codex_oauth_min_age_days }} 天）的账号自动改为轻量查活。`;
   if (retryingCount || deactivatedCount) msg += `
 
 其中：补跑中 ${retryingCount} 个、已废号 ${deactivatedCount} 个会自动跳过。`;

@@ -12,18 +12,19 @@ from core import codex_oauth, codex_retry_service, db
 
 
 class DirectOAuthPersistenceTests(unittest.TestCase):
-    def test_authorize_url_uses_chatgpt2api_oauth_parameters(self):
-        with patch.object(codex_config, "CODEX_CLIENT_ID", "app_2SKx67EdpoN0G6j64rFvigXD"), patch.object(
-            codex_config, "CODEX_AUTH_URL", "https://auth.openai.com/api/accounts/authorize"
-        ), patch.object(codex_config, "CODEX_REDIRECT_URI", "https://platform.openai.com/auth/callback"):
-            url = codex_oauth._build_authorize_url("state-fixture", "challenge-fixture")
+    def test_authorize_url_uses_v092_compatible_oauth_parameters(self):
+        url = codex_oauth._build_authorize_url("state-fixture", "challenge-fixture")
 
         query = parse_qs(urlparse(url).query)
         self.assertEqual(query["client_id"], ["app_2SKx67EdpoN0G6j64rFvigXD"])
-        self.assertEqual(query["redirect_uri"], ["https://platform.openai.com/auth/callback"])
         self.assertEqual(query["audience"], ["https://api.openai.com/v1"])
+        self.assertEqual(query["redirect_uri"], ["https://platform.openai.com/auth/callback"])
+        self.assertEqual(query["scope"], ["openid profile email offline_access"])
         self.assertEqual(query["state"], ["state-fixture"])
         self.assertEqual(query["code_challenge"], ["challenge-fixture"])
+        self.assertEqual(query["screen_hint"], ["login_or_signup"])
+        self.assertEqual(query["max_age"], ["0"])
+        self.assertEqual(query["auth0Client"], [codex_config.CODEX_AUTH0_CLIENT])
 
     def test_platform_callback_is_accepted_by_browser_flow(self):
         from core import roxy_codex_oauth

@@ -96,6 +96,40 @@ class CodexOAuthWebUiTests(unittest.TestCase):
         enqueue.assert_called_once()
         thread.assert_called_once()
 
+    def test_bulk_force_oauth_bypasses_gate_and_uses_program_worker(self):
+        account = _account(
+            8,
+            "historic@example.com",
+            created_at=_iso_days_ago(30),
+            token_expires_at=_iso_days_ago(1),
+            token_expired=True,
+        )
+        account.update({
+            "chatgpt_refresh_token": "existing-refresh",
+            "chatgpt_id_token": "existing-id",
+        })
+        with patch.object(webui_app.db, "get_account", return_value=account), patch.object(
+            webui_app,
+            "evaluate_oauth_eligibility",
+            return_value={"eligible": False, "reason_code": "existing_oauth"},
+        ), patch.object(webui_app.codex_retry_service, "reserve", return_value=True), patch.object(
+            webui_app.plan_check_service,
+            "enqueue_account_plan_check",
+        ) as enqueue, patch.object(webui_app.threading, "Thread") as thread:
+            response = self.client.post(
+                "/api/codex/retry-bulk",
+                headers=self.headers,
+                json={"account_ids": [8], "workers": 1, "force_oauth": True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertTrue(body["force_oauth"])
+        self.assertEqual(body["started_count"], 1)
+        self.assertEqual(body["simple_check_started_count"], 0)
+        enqueue.assert_not_called()
+        thread.assert_called_once()
+
     def test_account_toolbar_uses_clicked_button_for_live_check_and_distinguishes_oauth(self):
         root = Path(__file__).resolve().parent.parent
         template = (root / "webui/templates/index.html").read_text(encoding="utf-8")
@@ -103,10 +137,26 @@ class CodexOAuthWebUiTests(unittest.TestCase):
         self.assertEqual(template.count('id="btnCheckSelectedLiveV2"'), 1)
         self.assertIn("'btnCheckSelectedLiveV2'", template)
         self.assertIn("批量查活/刷新 AT", template)
-        self.assertIn("OAuth持久化（满7天）", template)
+        self.assertIn("OAuth持久化（按配置年龄）", template)
+        self.assertNotIn("OAuth持久化（满7天）", template)
         legacy = (root / "webui/templates/index_legacy.html").read_text(encoding="utf-8")
         self.assertEqual(legacy.count('id="btnCheckSelectedLiveTop"'), 0)
         self.assertEqual(legacy.count('id="btnCheckSelectedLive"'), 1)
+
+    def test_oauth_age_is_rendered_from_runtime_configuration_in_both_templates(self):
+        from config import codex
+
+        with patch.object(codex, "CODEX_OAUTH_MIN_AGE_DAYS", 3):
+            self.client.post("/login", data={"auth_code": "test-auth", "next": "/"})
+            modern = self.client.get("/?ui=modern")
+            legacy = self.client.get("/?ui=legacy")
+
+        self.assertEqual(modern.status_code, 200)
+        self.assertEqual(legacy.status_code, 200)
+        self.assertIn("3 天", modern.get_data(as_text=True))
+        self.assertIn("3 天", legacy.get_data(as_text=True))
+        self.assertNotIn("满 7 天", modern.get_data(as_text=True))
+        self.assertNotIn("满 7 天", legacy.get_data(as_text=True))
 
     def test_token_check_button_is_explicitly_separate_from_email_refresh(self):
         template = (Path(__file__).resolve().parent.parent / "webui/templates/index.html").read_text(encoding="utf-8")

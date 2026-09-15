@@ -85,10 +85,16 @@ Thumbs.db
 webui.log
 webui.pid
 logs/
-run/
+run/*
+!run/
+run/*
+!run/oauth-persistence-smoke.py
 .learnings/
 .tmp/
 output/
+
+# SQLite 运行库（含账号凭据与任务状态）
+turb.sqlite3*
 
 # HAR 是本地忽略输入，仓库只保留脱敏分析结论。
 Default-all-domains-*.json

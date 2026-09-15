@@ -14,6 +14,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import closing
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -40,6 +41,16 @@ _CODEX_DIR = _PROJECT_ROOT / "codex_accounts"
 # 导出状态单独存：{ "codex-邮箱-plan.json": {"exported_at": "...", "exported_count": N} }
 # 不污染 CPA 兼容的原文件
 _CODEX_EXPORT_STATE = _PROJECT_ROOT / "codex_导出状态.json"
+
+# SQLite 是运行时唯一的业务主存储；JSON/TXT 只在首次启动时迁移，
+# 保留原文件路径是为了兼容旧部署、备份和现有导入导出接口。
+_SQLITE_PATH = _PROJECT_ROOT / "turb.sqlite3"
+_SQLITE_LOCK = threading.RLock()
+_SQLITE_READY = False
+_SQLITE_READY_PATH: Path | None = None
+_DEFAULT_ACCOUNTS_JSON = _ACCOUNTS_JSON
+_DEFAULT_OUTLOOK_JSON = _OUTLOOK_JSON
+_DEFAULT_JOBS_JSON = _JOBS_JSON
 
 _LEGACY_SQLITE = _LEGACY_DATA_DIR / "registrations.db"
 _LEGACY_OUTLOOK_JSON = _LEGACY_DATA_DIR / "outlook_accounts.json"
@@ -68,6 +79,56 @@ def _token_fingerprint(token: str) -> str:
 def token_fingerprint(token: str) -> str:
     """返回可用于并发 CAS 的 Token 短哈希，不暴露 Token 明文。"""
     return _token_fingerprint(token)
+
+
+def _reset_token_bound_runtime_state(row: dict, *, reason: str) -> None:
+    """令新 access token 重新经过查活、额度查询和推送。
+
+    OAuth 凭据更新后，旧 token 的 live/plan/push 结果都不再能证明新 token
+    有效。历史成功时间和结果 JSON 保留作审计，但当前状态统一回到待确认，
+    避免旧状态把新凭据直接当成已推送账号。
+    """
+    row["pipeline_status"] = "pending"
+
+    row["live_check_status"] = "pending"
+    row["live_check_ok"] = False
+    row["live_check_method"] = None
+    row["live_checked_at"] = None
+    row["live_check_error"] = reason
+    row["live_check_proxy_used"] = None
+    row["needs_live_check"] = True
+
+    row["plan_check_status"] = "pending"
+    row["plan_check_ok"] = False
+    row["plan_check_error"] = reason
+    row["plan_check_http_status"] = None
+    row["plan_checked_at"] = None
+    row["plan_check_queued_at"] = None
+    row["plan_check_started_at"] = None
+    row["plan_check_completed_at"] = None
+    row["plan_check_proxy_mode"] = None
+    row["plan_check_network_route"] = None
+    row["plan_check_proxy_used"] = None
+    row["plan_check_proxy_fallback_reason"] = None
+    row["plan_check_result_json"] = None
+    row["plan_check_auto_retry_count"] = 0
+
+    row["image_quota"] = None
+    row["image_quota_reset_at"] = None
+    row["image_quota_unknown"] = True
+    row["image_quota_checked_at"] = None
+    row["image_quota_error"] = reason
+
+    row["push_status"] = "pending"
+    row["push_claim_fingerprint"] = None
+    row["push_token_fingerprint"] = None
+    row["push_error"] = None
+    row["push_next_retry_at"] = None
+    row["push_http_status"] = None
+    row["push_attempts"] = 0
+    row["push_started_at"] = None
+    row["push_last_attempt_at"] = None
+    row["push_completed_at"] = None
 
 
 def _run_debounced_static_viewer_refresh(generation: int | None = None) -> None:
@@ -114,6 +175,209 @@ def _schedule_static_viewer_refresh(reason: str = "") -> None:
 def _ensure_storage() -> None:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _active_sqlite_path() -> Path:
+    """返回当前数据库路径；测试替换 JSON 路径时同步隔离数据库。"""
+    if (
+        _ACCOUNTS_JSON != _DEFAULT_ACCOUNTS_JSON
+        or _OUTLOOK_JSON != _DEFAULT_OUTLOOK_JSON
+        or _JOBS_JSON != _DEFAULT_JOBS_JSON
+    ):
+        return _ACCOUNTS_JSON.parent / "turb.sqlite3"
+    return _SQLITE_PATH
+
+
+def _sqlite_conn() -> sqlite3.Connection:
+    """创建短生命周期连接，启用 WAL 和等待锁，兼容 Windows/Linux。"""
+    _ensure_storage()
+    conn = sqlite3.connect(str(_active_sqlite_path()), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _json_rows_for_migration(path: Path, fallback: list[dict] | None = None) -> list[dict]:
+    """读取一次性迁移源，不把迁移过程误判为运行时 JSON 存储。"""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else fallback
+    except Exception:
+        value = fallback
+    return [dict(item) for item in value] if isinstance(value, list) and all(isinstance(item, dict) for item in value) else []
+
+
+def _ensure_sqlite() -> None:
+    """首次启动把历史 JSON 导入 SQLite，之后 SQLite 成为唯一运行时读写源。"""
+    global _SQLITE_READY, _SQLITE_READY_PATH
+    active_path = _active_sqlite_path()
+    if _SQLITE_READY and _SQLITE_READY_PATH == active_path:
+        return
+    with _SQLITE_LOCK:
+        active_path = _active_sqlite_path()
+        if _SQLITE_READY and _SQLITE_READY_PATH == active_path:
+            return
+        conn = _sqlite_conn()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
+                CREATE INDEX IF NOT EXISTS idx_accounts_created_at ON accounts(created_at);
+                CREATE TABLE IF NOT EXISTS email_pool (
+                    source TEXT NOT NULL,
+                    id INTEGER NOT NULL,
+                    email TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY(source, id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_email_pool_email ON email_pool(email);
+                CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(source, status);
+                CREATE TABLE IF NOT EXISTS registration_jobs (
+                    id INTEGER PRIMARY KEY,
+                    email_source TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON registration_jobs(created_at);
+                CREATE TABLE IF NOT EXISTS storage_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            migrated = conn.execute(
+                "SELECT value FROM storage_meta WHERE key='migration_complete'"
+            ).fetchone()
+            if migrated is None:
+                accounts = _json_rows_for_migration(_ACCOUNTS_JSON, [])
+                if not accounts and _ACCOUNTS_JSON == _DEFAULT_ACCOUNTS_JSON:
+                    accounts = _json_rows_for_migration(_LEGACY_ACCOUNTS_JSON, [])
+                outlook = _json_rows_for_migration(_OUTLOOK_JSON, [])
+                if not outlook and _OUTLOOK_JSON == _DEFAULT_OUTLOOK_JSON:
+                    outlook = _json_rows_for_migration(_LEGACY_OUTLOOK_JSON, [])
+                generic = _json_rows_for_migration(_GENERIC_API_EMAIL_JSON, [])
+                jobs = _json_rows_for_migration(_JOBS_JSON, [])
+                if not jobs and _JOBS_JSON == _DEFAULT_JOBS_JSON:
+                    jobs = _json_rows_for_migration(_LEGACY_JOBS_JSON, [])
+                domain_path = globals().get("_DOMAIN_EMAIL_JSON")
+                domain = _json_rows_for_migration(domain_path, []) if isinstance(domain_path, Path) else []
+
+                for row in accounts:
+                    row_id = int(row.get("id") or 0)
+                    if row_id <= 0:
+                        continue
+                    conn.execute(
+                        "INSERT OR IGNORE INTO accounts(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+                        (row_id, str(row.get("email") or ""), str(row.get("status") or ""), int(bool(row.get("archived"))), str(row.get("created_at") or ""), str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)),
+                    )
+                for source, rows in (("outlook", outlook), ("generic_api", generic), ("cloudflare_domain", domain)):
+                    for row in rows:
+                        row_id = int(row.get("id") or 0)
+                        if row_id <= 0:
+                            continue
+                        conn.execute(
+                            "INSERT OR IGNORE INTO email_pool(source,id,email,status,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+                            (source, row_id, str(row.get("email") or ""), str(row.get("status") or ""), str(row.get("created_at") or row.get("imported_at") or ""), str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)),
+                        )
+                for row in jobs:
+                    row_id = int(row.get("id") or 0)
+                    if row_id <= 0:
+                        continue
+                    conn.execute(
+                        "INSERT OR IGNORE INTO registration_jobs(id,email_source,status,created_at,updated_at,payload) VALUES(?,?,?,?,?,?)",
+                        (row_id, str(row.get("email_source") or ""), str(row.get("status") or ""), str(row.get("created_at") or ""), str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)),
+                    )
+                conn.execute(
+                    "INSERT INTO storage_meta(key,value) VALUES('migration_complete','1')"
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        _SQLITE_READY = True
+        _SQLITE_READY_PATH = active_path
+
+
+def _collection_table(collection: str) -> tuple[str, str | None]:
+    if collection == "accounts":
+        return "accounts", None
+    if collection == "outlook":
+        return "email_pool", "outlook"
+    if collection == "generic_api":
+        return "email_pool", "generic_api"
+    if collection == "domain":
+        return "email_pool", "cloudflare_domain"
+    if collection == "jobs":
+        return "registration_jobs", None
+    raise ValueError(f"未知 SQLite 集合: {collection}")
+
+
+def _load_collection(collection: str) -> list[dict]:
+    _ensure_sqlite()
+    table, source = _collection_table(collection)
+    with closing(_sqlite_conn()) as conn:
+        if source is None:
+            rows = conn.execute(f"SELECT payload FROM {table} ORDER BY id").fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT payload FROM {table} WHERE source=? ORDER BY id", (source,)
+            ).fetchall()
+    output = []
+    for row in rows:
+        try:
+            value = json.loads(row["payload"])
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            output.append(value)
+    return output
+
+
+def _save_collection(collection: str, rows: list[dict]) -> None:
+    _ensure_sqlite()
+    table, source = _collection_table(collection)
+    with _SQLITE_LOCK, closing(_sqlite_conn()) as conn:
+        if source is None:
+            conn.execute(f"DELETE FROM {table}")
+            for row in rows or []:
+                row_id = int(row.get("id") or 0)
+                if row_id <= 0:
+                    continue
+                if collection == "accounts":
+                    conn.execute(
+                        "INSERT INTO accounts(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+                        (row_id, str(row.get("email") or ""), str(row.get("status") or ""), int(bool(row.get("archived"))), str(row.get("created_at") or ""), str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO registration_jobs(id,email_source,status,created_at,updated_at,payload) VALUES(?,?,?,?,?,?)",
+                        (row_id, str(row.get("email_source") or ""), str(row.get("status") or ""), str(row.get("created_at") or ""), str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)),
+                    )
+        else:
+            conn.execute("DELETE FROM email_pool WHERE source=?", (source,))
+            for row in rows or []:
+                row_id = int(row.get("id") or 0)
+                if row_id <= 0:
+                    continue
+                conn.execute(
+                    "INSERT INTO email_pool(source,id,email,status,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+                    (source, row_id, str(row.get("email") or ""), str(row.get("status") or ""), str(row.get("created_at") or row.get("imported_at") or ""), str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)),
+                )
+        conn.commit()
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -519,55 +783,45 @@ render();
 
 
 def _load_outlook() -> list[dict]:
-    rows = _read_json(_OUTLOOK_JSON, None)
-    if not isinstance(rows, list):
-        rows = _read_json(_LEGACY_OUTLOOK_JSON, [])
-    return rows if isinstance(rows, list) else []
+    return _load_collection("outlook")
 
 
 def _save_outlook(rows: list[dict]) -> None:
-    _write_json(_OUTLOOK_JSON, rows)
+    _save_collection("outlook", rows)
     _sync_outlook_txt(rows)
     _schedule_static_viewer_refresh("save_outlook")
 
 
 def _load_generic_api_emails() -> list[dict]:
-    rows = _read_json(_GENERIC_API_EMAIL_JSON, [])
-    return rows if isinstance(rows, list) else []
+    return _load_collection("generic_api")
 
 
 def _save_generic_api_emails(rows: list[dict]) -> None:
     for row in rows:
         row["copy_line"] = _generic_api_email_line(row)
-    _write_json(_GENERIC_API_EMAIL_JSON, rows)
+    _save_collection("generic_api", rows)
     _sync_generic_api_email_txt(rows)
 
 
 def _load_accounts() -> list[dict]:
-    rows = _read_json(_ACCOUNTS_JSON, None)
-    if not isinstance(rows, list):
-        rows = _read_json(_LEGACY_ACCOUNTS_JSON, [])
-    return rows if isinstance(rows, list) else []
+    return _load_collection("accounts")
 
 
 def _save_accounts(rows: list[dict]) -> None:
     for row in rows:
         row["copy_line"] = _account_line(row)
-    _write_json(_ACCOUNTS_JSON, rows)
+    _save_collection("accounts", rows)
     _sync_accounts_txt(rows)
     _sync_tokens_txt(rows)
     _schedule_static_viewer_refresh("save_accounts")
 
 
 def _load_jobs() -> list[dict]:
-    rows = _read_json(_JOBS_JSON, None)
-    if not isinstance(rows, list):
-        rows = _read_json(_LEGACY_JOBS_JSON, [])
-    return rows if isinstance(rows, list) else []
+    return _load_collection("jobs")
 
 
 def _save_jobs(rows: list[dict]) -> None:
-    _write_json(_JOBS_JSON, rows)
+    _save_collection("jobs", rows)
 
 
 def _find_by_email(rows: list[dict], email: str) -> dict | None:
@@ -581,7 +835,32 @@ def _decorate_account(row: dict) -> dict:
     out["note_updated_at"] = out.get("note_updated_at") or ""
     out["totp_status"] = _totp_status(out)
     out["totp_enabled"] = out["totp_status"] == "enabled"
-    if "image_quota" in out and "生图额度:" not in out["note"]:
+    quota_keys = {
+        "image_quota",
+        "image_quota_reset_at",
+        "image_quota_unknown",
+        "image_quota_checked_at",
+        "image_quota_error",
+    }
+    # 套餐查询成功才会在同一会话里完成额度探测。历史记录若正处于排队、
+    # 运行或失败状态，旧数字只能作为历史值，不能继续当作当前额度下发。
+    # 这里只改返回视图，不改数据库中的历史值；下一次刷新结果会由
+    # update_account_plan_check 正式落盘。
+    if out.get("plan_check_status") in {"queued", "running", "failed"}:
+        out["image_quota"] = None
+        out["image_quota_reset_at"] = None
+        out["image_quota_unknown"] = True
+        if out.get("plan_check_status") == "failed":
+            out["image_quota_error"] = out.get("plan_check_error") or "本次套餐查询失败，额度待确认"
+        else:
+            out["image_quota_error"] = "本次套餐查询尚未完成，额度待确认"
+
+    if quota_keys.intersection(out):
+        note_lines = [
+            line.strip()
+            for line in str(out.get("note") or "").splitlines()
+            if line.strip() and not line.strip().startswith("生图额度:")
+        ]
         if out.get("image_quota_unknown"):
             quota_note = "生图额度: 未知"
         else:
@@ -589,7 +868,8 @@ def _decorate_account(row: dict) -> dict:
             quota_note = f"生图额度: {value}"
         if out.get("image_quota_reset_at"):
             quota_note += f"；重置: {out['image_quota_reset_at']}"
-        out["note"] = f"{out['note']}\n{quota_note}".strip()
+        note_lines.append(quota_note)
+        out["note"] = "\n".join(note_lines)
     plan_status = out.get("plan_check_status")
     if plan_status in {"queued", "running"}:
         try:
@@ -901,8 +1181,8 @@ def _extract_chatgpt_oauth_credential(value: object) -> dict | None:
 def update_account_chatgpt_oauth(email: str, credential: dict, expected_access_token: str | None = None) -> dict:
     """原子写入已有账号的 ChatGPT OAuth 凭据，不覆盖 Outlook 邮箱凭据。"""
     normalized = _extract_chatgpt_oauth_credential(credential)
-    if normalized is None:
-        return {"updated": False, "reason": "缺少 access_token 或 refresh_token"}
+    if normalized is None or not normalized.get("id_token"):
+        return {"updated": False, "reason": "缺少完整 OAuth 凭据（需要 access_token/refresh_token/id_token）"}
     target_email = str(email or normalized.get("email") or "").strip()
     if not target_email:
         return {"updated": False, "reason": "email 为空"}
@@ -938,9 +1218,14 @@ def update_account_chatgpt_oauth(email: str, credential: dict, expected_access_t
         row["chatgpt_credential_source"] = normalized.get("source") or "codex_oauth"
         row["chatgpt_credential_updated_at"] = now
         row["oauth_status"] = "success"
+        row["credential_kind"] = "complete"
         row["oauth_completed_at"] = now
         row["credential_source"] = normalized.get("source") or "codex_oauth"
         row["credential_updated_at"] = now
+        _reset_token_bound_runtime_state(
+            row,
+            reason="OAuth 凭据已更新，等待使用新 access_token 重新查活",
+        )
         row["updated_at"] = now
         _save_accounts(accounts)
         return {"updated": True, "account_id": int(row.get("id") or 0), "email": target_email}
@@ -1415,7 +1700,7 @@ def update_account_plan_check(
     expected_token_fingerprint: str | None = None,
 ) -> bool:
     """更新账号套餐/Plus 试用资格查询结果。"""
-    result = result or {}
+    result = dict(result or {})
     with _LOCK:
         accounts = _load_accounts()
         target_email = (email or "").lower()
@@ -1428,6 +1713,25 @@ def update_account_plan_check(
             return False
 
         ok = bool(result.get("ok"))
+        # 额度和套餐来自同一次刷新。若本次刷新在 accounts/check、代理预检或
+        # Token 检查阶段失败，结果里不会有 image_quota 字段；继续保留旧数字会
+        # 让列表把上一次成功值误认为当前额度。历史成功结果由
+        # plan_last_success_result_json 保留，当前可用额度必须明确标记为未知。
+        quota_keys = {
+            "image_quota",
+            "image_quota_reset_at",
+            "image_quota_unknown",
+            "image_quota_checked_at",
+            "image_quota_error",
+        }
+        if not ok and not quota_keys.intersection(result):
+            result.update({
+                "image_quota": None,
+                "image_quota_reset_at": None,
+                "image_quota_unknown": True,
+                "image_quota_checked_at": result.get("checked_at") or _now(),
+                "image_quota_error": result.get("error") or "套餐查询失败，未获取生图额度",
+            })
         if (
             expected_token_fingerprint is not None
             and _token_fingerprint(row.get("access_token") or "") != expected_token_fingerprint
@@ -1777,6 +2081,8 @@ def list_account_plan_check_statuses(limit: int = 5000, offset: int = 0, archive
         "plan_check_trigger", "plan_check_queued_at", "plan_check_started_at",
         "plan_check_completed_at", "plan_checked_at", "plan_last_success_at",
         "plan_check_network_route", "plan_check_proxy_used", "plan_check_proxy_fallback_reason",
+        "image_quota", "image_quota_reset_at", "image_quota_unknown",
+        "image_quota_checked_at", "image_quota_error",
         "expires_at", "plan_expires_at", "plan_renews_at", "renews_at",
         "billing_period", "billing_currency", "discount_amount", "discount_type",
         "discount_expires_at", "discount_promo_campaign_id",
@@ -1882,6 +2188,58 @@ def update_account_note(acc_id: int, note: str) -> bool:
         row["note"] = str(note or "")
         row["note_updated_at"] = now
         row["updated_at"] = now
+        _save_accounts(rows)
+        return True
+
+
+def update_account_registration_password(email: str, password: str) -> bool:
+    """记录/覆盖账号的 OpenAI 登录密码（补设密码或密码注册后调用）。
+
+    写入 extra_json.registration_password（与注册流程的字段保持一致），
+    同时同步顶层 password 字段，便于导出与人工登录。
+    """
+    target = str(email or "").strip().lower()
+    if not target or not str(password or "").strip():
+        return False
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if str(r.get("email") or "").strip().lower() == target), None)
+        if row is None:
+            return False
+        extra = row.get("extra_json")
+        if isinstance(extra, str) and extra.strip():
+            try:
+                extra_data = json.loads(extra)
+            except Exception:
+                extra_data = {}
+        elif isinstance(extra, dict):
+            extra_data = dict(extra)
+        else:
+            extra_data = {}
+        if not isinstance(extra_data, dict):
+            extra_data = {}
+        extra_data["registration_password"] = str(password)
+        row["extra_json"] = json.dumps(extra_data, ensure_ascii=False)
+        row["password"] = str(password)
+        row["password_updated_at"] = _now()
+        row["updated_at"] = _now()
+        _save_accounts(rows)
+        return True
+
+
+def update_account_totp_secret(email: str, secret: str) -> bool:
+    """记录/覆盖账号的 TOTP secret（补设 2FA 后调用）。"""
+    target = str(email or "").strip().lower()
+    if not target or not str(secret or "").strip():
+        return False
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if str(r.get("email") or "").strip().lower() == target), None)
+        if row is None:
+            return False
+        row["totp_secret"] = str(secret)
+        row["totp_updated_at"] = _now()
+        row["updated_at"] = _now()
         _save_accounts(rows)
         return True
 
@@ -3261,12 +3619,14 @@ def migrate_legacy_files() -> dict:
 
 
 def db_path() -> Path:
-    """兼容旧名称，返回当前文件存储目录。"""
-    return _DATA_DIR
+    """兼容旧名称，返回当前 SQLite 数据库路径。"""
+    _ensure_sqlite()
+    return _active_sqlite_path()
 
 
 def storage_paths() -> dict:
     return {
+        "sqlite": str(_active_sqlite_path()),
         "outlook_json": str(_OUTLOOK_JSON),
         "outlook_txt": str(_OUTLOOK_TXT),
         "accounts_json": str(_ACCOUNTS_JSON),
@@ -3297,12 +3657,11 @@ _DOMAIN_EMAIL_JSON = _PROJECT_ROOT / "用于注册的域名邮箱.json"
 
 
 def _load_domain_pool() -> list[dict]:
-    rows = _read_json(_DOMAIN_EMAIL_JSON, [])
-    return rows if isinstance(rows, list) else []
+    return _load_collection("domain")
 
 
 def _save_domain_pool(rows: list[dict]) -> None:
-    _write_json(_DOMAIN_EMAIL_JSON, rows)
+    _save_collection("domain", rows)
 
 
 def _find_domain_email(rows: list[dict], email: str) -> dict | None:

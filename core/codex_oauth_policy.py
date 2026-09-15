@@ -37,6 +37,16 @@ def _as_bool(value: Any) -> bool | None:
     return None
 
 
+def configured_min_age_days(value: Any = None) -> int:
+    """读取并规范化 OAuth 最小账号年龄，供策略和 WebUI 共用。"""
+    if value is None:
+        value = getattr(_cfg, "CODEX_OAUTH_MIN_AGE_DAYS", 7)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 7
+
+
 def evaluate_oauth_eligibility(
     account: dict[str, Any] | None,
     *,
@@ -53,12 +63,7 @@ def evaluate_oauth_eligibility(
     """
     row = account if isinstance(account, dict) else {}
     current = _parse_datetime(now) or datetime.now(timezone.utc)
-    if min_age_days is None:
-        min_age_days = getattr(_cfg, "CODEX_OAUTH_MIN_AGE_DAYS", 7)
-    try:
-        min_age_days = max(0, int(min_age_days))
-    except (TypeError, ValueError):
-        min_age_days = 7
+    min_age_days = configured_min_age_days(min_age_days)
     if require_expired_token is None:
         require_expired_token = bool(getattr(_cfg, "CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN", False))
 
@@ -68,6 +73,7 @@ def evaluate_oauth_eligibility(
             "action": "plan_check",
             "reason_code": "oauth_already_persisted",
             "reason": "已有 ChatGPT refresh_token，无需重复 OAuth",
+            "min_age_days": min_age_days,
         }
 
     created_at = _parse_datetime(row.get("created_at"))
@@ -79,6 +85,7 @@ def evaluate_oauth_eligibility(
             "reason_code": "account_too_new",
             "reason": f"账号未达到最小等待期 {min_age_days} 天",
             "eligible_at": eligible_at.isoformat(),
+            "min_age_days": min_age_days,
         }
     if not created_at and min_age_days > 0:
         return {
@@ -86,6 +93,7 @@ def evaluate_oauth_eligibility(
             "action": "plan_check",
             "reason_code": "created_at_missing",
             "reason": "缺少注册时间，不能执行完整 OAuth",
+            "min_age_days": min_age_days,
         }
 
     expires_at = _parse_datetime(
@@ -102,6 +110,7 @@ def evaluate_oauth_eligibility(
                 "reason_code": "token_not_expired",
                 "reason": "access_token 尚未到期，当前只允许轻量查活",
                 "token_expires_at": expires_at.isoformat(),
+                "min_age_days": min_age_days,
             }
         if not expires_at and token_expired is False:
             return {
@@ -109,6 +118,7 @@ def evaluate_oauth_eligibility(
                 "action": "plan_check",
                 "reason_code": "token_not_expired",
                 "reason": "账号标记为 access_token 未到期，当前只允许轻量查活",
+                "min_age_days": min_age_days,
             }
 
     age_days = (current - created_at).total_seconds() / 86400 if created_at else None
@@ -120,4 +130,5 @@ def evaluate_oauth_eligibility(
         "age_days": round(age_days, 2) if age_days is not None else None,
         "eligible_at": eligible_at.isoformat() if eligible_at else None,
         "token_expires_at": expires_at.isoformat() if expires_at else None,
+        "min_age_days": min_age_days,
     }

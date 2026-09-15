@@ -285,15 +285,22 @@ def _probe_image_quota(env: BrowserSession, token: str, timeout: float) -> dict[
             timeout=max(0.1, float(timeout)),
         )
         if int(response.status_code) != 200:
+            status = int(response.status_code)
             return {
                 "image_quota": None,
                 "image_quota_reset_at": None,
                 "image_quota_unknown": True,
-                "image_quota_error": f"HTTP {int(response.status_code)}",
+                "image_quota_error": f"HTTP {status}",
+                "image_quota_http_status": status,
+                "image_quota_retryable": _retryable_plan_error(status),
             }
         result = extract_image_quota(response.json())
         result["image_quota_checked_at"] = now_iso()
         result["image_quota_error"] = None
+        result["image_quota_http_status"] = 200
+        # 没有 limits_progress 是合法的“未知额度”，不能因为未知值而
+        # 无限轮换出口；只有明确的请求失败才触发下一次代理重试。
+        result["image_quota_retryable"] = False
         return result
     except Exception as exc:
         return {
@@ -302,6 +309,8 @@ def _probe_image_quota(env: BrowserSession, token: str, timeout: float) -> dict[
             "image_quota_unknown": True,
             "image_quota_checked_at": now_iso(),
             "image_quota_error": type(exc).__name__,
+            "image_quota_http_status": None,
+            "image_quota_retryable": True,
         }
 
 
@@ -445,17 +454,23 @@ def check_account_plan(
             **{k: v for k, v in claims.items() if k != "payload"},
         }
 
-    try:
-        route = resolve_plan_check_route(proxy)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "checked_at": now_iso(),
-            "http_status": None,
-            "error": f"套餐查询网络配置错误: {exc}",
-            **{k: v for k, v in claims.items() if k != "payload"},
-        }
-    route_meta = {k: v for k, v in route.items() if k != "proxy"}
+    # 显式 proxy 由调用方固定，失败时不能擅自换路由；自动选路则延迟到
+    # 每次尝试内执行。这样 Mihomo/Resin 首次抽到 GB、SSL EOF 等坏出口时，
+    # 会进入同一套重试计数，而不是在浏览器请求前直接结束套餐查询。
+    route: dict | None = None
+    route_meta: dict = {}
+    if proxy is not None:
+        try:
+            route = resolve_plan_check_route(proxy)
+            route_meta = {k: v for k, v in route.items() if k != "proxy"}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "checked_at": now_iso(),
+                "http_status": None,
+                "error": f"套餐查询网络配置错误: {exc}",
+                **{k: v for k, v in claims.items() if k != "payload"},
+            }
     url = f"https://chatgpt.com{ACCOUNTS_CHECK_PATH}?timezone_offset_min={quote(str(timezone_offset_min))}"
     try:
         timeout_seconds, attempts, base_delay = _plan_check_settings(timeout, max_attempts, retry_delay)
@@ -472,29 +487,43 @@ def check_account_plan(
 
     last_result: dict | None = None
     for attempt in range(1, attempts + 1):
-        if attempt > 1 and proxy is None:
+        if proxy is None:
             try:
                 route = resolve_plan_check_route(None)
                 route_meta = {k: v for k, v in route.items() if k != "proxy"}
                 logger.info(
-                    "套餐查询重试已轮换代理身份，第 %s/%s 次，route=%s node=%s",
+                    "套餐查询已选择代理身份，第 %s/%s 次，route=%s node=%s",
                     attempt,
                     attempts,
                     route_meta.get("network_route") or "unknown",
                     route_meta.get("proxy_node") or "-",
                 )
             except Exception as exc:
-                return {
+                last_result = {
                     "ok": False,
                     "checked_at": now_iso(),
                     "http_status": None,
-                    "error": f"套餐查询重试轮换代理失败: {exc}",
-                    "retryable": False,
+                    "error": f"套餐查询网络配置错误: {exc}",
+                    "retryable": True,
                     "attempt_count": attempt,
                     "max_attempts": attempts,
-                    **route_meta,
+                    "request_timeout": timeout_seconds,
                     **{k: v for k, v in claims.items() if k != "payload"},
                 }
+                route_meta = {}
+                if attempt >= attempts:
+                    return last_result
+                wait_seconds = _retry_wait_seconds(None, base_delay, attempt)
+                logger.warning(
+                    "套餐查询选路临时失败，第 %s/%s 次，%.1fs 后重新选择出口: %s",
+                    attempt,
+                    attempts,
+                    wait_seconds,
+                    last_result["error"],
+                )
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                continue
         env = None
         resp = None
         try:
@@ -540,10 +569,15 @@ def check_account_plan(
                     parsed["attempt_count"] = attempt
                     parsed["max_attempts"] = attempts
                     parsed["request_timeout"] = timeout_seconds
-                    parsed.update(_probe_image_quota(env, token, timeout_seconds))
-                    parsed["retryable"] = False
+                    quota_result = _probe_image_quota(env, token, timeout_seconds)
+                    parsed.update(quota_result)
+                    quota_retryable = bool(quota_result.get("image_quota_retryable"))
+                    parsed["retryable"] = quota_retryable
                     parsed.update(route_meta)
-                    return parsed
+                    if not quota_retryable or attempt >= attempts:
+                        parsed["retryable"] = False
+                        return parsed
+                    last_result = parsed
         except Exception as exc:
             logger.debug("套餐查询失败: %s: %s", type(exc).__name__, exc, exc_info=True)
             last_result = {

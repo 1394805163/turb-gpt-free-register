@@ -186,14 +186,27 @@ def _select_oauth_proxy() -> str:
     return str(_select_oauth_route().get("proxy_url") or "").strip()
 
 
-def _persist_oauth_result_and_queue_liveness(email: str, result: dict) -> dict:
+def _persist_oauth_result_and_queue_liveness(
+    email: str,
+    result: dict,
+    *,
+    expected_access_token: str | None = None,
+) -> dict:
     """OAuth 文件落盘后回写账号，再由轻量查活成功路径触发 chatgpt2api 推送。"""
     file_path = str(result.get("file_path") or "").strip()
     credential = result.get("credential") if isinstance(result.get("credential"), dict) else None
     if credential is not None:
-        persisted = db.update_account_chatgpt_oauth(email, credential)
+        persisted = db.update_account_chatgpt_oauth(
+            email,
+            credential,
+            expected_access_token=expected_access_token,
+        )
     elif file_path:
-        persisted = db.update_account_chatgpt_oauth_from_file(email, file_path)
+        persisted = db.update_account_chatgpt_oauth_from_file(
+            email,
+            file_path,
+            expected_access_token=expected_access_token,
+        )
     else:
         persisted = {"updated": False, "reason": "OAuth 结果缺少 credential/file_path"}
     if not persisted.get("updated"):
@@ -361,6 +374,8 @@ def run_worker(
             if not acquired:
                 raise RuntimeError("OAuth 浏览器闸门未取得，已取消本次任务")
             result = {"status": "failed", "ok": False, "message": "OAuth 未执行"}
+            account_before_oauth = db.get_account_by_email(email) or {}
+            expected_access_token = str(account_before_oauth.get("access_token") or "").strip() or None
             max_oauth_attempts = _oauth_proxy_rotation_attempts()
             for oauth_attempt in range(1, max_oauth_attempts + 1):
                 check_stop_requested(email)
@@ -405,7 +420,11 @@ def run_worker(
         )
         result_status = result.get("status", "failed")
         if result.get("ok"):
-            result = _persist_oauth_result_and_queue_liveness(email, result)
+            result = _persist_oauth_result_and_queue_liveness(
+                email,
+                result,
+                expected_access_token=expected_access_token,
+            )
             logger.info("[Codex 补跑] %s 成功", redact_email(email))
         elif result_status == "deactivated":
             db.update_account_codex_status(email, "deactivated", result.get("message"))

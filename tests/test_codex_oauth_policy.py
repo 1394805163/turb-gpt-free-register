@@ -37,6 +37,29 @@ class CodexOAuthPolicyTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertEqual(result["action"], "plan_check")
         self.assertEqual(result["reason_code"], "account_too_new")
+        self.assertEqual(result["min_age_days"], 7)
+
+    def test_configured_three_day_age_allows_account_at_boundary(self):
+        with patch("config.codex.CODEX_OAUTH_MIN_AGE_DAYS", 3):
+            result = evaluate_oauth_eligibility(
+                self.account(created_at="2026-08-20T12:00:00+00:00"),
+                now=self.NOW,
+            )
+
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["reason_code"], "eligible")
+        self.assertEqual(result["min_age_days"], 3)
+
+    def test_configured_three_day_age_keeps_two_day_account_on_simple_check(self):
+        with patch("config.codex.CODEX_OAUTH_MIN_AGE_DAYS", 3):
+            result = evaluate_oauth_eligibility(
+                self.account(created_at="2026-08-21T12:00:00+00:00"),
+                now=self.NOW,
+            )
+
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["reason_code"], "account_too_new")
+        self.assertEqual(result["min_age_days"], 3)
 
     def test_unexpired_access_token_is_oauth_eligible_when_account_is_old_enough(self):
         result = evaluate_oauth_eligibility(

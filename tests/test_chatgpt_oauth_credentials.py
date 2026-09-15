@@ -142,6 +142,7 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
             access_token="stale-access-token",
             email_source="icloud",
         )
+        expires_at = "2026-09-09T12:34:56Z"
         with patch("core.email_provider.release_email") as release_email:
             result = db.import_account_credentials([{
                 "email": "overwrite@icloud.com",
@@ -151,18 +152,30 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
                 "chatgpt_id_token": "oauth-id-token",
                 "chatgpt_oauth_client_id": "oauth-client",
                 "chatgpt_account_id": "chatgpt-account-id",
+                "expired": expires_at,
                 "email_source": "icloud",
             }])
 
         self.assertEqual(result["oauth_status"], {"complete": 1})
         self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["inserted"], 0)
         row = db.get_account(row_id)
         self.assertEqual(row["access_token"], "oauth-access-token")
+        self.assertEqual(row["chatgpt_oauth_access_token"], "oauth-access-token")
         self.assertEqual(row["chatgpt_refresh_token"], "oauth-refresh-token")
         self.assertEqual(row["refresh_token"], "oauth-refresh-token")
         self.assertEqual(row["id_token"], "oauth-id-token")
+        self.assertEqual(row["chatgpt_id_token"], "oauth-id-token")
         self.assertEqual(row["oauth_client_id"], "oauth-client")
+        self.assertEqual(row["chatgpt_oauth_client_id"], "oauth-client")
         self.assertEqual(row["account_id"], "chatgpt-account-id")
+        self.assertEqual(row["token_expires_at"], expires_at)
+        self.assertEqual(row["chatgpt_token_expires_at"], expires_at)
+        self.assertEqual(row["oauth_status"], "success")
+        self.assertEqual(
+            sum(item.get("email") == "overwrite@icloud.com" for item in db._load_accounts()),
+            1,
+        )
         release_email.assert_called_once()
         self.assertEqual(release_email.call_args.kwargs["status"], "used")
 
@@ -182,6 +195,92 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
         self.assertEqual(saved["access_token"], "oauth-access-token")
         self.assertEqual(saved["refresh_token"], "oauth-refresh-token")
         self.assertEqual(saved["id_token"], "oauth-id-token")
+
+    def test_oauth_update_rejects_a_partial_credential_without_id_token(self):
+        row_id = db.insert_account(email="partial@icloud.com", access_token="old-access", email_source="icloud")
+
+        result = db.update_account_chatgpt_oauth("partial@icloud.com", {
+            "type": "codex",
+            "email": "partial@icloud.com",
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+        })
+
+        self.assertFalse(result["updated"])
+        self.assertIn("id_token", result["reason"])
+        row = db.get_account(row_id)
+        self.assertEqual(row["access_token"], "old-access")
+        self.assertEqual(row.get("chatgpt_refresh_token"), None)
+
+    def test_oauth_update_invalidates_token_bound_runtime_state(self):
+        row_id = db.insert_account(email="rotate@icloud.com", access_token="old-access", email_source="icloud")
+        self.assertTrue(db.update_account_liveness(row_id, {
+            "ok": True,
+            "status": "live",
+            "method": "token",
+            "checked_at": "2026-09-09T10:00:00",
+            "access_token": "old-access",
+        }))
+        old_fp = db.token_fingerprint("old-access")
+        self.assertEqual(db.claim_account_push(row_id, old_fp), "claimed")
+        self.assertTrue(db.complete_account_push(
+            row_id,
+            success=True,
+            token_fingerprint=old_fp,
+            attempts=1,
+            http_status=200,
+        ))
+        self.assertTrue(db.update_account_plan_check(row_id, result={
+            "ok": True,
+            "checked_at": "2026-09-09T10:00:00",
+            "current_plan_type": "free",
+            "image_quota": 24,
+            "image_quota_unknown": False,
+            "image_quota_checked_at": "2026-09-09T10:00:00",
+        }))
+
+        result = db.update_account_chatgpt_oauth("rotate@icloud.com", {
+            "type": "codex",
+            "email": "rotate@icloud.com",
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "id_token": "new-id",
+            "oauth_client_id": "codex-client",
+            "expired": "2026-09-19T00:00:00Z",
+        })
+
+        self.assertTrue(result["updated"])
+        row = db.get_account(row_id)
+        self.assertEqual(row["access_token"], "new-access")
+        self.assertEqual(row["live_check_status"], "pending")
+        self.assertFalse(row["live_check_ok"])
+        self.assertEqual(row["plan_check_status"], "pending")
+        self.assertFalse(row["plan_check_ok"])
+        self.assertEqual(row["push_status"], "pending")
+        self.assertIsNone(row.get("push_token_fingerprint"))
+        self.assertIsNone(row["image_quota"])
+        self.assertTrue(row["image_quota_unknown"])
+
+    def test_oauth_update_rejects_stale_expected_access_token(self):
+        row_id = db.insert_account(email="cas@icloud.com", access_token="current-access", email_source="icloud")
+
+        result = db.update_account_chatgpt_oauth(
+            "cas@icloud.com",
+            {
+                "type": "codex",
+                "email": "cas@icloud.com",
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "id_token": "new-id",
+            },
+            expected_access_token="stale-access",
+        )
+
+        self.assertFalse(result["updated"])
+        self.assertIn("已变化", result["reason"])
+        row = db.get_account(row_id)
+        self.assertEqual(row["access_token"], "current-access")
+        self.assertIsNone(row.get("chatgpt_refresh_token"))
 
 
 if __name__ == "__main__":

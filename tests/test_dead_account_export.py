@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 import tempfile
 import unittest
-import json
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -121,9 +120,13 @@ class DeadAccountExportTests(unittest.TestCase):
         db.update_account_liveness(acc_id, candidate)
         self.assertEqual(db.get_account(acc_id)["pipeline_status"], "temporary_error")
 
-        rows = json.loads(Path(db._ACCOUNTS_JSON).read_text(encoding="utf-8"))
-        rows[0]["dead_candidate_checked_at"] = "2026-08-11T00:00:00"
-        Path(db._ACCOUNTS_JSON).write_text(json.dumps(rows), encoding="utf-8")
+        # SQLite 是运行时主存储；通过现有存储 API 调整候选时间，避免测试绕过存储层直接改旧 JSON。
+        with db._SQLITE_LOCK, closing(db._sqlite_conn()) as conn:
+            conn.execute(
+                "UPDATE accounts SET payload=json_set(payload, '$.dead_candidate_checked_at', ?) WHERE id=?",
+                ("2026-08-11T00:00:00", acc_id),
+            )
+            conn.commit()
         db.update_account_liveness(acc_id, candidate)
 
         stored = db.get_account(acc_id)
