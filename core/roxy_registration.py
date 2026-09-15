@@ -1145,6 +1145,68 @@ def _pass_mfa_challenge_if_needed(driver, email: str, timeout: int = 25) -> bool
     return outcome == "accepted"
 
 
+_OTP_INPUT_FINDER_JS = r"""
+const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+const el = [...document.querySelectorAll('input')].filter(vis).find(e =>
+  ['code', 'one-time-code'].includes(String(e.name || '').toLowerCase()) ||
+  String(e.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code' ||
+  /code|otp|验证码/i.test(String(e.getAttribute('placeholder') || ''))
+);
+return el ? String(el.value || '') : null;
+"""
+
+_OTP_INPUT_SET_JS = r"""
+const code = arguments[0];
+const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+const el = [...document.querySelectorAll('input')].filter(vis).find(e =>
+  ['code', 'one-time-code'].includes(String(e.name || '').toLowerCase()) ||
+  String(e.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code' ||
+  /code|otp|验证码/i.test(String(e.getAttribute('placeholder') || ''))
+);
+if (!el) return null;
+const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+el.focus();
+setter.call(el, code);
+el.dispatchEvent(new Event('input', {bubbles: true}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+return String(el.value || '');
+"""
+
+
+def _read_otp_input_value(driver) -> str | None:
+    """读当前单框 OTP 输入值；找不到输入框返回 None。"""
+    try:
+        value = driver.execute_script(_OTP_INPUT_FINDER_JS)
+    except Exception:
+        return None
+    return None if value is None else str(value)
+
+
+def _ensure_otp_input_value(driver, code: str, attempts: int = 3) -> bool:
+    """确认 OTP 输入框里确实是我们期望的验证码；逐字符输入丢字符时用原生 setter 重填。
+
+    页面对验证码有长度校验（提交后会提示 "should be exactly 6 characters long"，
+    而页面不会给出"验证码错误"，上层只能看到"提交后页面不动"）。每次重填失败都会
+    再读一次输入值，避免把"填错了"当成"码错了"。
+    """
+    target = str(code or "").strip()
+    if not target:
+        return False
+    for attempt in range(1, attempts + 1):
+        if _read_otp_input_value(driver) == target:
+            return True
+        try:
+            value = driver.execute_script(_OTP_INPUT_SET_JS, target)
+        except Exception:
+            value = None
+        if value is not None and str(value) == target:
+            return True
+        if attempt < attempts:
+            time.sleep(0.4)
+    logger.warning("%s OTP 输入框重填 %s 次后仍未拿到期望的验证码", _log_prefix(driver), attempts)
+    return False
+
+
 def _type_otp(driver, code: str) -> None:
     from selenium.webdriver.common.by import By
 
@@ -1158,6 +1220,7 @@ def _type_otp(driver, code: str) -> None:
         els = [e for e in driver.find_elements(By.CSS_SELECTOR, selector) if _visible(e)]
         if len(els) == 1:
             _human_type_text(driver, els[0], code, clear=True)
+            _ensure_otp_input_value(driver, code)
             return
 
     # 6 个分格输入框
