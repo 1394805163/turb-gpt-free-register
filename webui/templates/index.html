@@ -803,6 +803,9 @@
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .accounts-table-v2 .acc-v2-muted { color: #c0c4cc; }
+    .acc-mini-btn { border: none; background: transparent; cursor: pointer; padding: 0 2px; font-size: 13px; line-height: 1; vertical-align: middle; }
+    .acc-mini-btn:hover { opacity: .65; }
+    .acc-pwd { font-family: ui-monospace, Consolas, monospace; letter-spacing: 1px; margin-right: 4px; }
     .accounts-table-v2 .pill {
       display: inline-flex; align-items: center; justify-content: center;
       height: 26px; padding: 0 10px; border-radius: 4px;
@@ -2168,7 +2171,7 @@
   <!-- ============ 账号 ============ -->
   <div id="tab-accounts" class="hidden">
     <h1 class="register-title">账号</h1>
-    <div class="banner info">快速测活/查套餐：验证现有 Token，无需邮箱 OTP；OAuth 持久化：账号满 7 天且没有 refresh_token 即可处理，未满年龄的账号自动转轻量查活。</div>
+    <div class="banner info">快速测活/查套餐：验证现有 Token，无需邮箱 OTP；OAuth 持久化：账号达到当前配置的最小年龄（{{ codex_oauth_min_age_days }} 天）且没有 refresh_token 即可处理，未满年龄的账号自动转轻量查活。</div>
     <section class="accounts-panel-v2" id="accountsPanelV2" aria-label="账号列表">
       <div class="accounts-filter-v2" id="accountsFilterV2">
         <div class="acc-v2-btn-group acc-v2-search-wrap">
@@ -2235,7 +2238,7 @@
         </div>
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">Codex</span>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnRetrySelectedCodexV2" disabled title="批量执行 OAuth 持久化；未满 7 天的账号自动转轻量查活">OAuth持久化（满7天）</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnRetrySelectedCodexV2" disabled title="批量执行 OAuth 持久化；未达到当前配置年龄的账号自动转轻量查活">OAuth持久化（按配置年龄）</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCpaV2" title="有勾选时导出勾选账号；未勾选时导出当前筛选结果中的完整 OAuth 凭据，并打包 ZIP">导出完整OAuth</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCredentialsV2" title="有勾选时导出勾选账号；未勾选时导出当前筛选结果，兼容完整 OAuth 和仅 access_token 账号">导出账号凭据</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnImportOAuthV2" title="导入账号凭据 JSON 或 ZIP；兼容完整 OAuth 和仅 access_token，且不需要勾选账号">导入账号凭据</button>
@@ -2274,7 +2277,7 @@
               <th class="col-source">来源</th>
               <th class="col-token">Token</th>
               <th class="col-plan">套餐</th>
-              <th class="col-note">备注</th>
+              <th class="col-note">密码</th>
               <th class="col-small">2FA</th>
               <th class="col-status">Codex</th>
               <th class="col-agent">Agent Token</th>
@@ -3601,6 +3604,21 @@ function _planCell(r) {
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
   return `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
 }
+function _imageQuotaCell(r) {
+  const hasQuotaState = ['image_quota', 'image_quota_unknown', 'image_quota_checked_at', 'image_quota_error']
+    .some(key => Object.prototype.hasOwnProperty.call(r, key));
+  if (!hasQuotaState) return '';
+  const raw = r.image_quota;
+  const number = Number(raw);
+  const unknown = r.image_quota_unknown === true || raw === null || raw === undefined || raw === '' || Number.isNaN(number);
+  const value = unknown ? '未知' : String(Math.max(0, Math.trunc(number)));
+  const checkedAt = r.image_quota_checked_at ? `查询: ${r.image_quota_checked_at}` : '尚未完成额度查询';
+  const resetAt = r.image_quota_reset_at ? `重置: ${r.image_quota_reset_at}` : '';
+  const error = r.image_quota_error ? `错误: ${r.image_quota_error}` : '';
+  const title = [checkedAt, resetAt, error].filter(Boolean).join('；');
+  const cls = unknown ? 'status-failed' : number <= 5 ? 'status-running' : 'status-success';
+  return `<div class="acc-v2-sub" title="${esc(title)}"><span class="pill ${cls}">生图额度: ${esc(value)}</span></div>`;
+}
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {
     const automatic = r.plan_check_trigger === 'registration_auto';
@@ -3660,8 +3678,9 @@ function _codexAction(r) {
   }
   if (s === 'deactivated') return '';
   const eligibility = r.oauth_eligibility || {};
+  const minAgeDays = Number.isFinite(Number(eligibility.min_age_days)) ? Number(eligibility.min_age_days) : {{ codex_oauth_min_age_days }};
   if (eligibility.eligible === false && eligibility.reason_code !== 'oauth_already_persisted') {
-    return `<button disabled title="${esc(eligibility.reason || '账号未满 7 天，当前只允许轻量查活')}">待满7天·查活</button>`;
+    return `<button disabled title="${esc(eligibility.reason || ('账号未达到 ' + minAgeDays + ' 天，当前只允许轻量查活'))}">待${minAgeDays}天·查活</button>`;
   }
   if (eligibility.reason_code === 'oauth_already_persisted') {
     return `<span class="pill status-success" title="${esc(eligibility.reason || 'OAuth 凭据已持久化')}">OAuth已完成</span>`;
@@ -3734,9 +3753,15 @@ function renderAccounts() {
       </td>
       <td class="col-source">${esc(r.email_source || '-')}</td>
       <td class="col-token">${_tokenCellV2(r)}</td>
-      <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
-      <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
-      <td class="col-small">${r.totp_enabled ? '已启用' : '<span class="acc-v2-muted">未启用</span>'}</td>
+      <td class="col-plan">${_planCell(r)}${_imageQuotaCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
+      <td class="col-note" title="${esc(r.note || '')}">${r.has_password
+        ? `<span class="acc-pwd" data-pwd-mask="${esc(r.id)}">••••••</span>` +
+          `<button type="button" class="acc-mini-btn" data-pwd-copy="${esc(r.id)}" title="复制密码">📋</button>` +
+          `<button type="button" class="acc-mini-btn" data-pwd-eye="${esc(r.id)}" title="显示/隐藏密码">👁</button>`
+        : '<span class="acc-v2-muted">未设置</span>'}</td>
+      <td class="col-small">${r.totp_enabled
+        ? `已启用 <button type="button" class="acc-mini-btn" data-totp-copy="${esc(r.id)}" title="复制 TOTP Secret">📋</button>`
+        : '<span class="acc-v2-muted">未启用</span>'}</td>
       <td class="col-status">${_codexCellV2(r)}</td>
       <td class="col-agent">${_codexAgentCell(r)}</td>
       <td class="col-time" title="${esc(r.created_at || '-')}">${esc(r.created_at || '-')}</td>
@@ -4948,7 +4973,7 @@ async function retrySelectedCodex() {
 预计完整 OAuth：${eligibleCount} 个
 预计轻量查活：${gatedCount} 个
 
-未满 7 天的账号不会启动 OAuth，只会执行轻量查活。`;
+未达到当前配置年龄（{{ codex_oauth_min_age_days }} 天）的账号不会启动 OAuth，只会执行轻量查活。`;
   if (retryingCount || deactivatedCount) msg += `
 
 其中：补跑中 ${retryingCount} 个、已废号 ${deactivatedCount} 个会自动跳过。`;
@@ -4988,6 +5013,44 @@ async function copyCurrentPageTokens() {
   if (!ids.length) { showToast('当前页没有 Token'); return; }
   try { copyText((await fetchAccountSecrets(ids, 'access_token')).join('\n')); } catch(e) { showToast('复制失败: ' + e.message); }
 }
+// 密码列：复制/显示切换；2FA 列：复制 TOTP Secret（按需走 /secret 接口）
+document.addEventListener('click', async (e) => {
+  const pwdCopy = e.target.closest('[data-pwd-copy]');
+  if (pwdCopy) {
+    e.stopPropagation();
+    try {
+      const v = await fetchOneAccountSecret(pwdCopy.dataset.pwdCopy, 'password');
+      if (!v) { showToast('该账号没有密码'); return; }
+      await copyText(v); showToast('密码已复制');
+    } catch (err) { showToast('复制失败: ' + err.message); }
+    return;
+  }
+  const pwdEye = e.target.closest('[data-pwd-eye]');
+  if (pwdEye) {
+    e.stopPropagation();
+    const id = pwdEye.dataset.pwdEye;
+    const span = document.querySelector(`[data-pwd-mask="${id}"]`);
+    if (!span) return;
+    if (span.dataset.shown === '1') { span.textContent = '••••••'; span.dataset.shown = '0'; return; }
+    try {
+      const v = await fetchOneAccountSecret(id, 'password');
+      if (!v) { showToast('该账号没有密码'); return; }
+      span.textContent = v; span.dataset.shown = '1';
+    } catch (err) { showToast('读取失败: ' + err.message); }
+    return;
+  }
+  const totpCopy = e.target.closest('[data-totp-copy]');
+  if (totpCopy) {
+    e.stopPropagation();
+    try {
+      const v = await fetchOneAccountSecret(totpCopy.dataset.totpCopy, 'totp_secret');
+      if (!v) { showToast('该账号没有 TOTP Secret'); return; }
+      await copyText(v); showToast('TOTP Secret 已复制');
+    } catch (err) { showToast('复制失败: ' + err.message); }
+    return;
+  }
+});
+
 async function copyCurrentPageLines() {
   const ids = ACCOUNTS.map(r => Number(r.id));
   if (!ids.length) { showToast('当前页没有账号'); return; }

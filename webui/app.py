@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from flask import Flask, Response, jsonify, make_response, render_template, request
 
 from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, registration_scheduler
-from core.codex_oauth_policy import evaluate_oauth_eligibility
+from core.codex_oauth_policy import configured_min_age_days, evaluate_oauth_eligibility
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -87,6 +87,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "email": row.get("email"),
         "has_access_token": bool(str(row.get("access_token") or "").strip()),
         "totp_enabled": bool(row.get("totp_secret")),
+        "has_password": bool(str(row.get("password") or "").strip()),
         "codex_agent_has_token": bool(str(row.get("codex_agent_token") or "").strip()),
         "oauth_eligibility": evaluate_oauth_eligibility(row),
     }
@@ -144,7 +145,11 @@ def _account_secret_value(row: dict, field: str) -> str:
         return str(row.get("copy_line") or "")
     if field == "codex_agent_token":
         return str(row.get("codex_agent_token") or "")
-    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token")
+    if field == "totp_secret":
+        return str(row.get("totp_secret") or "")
+    if field == "password":
+        return str(row.get("password") or "")
+    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/totp_secret/password")
 
 
 def _compact_job_for_list(row: dict) -> dict:
@@ -355,7 +360,10 @@ def create_app(auth_code: str | None = None) -> Flask:
                 ui_mode = "modern"
 
         template_name = "index_legacy.html" if ui_mode == "legacy" else "index.html"
-        resp = make_response(render_template(template_name))
+        resp = make_response(render_template(
+            template_name,
+            codex_oauth_min_age_days=configured_min_age_days(),
+        ))
         if requested_ui in {"legacy", "modern"}:
             resp.set_cookie("ui_mode", ui_mode, max_age=60 * 60 * 24 * 365, samesite="Lax")
         return resp
@@ -2456,13 +2464,24 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/codex/retry-bulk")
     def api_codex_retry_bulk():
-        """批量补跑 Codex；未满最小账号年龄的账号自动进入轻量查活队列。"""
+        """批量补跑 Codex。
+
+        默认遵守 OAuth 年龄/状态门禁；传入 ``force_oauth=true`` 时由调用方
+        明确要求对选中的历史账号重新走浏览器 OAuth，跳过“已有完整凭据/年龄
+        门禁”分流，但仍保留废号和重复任务保护。这个开关供批次迁移使用，
+        不改变普通 WebUI 的默认行为。
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from datetime import datetime as _dt
 
         data = request.get_json(silent=True) or {}
         ids = data.get("account_ids") or data.get("ids") or []
         workers = data.get("workers", 1)
+        force_oauth = data.get("force_oauth", data.get("force", False))
+        if isinstance(force_oauth, str):
+            force_oauth = force_oauth.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            force_oauth = bool(force_oauth)
         if not isinstance(ids, list) or not ids:
             return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
         try:
@@ -2495,7 +2514,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 skipped.append({"id": acc_id, "reason": "邮箱为空"})
                 continue
             eligibility = evaluate_oauth_eligibility(acc)
-            if not eligibility.get("eligible"):
+            if not force_oauth and not eligibility.get("eligible"):
                 token = str(acc.get("access_token") or "").strip()
                 if not token:
                     skipped.append({
@@ -2568,7 +2587,9 @@ def create_app(auth_code: str | None = None) -> Flask:
             ).start()
         return jsonify({
             "ok": True,
-            "message": f"已开始批量补跑 {len(selected)} 个账号，并发 {workers}",
+            "message": f"已开始批量补跑 {len(selected)} 个账号，并发 {workers}"
+            + ("（强制重新 OAuth）" if force_oauth else ""),
+            "force_oauth": force_oauth,
             "started": selected,
             "started_count": len(selected),
             "simple_check_started": simple_check_started,
