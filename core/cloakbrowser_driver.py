@@ -617,6 +617,27 @@ def account_fingerprint_seed(email: str) -> str:
     return hashlib.sha256(f"cloak-profile:{target}".encode("utf-8")).hexdigest()[:16]
 
 
+# 常见桌面分辨率池：按 seed 确定性选择，避免所有账号共用同一窗口尺寸。
+_WINDOW_SIZES = (
+    (1920, 1080),
+    (1600, 900),
+    (1536, 864),
+    (1440, 900),
+    (1366, 768),
+    (1280, 800),
+    (2560, 1440),
+)
+
+
+def _window_size_for_seed(seed: str) -> tuple[int, int]:
+    """按 seed 确定性派生窗口尺寸；无 seed 返回 (0, 0) 表示不注入。"""
+    target = str(seed or "").strip()
+    if not target:
+        return (0, 0)
+    digest = hashlib.sha256(f"window:{target}".encode("utf-8")).digest()
+    return _WINDOW_SIZES[digest[0] % len(_WINDOW_SIZES)]
+
+
 def build_cloak_driver(
     proxy: str | None = None,
     proxy_selection: dict | None = None,
@@ -660,6 +681,10 @@ def build_cloak_driver(
     seed = str(fingerprint_seed or getattr(_cfg, "CLOAK_FINGERPRINT_SEED", "") or "").strip()
     if seed:
         launch_args.append(f"--fingerprint={seed}")
+        # 窗口画像去同质化：按 seed 派生窗口尺寸（同账号恒定、跨账号不同）。
+        win_w, win_h = _window_size_for_seed(seed)
+        if win_w and not any(str(a).startswith("--window-size") for a in launch_args):
+            launch_args.append(f"--window-size={win_w},{win_h}")
 
     proxy_url = _normalize_proxy(proxy) if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)) else None
     transparent_route = _allows_transparent_mihomo_route(proxy_selection)

@@ -31,3 +31,22 @@ class AccountFingerprintSeedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class WindowProfileTests(unittest.TestCase):
+    """窗口画像去同质化：按 seed 确定性派生窗口尺寸。"""
+
+    def test_deterministic_per_seed(self):
+        from core.cloakbrowser_driver import _window_size_for_seed
+
+        self.assertEqual(_window_size_for_seed("seed-x"), _window_size_for_seed("seed-x"))
+
+    def test_varies_across_seeds(self):
+        from core.cloakbrowser_driver import _window_size_for_seed
+
+        sizes = {_window_size_for_seed(f"probe-{i}") for i in range(40)}
+        self.assertGreaterEqual(len(sizes), 3)
+
+    def test_empty_seed_means_no_injection(self):
+        from core.cloakbrowser_driver import _window_size_for_seed
+
+        self.assertEqual(_window_size_for_seed(""), (0, 0))
