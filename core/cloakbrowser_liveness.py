@@ -23,6 +23,7 @@ from core.roxy_registration import (
     _submit_email_and_wait_next,
     _type_otp,
     _wait_after_email_otp_submit,
+    _recover_otp_error_page,
     _fetch_chatgpt_session,
 )
 
@@ -139,9 +140,28 @@ def run_cloak_liveness_flow(
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             human_delay("otp_input")
-            _click_continue(driver)
+            try:
+                _click_continue(driver)
+            except Exception as exc:
+                # 页面可能已自动提交/跳转；继续观察页面状态而不是直接判死。
+                logger.info("[Cloak查活][OTP] 未找到显式提交按钮，继续等待页面状态：%s", type(exc).__name__)
             outcome = _wait_after_email_otp_submit(driver, timeout=otp_submit_timeout)
             logger.info("[Cloak查活][OTP] 提交结果：%s", outcome)
+            if outcome == "error_page":
+                # 服务端路由错误页：恢复后重交一次；仍失败则按停滞处理（进入重发/重试分支）。
+                logger.warning("[Cloak查活][OTP] 提交后进入服务端错误页，尝试恢复后重交")
+                if _recover_otp_error_page(driver):
+                    _clear_otp_inputs(driver)
+                    _type_otp(driver, current_otp)
+                    human_delay("otp_input")
+                    try:
+                        _click_continue(driver)
+                    except Exception as exc:
+                        logger.info("[Cloak查活][OTP] 错误页恢复后未找到提交按钮：%s", type(exc).__name__)
+                    outcome = _wait_after_email_otp_submit(driver, timeout=otp_submit_timeout)
+                    logger.info("[Cloak查活][OTP] 错误页恢复后提交结果：%s", outcome)
+                if outcome == "error_page":
+                    outcome = "stalled"
             if outcome == "accepted":
                 if _pass_mfa_challenge_if_needed(driver, email, timeout=max(otp_submit_timeout, 25)):
                     logger.info("[Cloak查活][OTP] 2FA 动态码已通过，继续读取登录态")

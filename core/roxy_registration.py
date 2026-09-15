@@ -980,9 +980,16 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     # 给正常跨域跳转留出时间，但不要让空白 authorize 页面占满整个阶段超时。
     authorize_grace = min(max(5, configured_grace), max(5, int(timeout) - 2))
     navigation_grace = min(max(5, configured_navigation_grace), max(5, int(timeout) - 2))
+    session_probe_round = 0
+    slow_rounds = 0
     while time.time() < end:
-        if _has_access_token(driver):
-            return "logged_in"
+        tick_started = time.time()
+        # 登录态探测降频 + 仅在可能已登录的主域执行：每轮都发跨域 fetch 会在
+        # 导航窗口期把状态机拖死（180s stall 的诱因之一）。
+        session_probe_round += 1
+        if (session_probe_round == 1 or session_probe_round % 3 == 0) and _url_ready_for_session_probe(driver):
+            if _has_access_token(driver):
+                return "logged_in"
         if _is_login_password_page(driver):
             return "login_password"
         if _is_email_verification_page(driver):
@@ -1072,6 +1079,19 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             else:
                 cleared_seen_at = None
             # 仍是当前邮箱页，继续短等。
+        round_elapsed = time.time() - tick_started
+        if round_elapsed >= 12.0:
+            slow_rounds += 1
+            logger.warning(
+                "%s 邮箱提交后状态检测出现慢轮：%.1fs（第 %s 次）",
+                _log_prefix(driver), round_elapsed, slow_rounds,
+            )
+            if slow_rounds >= 2:
+                logger.warning(
+                    "%s 邮箱提交后状态检测连续慢轮（疑似导航/渲染卡住），提前退出交给上层轮换",
+                    _log_prefix(driver),
+                )
+                return "navigation_timeout"
         time.sleep(0.8)
     logger.info("%s 邮箱提交后等待下一步超时，最后邮箱页状态=%s", _log_prefix(driver), last)
     return "email_page" if _is_email_login_page_still_present(driver) else "unknown"
@@ -1328,6 +1348,75 @@ def _is_email_verification_page(driver) -> bool:
     ))
 
 
+def _url_ready_for_session_probe(driver) -> bool:
+    """只有页面已落在 chatgpt.com 主域时才探测 session，避免导航窗口期发跨域 fetch。"""
+    try:
+        url = str(getattr(driver, "current_url", "") or "").lower()
+    except Exception:
+        return False
+    if "chatgpt.com" not in url:
+        return False
+    return not any(marker in url for marker in ("/auth/", "/login", "/signup"))
+
+
+def _is_otp_error_page(driver) -> bool:
+    """识别 OTP 提交后 OpenAI 的服务端路由错误页（Route Error 400 / Oops）。
+
+    错误页 URL 往往仍是 /email-verification，只看 URL 会把它当成正常验证码页，
+    后续就会以"找不到 Continue 按钮"的硬错误收场。
+    """
+    state = _email_otp_page_state(driver)
+    if not isinstance(state, dict):
+        return False
+    text = " ".join([
+        str(state.get('title') or ''),
+        str(state.get('text') or ''),
+        " ".join(str(v) for v in (state.get('errors') or [])),
+    ]).lower()
+    return any(marker in text for marker in ("route error", "an error occurred", "invalid content type"))
+
+
+def _recover_otp_error_page(driver, timeout: int = 15) -> bool:
+    """从 OTP 提交后的服务端错误页恢复：优先点 Try again，否则刷新页面。
+
+    恢复到验证码页或登录态返回 True；没有检测到错误页时也返回 True（无需恢复）。
+    """
+    if not _is_otp_error_page(driver):
+        return True
+    logger.warning("%s[OTP] 检测到服务端错误页，尝试恢复（Try again/刷新）", _log_prefix(driver))
+    clicked = False
+    try:
+        _click_any(driver, [
+            "//button[contains(., 'Try again')]",
+            "//a[contains(., 'Try again')]",
+            "//button[contains(., '重试')]",
+            "//a[contains(., '重试')]",
+        ], timeout=4)
+        clicked = True
+    except Exception:
+        pass
+    if not clicked:
+        try:
+            driver.refresh()
+            time.sleep(1.0)
+        except Exception:
+            return False
+    end = time.time() + max(5, int(timeout or 15))
+    while time.time() < end:
+        try:
+            if _is_chatgpt_logged_in_page(driver):
+                logger.info("%s[OTP] 错误页恢复后已处于登录态", _log_prefix(driver))
+                return True
+            if _is_email_verification_page(driver) and not _is_otp_error_page(driver):
+                logger.info("%s[OTP] 错误页恢复后已回到验证码页", _log_prefix(driver))
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    logger.warning("%s[OTP] 错误页恢复失败（未回到验证码页/登录态）", _log_prefix(driver))
+    return False
+
+
 def _is_chatgpt_logged_in_page(driver) -> bool:
     """识别 ChatGPT 首页，避免已登录页面进入 OTP 重发分支。"""
     try:
@@ -1433,6 +1522,12 @@ def _wait_after_email_otp_submit(driver, timeout: int = 30) -> str:
         ]).lower()
         if "account_deactivated" in page_error_text or "deleted or deactivated" in page_error_text:
             raise RuntimeError(f"account_deactivated after OTP submit: {last}")
+        if any(marker in page_error_text for marker in ("route error", "an error occurred", "invalid content type")):
+            logger.warning(
+                "%s[OTP] 提交后进入服务端错误页（Route Error/400）：%s",
+                _log_prefix(driver), str(last.get('title') or '')[:80],
+            )
+            return 'error_page'
         invalid = any(str(i.get('ariaInvalid') or '').lower() == 'true' for i in (last.get('inputs') or []))
         if invalid or (last.get('errors') or []):
             return 'invalid'
@@ -1506,12 +1601,20 @@ def _page_snapshot(driver) -> dict:
 
 
 def _has_access_token(driver) -> bool:
+    """探测 session 是否已返回 accessToken。
+
+    fetch 加 3 秒 AbortController 上限：提交邮箱/验证码后的页面常处于跨域导航
+    窗口期，裸 fetch 会长时间 pending 把状态机拖死（180s stall 的诱因之一）。
+    """
     try:
         result = driver.execute_async_script(r"""
         const done = arguments[0];
-        fetch('https://chatgpt.com/api/auth/session', {credentials:'include'})
-          .then(r => r.json()).then(j => done(Boolean(j && j.accessToken)))
-          .catch(() => done(false));
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, 3000);
+        fetch('https://chatgpt.com/api/auth/session', {credentials:'include', signal: ctrl.signal})
+          .then(r => r.json())
+          .then(j => { clearTimeout(timer); done(Boolean(j && j.accessToken)); })
+          .catch(() => { clearTimeout(timer); done(false); });
         """)
         return bool(result)
     except Exception:
@@ -2371,6 +2474,22 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
 
             outcome = _wait_after_email_otp_submit(driver, timeout=30)
             _check_manual_stop()
+            if outcome == 'error_page':
+                # 服务端路由错误页（Route Error 400）：恢复后重交一次；失败并入既有 stalled 兜底链。
+                logger.warning("[Roxy注册][OTP] 提交后进入服务端错误页（Route Error），尝试恢复后重交")
+                if _recover_otp_error_page(driver):
+                    _clear_otp_inputs(driver)
+                    _type_otp(driver, current_otp)
+                    human_delay("otp_input")
+                    try:
+                        _click_continue(driver)
+                    except Exception as exc:
+                        logger.info("[Roxy注册][OTP] 错误页恢复后未找到提交按钮：%s", redact_emails(exc)[:120])
+                    outcome = _wait_after_email_otp_submit(driver, timeout=15)
+                else:
+                    outcome = 'stalled'
+                if outcome == 'error_page':
+                    outcome = 'stalled'
             if outcome == 'stalled':
                 # 点击提交后页面没动：常见于页面进入 SPA 错误页（Cloudflare/HTML 响应）或点击未生效。
                 # 先用页内 fetch 直接提交（不依赖 DOM 元素），失败再退化回点击重提。

@@ -25,7 +25,7 @@ from core.roxy_registration import (  # noqa: F401
     _maybe_accept, _page_warmup, _submit_email_and_wait_next, _fill_password_page_if_present,
     _clear_otp_inputs, _type_otp, _click_continue, _wait_after_email_otp_submit,
     _click_resend_email_otp, _complete_profile_page, _fetch_chatgpt_session, _check_manual_stop,
-    _is_chatgpt_logged_in_page,
+    _is_chatgpt_logged_in_page, _recover_otp_error_page,
 )
 
 logger = logging.getLogger(__name__)
@@ -282,10 +282,30 @@ def run_cloak_registration(
             otp_submit_timeout = max(8, int(getattr(_cfg, "CLOAK_OTP_SUBMIT_TIMEOUT", 20) or 20))
             outcome = _wait_after_email_otp_submit(driver, timeout=otp_submit_timeout)
             _check_manual_stop()
+            if outcome == "error_page":
+                # 服务端路由错误页（Route Error 400）：恢复页面后用同一验证码重交一次；
+                # 恢复失败直接结束本轮，避免在错误页上"找不到按钮"的硬错误。
+                logger.warning("[Cloak注册][OTP] 提交后进入服务端错误页，尝试恢复后重交")
+                if not _recover_otp_error_page(driver):
+                    raise RuntimeError("OTP 提交后进入 OpenAI 服务端错误页（Route Error），恢复失败，结束当前代理并轮换")
+                _clear_otp_inputs(driver)
+                _type_otp(driver, current_otp)
+                human_delay("otp_input")
+                try:
+                    _click_continue(driver)
+                except Exception as exc:
+                    logger.info("[Cloak注册][OTP] 错误页恢复后未找到提交按钮，继续观察页面状态：%s", redact_emails(exc)[:120])
+                outcome = _wait_after_email_otp_submit(driver, timeout=otp_submit_timeout)
+                _check_manual_stop()
+                if outcome == "error_page":
+                    raise RuntimeError("OTP 提交后连续进入服务端错误页（Route Error），结束当前代理并轮换")
             if outcome == "stalled":
                 logger.warning("[Cloak注册][OTP] 首次提交没有产生页面状态变化，使用同一验证码重提一次")
-                _click_continue(driver)
-                logger.info("[Cloak注册][OTP] 已完成第二次提交，等待页面状态")
+                try:
+                    _click_continue(driver)
+                    logger.info("[Cloak注册][OTP] 已完成第二次提交，等待页面状态")
+                except Exception as exc:
+                    logger.info("[Cloak注册][OTP] 重试提交未找到按钮，继续观察页面状态：%s", redact_emails(exc)[:120])
                 outcome = _wait_after_email_otp_submit(driver, timeout=otp_submit_timeout)
                 _check_manual_stop()
                 if outcome == "stalled":
