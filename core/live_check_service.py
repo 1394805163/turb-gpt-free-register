@@ -168,6 +168,15 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
                 _append_log(email, f"[推送] 入队异常：{type(exc).__name__}")
         elif result.get("status") == "confirmed_dead":
             _append_log(email, f"[查活] 完成：确认死亡 {result.get('error') or ''}")
+            # 账号已废 → 同步停用邮箱池条目，便于运营区分"账号仍存活的 used"与"已判废"。
+            try:
+                from core.email_provider import release_email
+
+                reason = str(result.get("error") or "confirmed_dead")[:160]
+                release_email(email, status="disabled", note=f"查活确认账号已废: {reason}")
+                _append_log(email, "[查活] 已同步停用邮箱池条目（disabled）")
+            except Exception as exc:
+                _append_log(email, f"[查活] 邮箱池停用失败：{type(exc).__name__}: {exc}")
         else:
             _append_log(email, f"[查活] 完成：临时错误 {result.get('error') or ''}")
         return result

@@ -123,3 +123,49 @@ class DelayedEmailAllocationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class JobEmailCleanupFallbackTests(unittest.TestCase):
+    """stall/超时收尾漏标邮箱的回归：局部变量为空时从 job 记录兜底取邮箱。"""
+
+    def test_cleanup_email_falls_back_to_job_record_when_local_empty(self):
+        with patch.object(registration_service.db, "get_job", return_value={"email": "job@example.com"}):
+            self.assertEqual(
+                registration_service._resolve_job_email_for_cleanup(7),
+                "job@example.com",
+            )
+            self.assertEqual(
+                registration_service._resolve_job_email_for_cleanup(7, "explicit@example.com"),
+                "explicit@example.com",
+            )
+        with patch.object(registration_service.db, "get_job", return_value=None):
+            self.assertEqual(
+                registration_service._resolve_job_email_for_cleanup(7, None, ""),
+                "",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class EmailSubmittedMarkerTests(unittest.TestCase):
+    """已提交邮箱判定：失败回收回 available 还是 failed 的依据。"""
+
+    def test_submitted_marker_detection(self):
+        import os
+        import tempfile
+
+        submitted_path = clean_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8") as fh:
+                fh.write("11:25:34 [Cloak注册] 已提交邮箱，等待进入密码页或验证码页（1/1）\n")
+                submitted_path = fh.name
+            with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8") as fh:
+                fh.write("11:25:14 [Cloak注册][预检] attempt=1/1 ok=True country=SG\n")
+                clean_path = fh.name
+            self.assertTrue(registration_service._registration_email_was_submitted(submitted_path))
+            self.assertFalse(registration_service._registration_email_was_submitted(clean_path))
+            self.assertFalse(registration_service._registration_email_was_submitted(None))
+            self.assertFalse(registration_service._registration_email_was_submitted("Z:/no/such/file.log"))
+        finally:
+            for p in filter(None, (submitted_path, clean_path)):
+                os.unlink(p)

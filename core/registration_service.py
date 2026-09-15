@@ -344,14 +344,56 @@ def _prepare_registration_args() -> tuple[str, str, str]:
     return email, name, birthday
 
 
-def _release_unconsumed_job_email(email: str | None, reason: str) -> None:
-    """任务失败兜底：只回收尚未生成账号、仍处于 used 的邮箱领取。"""
+def _resolve_job_email_for_cleanup(job_id: int, *candidates: str | None) -> str:
+    """失败收尾定位任务邮箱：优先显式值，兜底 job 记录。
+
+    自动邮箱是"页面确认后才领取"的，子进程通过消息回传邮箱并写进 job 记录，
+    父线程局部变量 email 仍是空串——stall/超时/停止等异常路径据此回收邮箱会漏标。
+    """
+    for item in candidates:
+        text = str(item or "").strip()
+        if text:
+            return text
+    try:
+        row = db.get_job(job_id) or {}
+        return str(row.get("email") or "").strip()
+    except Exception:
+        return ""
+
+
+_EMAIL_SUBMITTED_MARKERS = ("已提交邮箱", "已进入下一步", "已直接落在验证码页", "等待验证码", "邮箱提交后进入")
+
+
+def _registration_email_was_submitted(log_file: str | None) -> bool:
+    """读任务日志判断邮箱是否已提交给服务端（已提交=脏，失败后不能回可用池）。"""
+    if not log_file:
+        return False
+    try:
+        text = Path(log_file).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return any(marker in text for marker in _EMAIL_SUBMITTED_MARKERS)
+
+
+def _release_unconsumed_job_email(email: str | None, reason: str, log_file: str | None = None) -> None:
+    """任务失败兜底：回收未生成账号的邮箱领取。
+
+    邮箱已提交给服务端（页面确认过邮箱）的失败回收为 failed，防止脏邮箱重返
+    可用池被再次领去注册；只有从未提交（如出口预检/CF 拦截）才回 available。
+    """
     if not email:
         return
     try:
         from core.email_provider import release_email_if_unconsumed
 
-        release_email_if_unconsumed(email, note=f"任务未消耗，已自动回收: {reason[:180]}")
+        if _registration_email_was_submitted(log_file):
+            release_email_if_unconsumed(
+                email,
+                note=f"注册未完成（邮箱已提交，防污染不回池）: {reason[:150]}",
+                status="failed",
+            )
+        else:
+            release_email_if_unconsumed(email, note=f"任务未消耗，已自动回收: {reason[:180]}")
     except Exception:
         logger.exception("[Service] 回收未消耗邮箱失败: %s", redact_email(email))
 
@@ -659,7 +701,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
             check_stop_requested()
             result = _run_registration_isolated(job_id, log_file, email, name, birthday)
             if is_stop_requested(job_id):
-                _release_unconsumed_job_email(email, "用户手动停止")
+                _release_unconsumed_job_email(_resolve_job_email_for_cleanup(job_id, email), "用户手动停止", log_file)
                 db.update_job(
                     job_id,
                     status="stopped",
@@ -689,14 +731,14 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
                     error=str(err)[:500],
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
-                email_to_handle = str(result_email or email or "").strip()
+                email_to_handle = _resolve_job_email_for_cleanup(job_id, result_email, email)
                 if _should_disable_failed_registration_email(err):
                     _disable_job_email(email_to_handle, str(err))
                 else:
-                    _release_unconsumed_job_email(email_to_handle, str(err))
+                    _release_unconsumed_job_email(email_to_handle, str(err), log_file)
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
     except RegistrationJobTimeout as exc:
-        _release_unconsumed_job_email(email, str(exc))
+        _release_unconsumed_job_email(_resolve_job_email_for_cleanup(job_id, email), str(exc), log_file)
         log_logger.error(f"[Job {job_id}] 自动超时并已清理子进程: {exc}")
         db.update_job(
             job_id,
@@ -705,7 +747,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
     except StopRequested as exc:
-        _release_unconsumed_job_email(email, str(exc))
+        _release_unconsumed_job_email(_resolve_job_email_for_cleanup(job_id, email), str(exc), log_file)
         current = db.get_job(job_id) or {}
         reason = str(current.get("error_message") or str(exc))
         auto_timeout = _is_automatic_stop_reason(reason) or _is_automatic_stop_reason(exc)
@@ -720,10 +762,11 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
         )
     except Exception as exc:
         err_text = f"{type(exc).__name__}: {exc}"
+        cleanup_email = _resolve_job_email_for_cleanup(job_id, email)
         if _should_disable_failed_registration_email(err_text):
-            _disable_job_email(email, err_text)
+            _disable_job_email(cleanup_email, err_text)
         else:
-            _release_unconsumed_job_email(email, err_text)
+            _release_unconsumed_job_email(cleanup_email, err_text, log_file)
         if is_stop_requested(job_id):
             current = db.get_job(job_id) or {}
             reason = str(current.get("error_message") or str(exc))
@@ -1069,6 +1112,7 @@ def request_stop_job(job_id: int, *, reason: str = "用户手动停止") -> dict
             _release_unconsumed_job_email(
                 str(job.get("email") or "").strip() or None,
                 "任务实例不存在，确认未继续执行",
+                str(job.get("log_file") or "") or None,
             )
             _append_job_log(job_id, f"{reason}：未找到运行中的任务实例，已直接标记为已停止。")
             logger.warning("[Service] 请求停止任务 #%s：任务实例不存在，已直接标记 stopped（%s）", job_id, reason)

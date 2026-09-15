@@ -135,6 +135,9 @@ class ICloudMailboxPool:
         with self.lock:
             state = self._load()
             current = dict(state.get(address) or {})
+            if str(current.get("state") or "") == "disabled":
+                # 已停用的别名不允许被成功/失败回收覆盖为其它状态。
+                return
             current.update({
                 "state": "used" if success else "failed",
                 "reason": "" if success else str(error or "")[:300],
