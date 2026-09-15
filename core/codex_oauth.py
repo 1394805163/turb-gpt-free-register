@@ -776,6 +776,13 @@ def _bootstrap_authorize(
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
     logger.info("[Codex] 跟随 Codex authorize URL 建立会话...")
     logger.info(f"[Codex] 完整授权地址: {auth_url}")
+    if getattr(session, "page_transport", False):
+        # 页面会话：fetch 直连 authorize 会被 Cloudflare 拦成 "Just a moment"，
+        # 必须用真实导航建立 oai-client-auth-session。
+        session.driver.get(auth_url)
+        time.sleep(3)
+        logger.info("[Codex] 页面导航完成，落点: %s", str(session.driver.current_url or "")[:120])
+        return
     resp = _with_net_retry(
         "bootstrap authorize",
         lambda: session.get(auth_url, headers=headers, allow_redirects=True),
@@ -789,8 +796,11 @@ def _bootstrap_authorize(
 
 def _submit_email(session: BrowserSession, email: str) -> None:
     """POST authorize/continue 提交邮箱，触发 OpenAI 发送邮箱 OTP。带 sentinel。"""
-    sentinel_resp = request_sentinel_token(session, "authorize_continue")
-    sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "authorize_continue")
+    if getattr(session, "page_transport", False):
+        sentinel_header, so_header = None, None  # 页面会话由页内 SDK 自动附带
+    else:
+        sentinel_resp = request_sentinel_token(session, "authorize_continue")
+        sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "authorize_continue")
     payload = {"username": {"kind": "email", "value": email}}
     resp = _post_json(
         session,
@@ -813,8 +823,11 @@ def _submit_email(session: BrowserSession, email: str) -> None:
 
 def _submit_email_otp(session: BrowserSession, code: str) -> None:
     """POST email-otp/validate 提交邮箱验证码。带 sentinel(authorize_continue)。"""
-    sentinel_resp = request_sentinel_token(session, "authorize_continue")
-    sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "authorize_continue")
+    if getattr(session, "page_transport", False):
+        sentinel_header, so_header = None, None  # 页面会话由页内 SDK 自动附带
+    else:
+        sentinel_resp = request_sentinel_token(session, "authorize_continue")
+        sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "authorize_continue")
     resp = _post_json(
         session,
         "https://auth.openai.com/api/accounts/email-otp/validate",
@@ -993,6 +1006,25 @@ def _do_phone_verification(session: BrowserSession) -> None:
 # ============================================================
 # 步骤 5：选 workspace → 拿 callback code
 # ============================================================
+
+def _follow_continue_url(session: BrowserSession, otp_resp: dict) -> None:
+    """OTP 通过后跟随 continue_url，让服务端推进授权状态（workspace 选择的前置）。"""
+    resp = otp_resp or {}
+    page = resp.get("page") if isinstance(resp.get("page"), dict) else {}
+    continue_url = str(resp.get("continue_url") or resp.get("url") or page.get("continue_url") or "")
+    if not continue_url:
+        logger.warning("[Codex] OTP 响应没有 continue_url，跳过跟随")
+        return
+    try:
+        session.get(
+            continue_url,
+            headers=session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification"),
+            allow_redirects=True,
+        )
+        logger.info("[Codex] 已跟随 continue_url: %s", continue_url[:100])
+    except Exception as exc:
+        logger.warning("[Codex] 跟随 continue_url 失败（继续尝试后续流程）: %s", str(exc)[:160])
+
 
 def _get_workspace_id(session: BrowserSession) -> str:
     """
@@ -1425,7 +1457,17 @@ def run_codex_oauth(
     if otp_provider is None:
         from core.email_provider import wait_for_otp as otp_provider
 
-    session = BrowserSession(proxy=proxy)
+    page_driver = None
+    transport = str(getattr(_cfg, "CODEX_OAUTH_PROTOCOL_TRANSPORT", "page") or "page").strip().lower()
+    if transport == "page":
+        from core.cloakbrowser_driver import build_cloak_driver
+        from core.page_session import PageSession
+
+        page_driver, _opened = build_cloak_driver(proxy=proxy or None)
+        session = PageSession(page_driver)
+        logger.info("[Codex] protocol 使用页面会话（内核浏览器代发请求，sentinel 由页面生成）")
+    else:
+        session = BrowserSession(proxy=proxy)
     try:
         logger.info("[Codex] 开始授权（全新 session）：%s", redact_email(email))
 
@@ -1455,7 +1497,8 @@ def run_codex_oauth(
 
         # 2. 网络预检 + 建立会话。预检不携带邮箱，不触发 OTP；
         #    真正烧邮箱的 authorize/continue 只在预检成功后执行。
-        network_preflight(session)
+        if not getattr(session, "page_transport", False):
+            network_preflight(session)
         human_delay("navigate")
 
         _bootstrap_authorize(session, state, code_challenge, auth_url=auth_url)
@@ -1492,14 +1535,24 @@ def run_codex_oauth(
         otp_resp = _submit_email_otp(session, email_otp)
         if str(((otp_resp or {}).get("page") or {}).get("type") or "") == "mfa_challenge":
             _pass_mfa_challenge(session, email, otp_resp)
-        human_delay("api")
+            human_delay("api")
 
-        # 5. 手机号验证（接码，自动重试换号）
-        _do_phone_verification(session)
-        human_delay("post_auth")
+        # 4.5 OTP 通过后：若 continue_url 已是带 code 的 OAuth callback，
+        #     直接提取 code（此时无需 workspace 选择）；否则跟随并走 workspace 流程。
+        otp_continue = str((otp_resp or {}).get("continue_url") or (otp_resp or {}).get("url") or "")
+        if "callback" in otp_continue and "code=" in otp_continue:
+            callback_url = otp_continue
+            logger.info("[Codex] OTP 响应直接给出 callback，跳过 workspace 选择")
+        else:
+            _follow_continue_url(session, otp_resp)
+            human_delay("api")
 
-        # 6. 选 workspace → 拿 callback code
-        callback_url = _select_workspace_and_get_callback(session, state)
+            # 5. 手机号验证（接码，自动重试换号）
+            _do_phone_verification(session)
+            human_delay("post_auth")
+
+            # 6. 选 workspace → 拿 callback code
+            callback_url = _select_workspace_and_get_callback(session, state)
         code = _extract_code(callback_url, state)
         logger.info(f"[Codex] 已拿到 authorization code：{code[:24]}...")
 
@@ -1603,3 +1656,9 @@ def run_codex_oauth(
             email=email,
             message=f"{type(exc).__name__}: {str(exc)[:200]}",
         )
+    finally:
+        if page_driver is not None:
+            try:
+                page_driver.quit()
+            except Exception:
+                pass

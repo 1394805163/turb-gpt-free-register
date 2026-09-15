@@ -3,8 +3,8 @@
 注册成功后自动跑 Codex OAuth 授权的配置项。
 设置 ENABLE_CODEX = False 可完全跳过此步骤。
 
-参数与 chatgpt2api 的 services/oauth_login_service.py 保持一致，
-生成的 refresh_token 可直接进入 chatgpt2api 的自动续期流程。
+授权参数沿用 v0.9.2 的本地 OAuth 兼容合同。
+浏览器驱动保持 CloakBrowser，数据库与代理逻辑不受此配置调整影响。
 """
 from config.env_loader import env_str, apply_env_overrides
 
@@ -12,7 +12,7 @@ from config.env_loader import env_str, apply_env_overrides
 # 是否启用 Codex OAuth 授权（False = 跳过，不影响注册结果）
 ENABLE_CODEX: bool = False
 
-# OAuth 客户端 ID 与 chatgpt2api 的 OAuth 登录服务保持一致，确保 refresh_token 可续期。
+# v0.9.2 OAuth 兼容客户端 ID。
 CODEX_CLIENT_ID: str = "app_2SKx67EdpoN0G6j64rFvigXD"
 
 # 授权端点（openai_auth.go:25 AuthURL）
@@ -61,6 +61,11 @@ CODEX_OAUTH_DRIVER: str = "cloak"
 # 不购买/调用短信平台；如果 OpenAI 强制要求手机号，本次授权明确失败并记录原因。
 CODEX_OAUTH_SKIP_PHONE_VERIFICATION: bool = True
 
+# protocol 驱动的传输方式：
+#   page（默认）— 用内核浏览器页面代发关键请求（页面 SDK 生成 sentinel token + so）；
+#   http        — 旧纯 HTTP 路径（缺 openai-sentinel-so-token，服务端会挂起）。
+CODEX_OAUTH_PROTOCOL_TRANSPORT: str = "page"
+
 # OAuth 批次门禁：默认只要求账号达到最小年龄；旧版 access_token 到期门禁保留为兼容开关并默认关闭。
 CODEX_OAUTH_MIN_AGE_DAYS: int = 7
 CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN: bool = False
@@ -73,8 +78,8 @@ CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN: bool = False
 # ============================================================
 
 # 授权地址来源：
-#   "local" = 本地生成与 chatgpt2api 兼容的 PKCE 授权地址（当前使用）
-#   "cpa"/"sub2" = 旧兼容路径
+#   "local" = 本地生成 v0.9.2 兼容的 PKCE 授权地址（当前使用）
+#   "cpa"/"sub2" = 兼容路径
 CODEX_AUTH_URL_SOURCE: str = "local"
 
 # CPA 管理页面或服务地址，例如 http://localhost:8317/admin/oauth
@@ -170,4 +175,4 @@ L_ADMIN_AUTH_CODE: str = env_str("L_ADMIN_AUTH_CODE", "")
 L_PHONE_PREFIX: str = ""
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_OAUTH_SKIP_PHONE_VERIFICATION': 'bool', 'CODEX_OAUTH_MIN_AGE_DAYS': 'int', 'CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN': 'bool', 'CODEX_AUTH_URL_SOURCE': 'str', 'CODEX_AUTH0_CLIENT': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})
+apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_OAUTH_PROTOCOL_TRANSPORT': 'str', 'CODEX_OAUTH_SKIP_PHONE_VERIFICATION': 'bool', 'CODEX_OAUTH_MIN_AGE_DAYS': 'int', 'CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN': 'bool', 'CODEX_AUTH_URL_SOURCE': 'str', 'CODEX_AUTH0_CLIENT': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})
