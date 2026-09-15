@@ -69,7 +69,13 @@ def run_cloak_liveness_flow(
     driver = None
     opened = None
     try:
-        driver, opened = build_cloak_driver(proxy=proxy, proxy_selection=proxy_selection)
+        from core.cloakbrowser_driver import account_fingerprint_seed
+
+        driver, opened = build_cloak_driver(
+            proxy=proxy,
+            proxy_selection=proxy_selection,
+            fingerprint_seed=account_fingerprint_seed(email),
+        )
         login_timeout = _setting_int("CLOAK_LOGIN_PAGE_TIMEOUT", 25, 8)
         normal_timeout = _setting_int("CLOAK_SELENIUM_TIMEOUT", 90, 20)
         driver.set_page_load_timeout(login_timeout)

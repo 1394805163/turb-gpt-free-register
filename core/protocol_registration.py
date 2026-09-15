@@ -119,7 +119,13 @@ def run_protocol_registration(
 
     driver = None
     try:
-        driver, _opened = build_cloak_driver(proxy=proxy, proxy_selection=proxy_selection)
+        from core.cloakbrowser_driver import account_fingerprint_seed
+
+        driver, _opened = build_cloak_driver(
+            proxy=proxy,
+            proxy_selection=proxy_selection,
+            fingerprint_seed=account_fingerprint_seed(email),
+        )
         session = PageSession(driver)
 
         # 1) chatgpt.com 域内取 csrf + signin（页内 fetch）

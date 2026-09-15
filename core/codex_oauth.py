@@ -1463,7 +1463,13 @@ def run_codex_oauth(
         from core.cloakbrowser_driver import build_cloak_driver
         from core.page_session import PageSession
 
-        page_driver, _opened = build_cloak_driver(proxy=proxy or None, proxy_selection=proxy_selection)
+        from core.cloakbrowser_driver import account_fingerprint_seed as _seed_for
+
+        page_driver, _opened = build_cloak_driver(
+            proxy=proxy or None,
+            proxy_selection=proxy_selection,
+            fingerprint_seed=_seed_for(email),
+        )
         session = PageSession(page_driver)
         logger.info("[Codex] protocol 使用页面会话（内核浏览器代发请求，sentinel 由页面生成）")
     else:

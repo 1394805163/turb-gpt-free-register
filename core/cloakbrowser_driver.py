@@ -2,6 +2,7 @@
 """CloakBrowser 的 Selenium 风格轻量适配层。"""
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -596,15 +597,28 @@ def _allows_transparent_mihomo_route(selection: dict | None) -> bool:
     return bool(data.get("transparent")) and data.get("mode") in {"mihomo_us", "mihomo_excluded"}
 
 
+def account_fingerprint_seed(email: str) -> str:
+    """由邮箱推导稳定画像种子：同一账号在所有后续流程复用同一份浏览器画像。
+
+    真实用户长期用同一台设备；每次登录都换一套画像反而是明显的风控信号。
+    """
+    target = str(email or "").strip().lower()
+    if not target:
+        return ""
+    return hashlib.sha256(f"cloak-profile:{target}".encode("utf-8")).hexdigest()[:16]
+
+
 def build_cloak_driver(
     proxy: str | None = None,
     proxy_selection: dict | None = None,
+    fingerprint_seed: str | None = None,
 ) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
     """启动 CloakBrowser 并返回 Selenium 风格 driver。
 
     proxy=None 且没有 proxy_selection 时选择一次代理；
     proxy_selection 由上游传入时沿用同一次节点选择，禁止二次轮换；
-    proxy="..." 时使用指定代理。
+    proxy="..." 时使用指定代理；
+    fingerprint_seed 传入时覆盖配置里的全局种子（账号级稳定画像）。
     """
     from config import proxy as _proxy_cfg
     proxy_selection = dict(proxy_selection) if isinstance(proxy_selection, dict) else {}
@@ -634,7 +648,7 @@ def build_cloak_driver(
         raise RuntimeError("未安装 cloakbrowser，请执行：pip install cloakbrowser") from exc
 
     launch_args = list(getattr(_cfg, "CLOAK_EXTRA_ARGS", []) or [])
-    seed = str(getattr(_cfg, "CLOAK_FINGERPRINT_SEED", "") or "").strip()
+    seed = str(fingerprint_seed or getattr(_cfg, "CLOAK_FINGERPRINT_SEED", "") or "").strip()
     if seed:
         launch_args.append(f"--fingerprint={seed}")
 
@@ -681,10 +695,10 @@ def build_cloak_driver(
 
     user_data_dir = str(getattr(_cfg, "CLOAK_USER_DATA_DIR", "") or "").strip()
     logger.info(
-        "[Cloak] 启动 CloakBrowser：headless=%s humanize=%s geoip=%s proxy=%s locale=%s timezone=%s accept_language=%s persistent=%s",
+        "[Cloak] 启动 CloakBrowser：headless=%s humanize=%s geoip=%s proxy=%s locale=%s timezone=%s accept_language=%s persistent=%s fingerprint=%s",
         opts.get("headless"), opts.get("humanize"), opts.get("geoip"),
         _proxy_log_label(proxy_url), opts.get("locale") or "自动/默认", opts.get("timezone") or "自动/默认",
-        locale_opts.get("accept_language") or "自动/默认", bool(user_data_dir),
+        locale_opts.get("accept_language") or "自动/默认", bool(user_data_dir), seed or "默认",
     )
     context_kwargs = {}
     if locale_opts.get("locale"):

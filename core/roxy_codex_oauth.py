@@ -1501,7 +1501,13 @@ def run_cloak_codex_oauth(
             "code_verifier": code_verifier,
         }
         logger.info("[Codex][Cloak] 已生成本地 OAuth 授权地址，准备启动浏览器：%s", auth_url)
-    driver, opened = build_cloak_driver(proxy=proxy, proxy_selection=proxy_selection)
+    from core.cloakbrowser_driver import account_fingerprint_seed
+
+    driver, opened = build_cloak_driver(
+        proxy=proxy,
+        proxy_selection=proxy_selection,
+        fingerprint_seed=account_fingerprint_seed(email),
+    )
     try:
         return run_roxy_codex_oauth(
             email,
