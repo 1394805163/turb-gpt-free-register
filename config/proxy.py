@@ -16,6 +16,7 @@ import random
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -342,21 +343,31 @@ def node_matches_registration_region(
     return node_matches_country(node_name, region)
 
 
-def _mihomo_proxy_type_map(client, base: str, headers: dict[str, str], timeout: float) -> dict[str, str]:
-    """读取 Mihomo provider 元数据，建立代理名到协议/分组类型的索引。"""
+_MIHOMO_HEALTHCHECK_URL = "https://www.gstatic.com/generate_204"
+
+
+def _mihomo_provider_index(
+    client, base: str, headers: dict[str, str], timeout: float
+) -> tuple[dict[str, str], dict[str, dict]]:
+    """读取 Mihomo provider 元数据：代理名→类型、代理名→最近一次健康检查结果。
+
+    健康数据（alive/delay/time）用于避开已失效的出口节点；控制器不提供时返回空字典，
+    调用方退回按名称筛选的旧行为。
+    """
     try:
         response = client.get(f"{base}/providers/proxies", headers=headers, timeout=timeout)
         response.raise_for_status()
         payload = response.json()
     except Exception:
         # 兼容旧版控制器或只实现 /proxies/{group} 的测试桩；调用方会使用名称兜底。
-        return {}
+        return {}, {}
 
     providers = payload.get("providers") if isinstance(payload, dict) else None
     if not isinstance(providers, dict):
-        return {}
-    result: dict[str, str] = {}
-    for provider in providers.values():
+        return {}, {}
+    types: dict[str, str] = {}
+    health: dict[str, dict] = {}
+    for provider_name, provider in providers.items():
         items = provider.get("proxies") if isinstance(provider, dict) else None
         if not isinstance(items, list):
             continue
@@ -364,10 +375,73 @@ def _mihomo_proxy_type_map(client, base: str, headers: dict[str, str], timeout: 
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
+            if not name:
+                continue
             proxy_type = str(item.get("type") or "").strip().upper()
-            if name and proxy_type:
-                result[name] = proxy_type
-    return result
+            if proxy_type:
+                types[name] = proxy_type
+            history = item.get("history") if isinstance(item.get("history"), list) else []
+            latest = history[-1] if history and isinstance(history[-1], dict) else {}
+            delay = latest.get("delay")
+            health[name] = {
+                "provider": str(provider_name or ""),
+                "alive": item.get("alive") is not False,
+                "delay": int(delay) if isinstance(delay, (int, float)) and delay > 0 else 0,
+                "time": str(latest.get("time") or ""),
+            }
+    return types, health
+
+
+def _mihomo_proxy_type_map(client, base: str, headers: dict[str, str], timeout: float) -> dict[str, str]:
+    """兼容入口：只取代理名到协议类型的索引。"""
+    return _mihomo_provider_index(client, base, headers, timeout)[0]
+
+
+def _mihomo_health_fresh(
+    health: dict[str, dict], candidates: list[str], max_age: float = 600.0
+) -> bool:
+    """候选节点是否有足够新的健康数据（旧数据不足以证明节点还活着）。"""
+    newest = 0.0
+    for name in candidates:
+        stamp = str((health.get(name) or {}).get("time") or "")
+        if not stamp:
+            continue
+        try:
+            parsed = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        newest = max(newest, parsed.timestamp())
+    return bool(newest) and (time.time() - newest) <= max_age
+
+
+def _mihomo_healthcheck(
+    client, base: str, headers: dict[str, str], timeout: float, providers: set[str]
+) -> None:
+    """触发指定 provider 主动测速（异步）；失败静默，调用方有随机兜底。"""
+    for name in sorted(providers):
+        if not name:
+            continue
+        try:
+            client.get(
+                f"{base}/providers/proxies/{quote(name, safe='')}/healthcheck",
+                headers=headers,
+                timeout=max(timeout, 5.0),
+                params={"timeout": 5000, "url": _MIHOMO_HEALTHCHECK_URL},
+            )
+        except Exception:
+            continue
+
+
+def _mihomo_pick_node(candidates: list[str], health: dict[str, dict], *, top: int = 5) -> str:
+    """按健康数据在最快的几个节点里随机；没有健康数据时退回全量随机。"""
+    scored = sorted(
+        (info["delay"], name)
+        for name in candidates
+        if (info := health.get(name) or {}) and info.get("alive") and info.get("delay")
+    )
+    if not scored:
+        return random.choice(candidates)
+    return random.choice([name for _, name in scored[:top]])
 
 
 def _is_mihomo_leaf_node(node_name: str, proxy_types: dict[str, str] | None = None) -> bool:
@@ -454,7 +528,7 @@ def select_mihomo_proxy(
     response.raise_for_status()
     payload = response.json()
     names = payload.get("all") if isinstance(payload, dict) else []
-    proxy_types = _mihomo_proxy_type_map(client, base, headers, timeout)
+    proxy_types, node_health = _mihomo_provider_index(client, base, headers, timeout)
     candidates = [
         str(name) for name in (names or [])
         if _is_mihomo_leaf_node(str(name), proxy_types)
@@ -468,7 +542,24 @@ def select_mihomo_proxy(
     alternatives = [name for name in candidates if name != current]
     if alternatives:
         candidates = alternatives
-    node_name = random.choice(candidates)
+    # 出口节点不能靠随机：失效节点会让 Cloudflare/OpenAI 直接 403 或超时（刷新 AT 失败）。
+    # provider 健康数据过期时先主动测速一次，再按延迟挑最快的几个。
+    if node_health and not _mihomo_health_fresh(node_health, candidates):
+        _mihomo_healthcheck(
+            client,
+            base,
+            headers,
+            timeout,
+            {str((node_health.get(name) or {}).get("provider") or "") for name in candidates},
+        )
+        for _ in range(6):
+            time.sleep(1.0)
+            refreshed_types, refreshed_health = _mihomo_provider_index(client, base, headers, timeout)
+            if _mihomo_health_fresh(refreshed_health, candidates):
+                proxy_types = refreshed_types or proxy_types
+                node_health = refreshed_health
+                break
+    node_name = _mihomo_pick_node(candidates, node_health)
     switched = client.put(
         endpoint,
         headers={**headers, "Content-Type": "application/json"},

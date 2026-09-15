@@ -544,5 +544,97 @@ class MihomoUsProxyTests(unittest.TestCase):
             direct_route.assert_not_called()
 
 
+class MihomoNodeHealthTests(unittest.TestCase):
+    """出口节点选择必须用 provider 健康数据避开死节点（选死了就会 403/超时）。"""
+
+    class _Client:
+        def __init__(self, group, providers):
+            self.group = group
+            self.providers = providers
+            self.urls: list[str] = []
+
+        def get(self, url, **kwargs):
+            self.urls.append(url)
+            response = Mock()
+            response.status_code = 200
+            response.raise_for_status.side_effect = None
+            response.json.return_value = self.providers if url.endswith("/providers/proxies") else self.group
+            return response
+
+        def put(self, url, **kwargs):
+            response = Mock()
+            response.status_code = 204
+            response.raise_for_status.side_effect = None
+            response.json.return_value = {}
+            return response
+
+    def _payloads(self):
+        from datetime import datetime, timezone
+
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        group = {
+            "name": "🤖 ChatGPT",
+            "type": "Selector",
+            "now": "🇺🇸 US01",
+            "all": ["🇺🇸 US01", "🇺🇸 US04", "🇯🇵 JP02", "🇸🇬 SG06", "🚀 手动选择"],
+        }
+        providers = {"providers": {"Provider_1": {"proxies": [
+            {"name": "🇺🇸 US01", "type": "Trojan", "alive": True, "history": [{"time": stamp, "delay": 320}]},
+            {"name": "🇺🇸 US04", "type": "Trojan", "alive": True, "history": [{"time": stamp, "delay": 150}]},
+            {"name": "🇯🇵 JP02", "type": "Trojan", "alive": True, "history": [{"time": stamp, "delay": 90}]},
+            {"name": "🇸🇬 SG06", "type": "Trojan", "alive": False, "history": [{"time": stamp, "delay": 0}]},
+        ]}}}
+        return group, providers
+
+    def test_picks_fast_alive_node_and_never_the_dead_one(self):
+        group, providers = self._payloads()
+        client = self._Client(group, providers)
+        with patch.object(proxy.random, "choice", wraps=proxy.random.choice) as choose:
+            selected = proxy.select_mihomo_proxy(
+                controller_url="http://127.0.0.1:9090",
+                secret="s",
+                group="🤖 ChatGPT",
+                proxy_url="",
+                allowed_countries={"US", "JP", "TW", "SG"},
+                excluded_countries={"HK"},
+                excluded_multipliers={"0.2"},
+                allow_transparent=True,
+                session=client,
+            )
+
+        pool = choose.call_args.args[0]
+        self.assertEqual(pool, ["🇯🇵 JP02", "🇺🇸 US04"])
+        self.assertNotIn("🇸🇬 SG06", pool)
+        self.assertTrue(selected["node_name"] in pool)
+        # 健康数据新鲜时不应额外触发测速
+        self.assertFalse([u for u in client.urls if u.endswith("/healthcheck")])
+
+    def test_stale_health_data_triggers_healthcheck_before_pick(self):
+        from datetime import datetime, timedelta, timezone
+
+        group, providers = self._payloads()
+        old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+        for item in providers["providers"]["Provider_1"]["proxies"]:
+            item["history"][0]["time"] = old
+        client = self._Client(group, providers)
+
+        with patch.object(proxy, "_mihomo_provider_index", wraps=proxy._mihomo_provider_index) as index, patch.object(
+            proxy.time, "sleep", return_value=None
+        ):
+            proxy.select_mihomo_proxy(
+                controller_url="http://127.0.0.1:9090",
+                secret="s",
+                group="🤖 ChatGPT",
+                proxy_url="",
+                allowed_countries={"US", "JP"},
+                excluded_countries={"HK"},
+                allow_transparent=True,
+                session=client,
+            )
+
+        self.assertTrue([u for u in client.urls if u.endswith("/healthcheck")], "过期健康数据应触发主动测速")
+        self.assertGreaterEqual(index.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
