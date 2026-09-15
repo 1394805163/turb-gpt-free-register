@@ -16,7 +16,10 @@ from core.roxy_registration import (
     _clear_otp_inputs,
     _click_continue,
     _click_resend_email_otp,
+    _fill_login_password_if_present,
     _fill_password_page_if_present,
+    _is_login_password_page,
+    _is_mfa_challenge_page,
     _is_chatgpt_logged_in_page,
     _is_email_verification_page,
     _maybe_accept,
@@ -95,6 +98,24 @@ def run_cloak_liveness_flow(
             email,
             timeout=_setting_int("CLOAK_PASSWORD_PAGE_TIMEOUT", 45, 15),
         )
+        if _is_login_password_page(driver):
+            # 账号已设密码且页面上没有"一次性验证码"入口：直接用存储密码登录。
+            _fill_login_password_if_present(driver, email, timeout=25)
+            # 密码提交后服务端跳转可能很慢（实测 30s+）：轮询等待 mfa-challenge/登录态。
+            mfa_deadline = time.time() + 75
+            last_log = 0.0
+            while time.time() < mfa_deadline:
+                if _is_mfa_challenge_page(driver):
+                    logger.info("[Cloak查活] 密码提交后进入 2FA 挑战页，提交本地 TOTP")
+                    _pass_mfa_challenge_if_needed(driver, email, timeout=30)
+                    break
+                if _is_chatgpt_logged_in_page(driver):
+                    logger.info("[Cloak查活] 密码登录后已检测到登录态")
+                    break
+                if time.time() - last_log >= 8:
+                    last_log = time.time()
+                    logger.info("[Cloak查活] 等待密码登录跳转：url=%s", str(getattr(driver, 'current_url', '') or '')[:120])
+                time.sleep(1.0)
 
         if not _is_email_verification_page(driver) and _is_chatgpt_logged_in_page(driver):
             session_info = _fetch_chatgpt_session(
@@ -111,6 +132,12 @@ def run_cloak_liveness_flow(
         otp_submit_timeout = _setting_int("CLOAK_OTP_SUBMIT_TIMEOUT", 20, 8)
         for attempt in range(1, 4):
             if current_otp is None:
+                if _is_mfa_challenge_page(driver):
+                    logger.info("[Cloak查活][OTP] 页面为 2FA 挑战页，先提交本地 TOTP 动态码")
+                    _pass_mfa_challenge_if_needed(driver, email, timeout=30)
+                    if _is_chatgpt_logged_in_page(driver):
+                        logger.info("[Cloak查活][OTP] 2FA 通过后已是登录态，跳过取码")
+                        break
                 logger.info(
                     "[Cloak查活][OTP] 等待验证码：%s（第 %s/3 次）",
                     redact_email(email),

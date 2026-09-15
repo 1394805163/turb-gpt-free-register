@@ -1166,6 +1166,64 @@ def _is_mfa_challenge_page(driver) -> bool:
     return "mfa-challenge" in url or "mfa_challenge" in url
 
 
+def _fill_login_password_if_present(driver, email: str, timeout: int = 25) -> bool:
+    """登录密码页：用 DB 里保存的密码完成登录（补密码后的账号走这里）。
+
+    返回 True 表示已提交密码（后续可能是登录成功，也可能进 MFA 挑战页）。
+    """
+    if not _is_login_password_page(driver):
+        return False
+    from core import db
+
+    acc = db.get_account_by_email(email) or {}
+    password = str(acc.get("password") or acc.get("registration_password") or "").strip()
+    if not password:
+        logger.info("%s 当前是登录密码页但 DB 无密码，跳过密码填写", _log_prefix(driver))
+        return False
+    try:
+        password_input = _find_any(driver, [
+            "input[type='password']",
+            "input[name*='password' i]",
+            "input[autocomplete='current-password']",
+        ], timeout=8)
+    except Exception:
+        password_input = None
+    if password_input is None:
+        logger.info("%s 登录密码页未找到密码输入框", _log_prefix(driver))
+        return False
+    submit = None
+    for selector in ("form button[type='submit']", "button[type='submit']", "input[type='submit']"):
+        try:
+            submit = _find_any(driver, [selector], timeout=2)
+        except Exception:
+            submit = None
+        if submit is not None:
+            break
+    _human_type_text(driver, password_input, password, clear=True)
+    human_delay("form", minimum=1.2, maximum=2.6)
+    try:
+        typed_len = len(str(password_input.get_attribute("value") or ""))
+    except Exception:
+        typed_len = -1
+    submit_label = ""
+    if submit is not None:
+        try:
+            submit_label = str(submit.text or submit.get_attribute("value") or "")[:40]
+        except Exception:
+            submit_label = "?"
+        _human_click(driver, submit, label="login_password_submit")
+    else:
+        try:
+            from selenium.webdriver.common.keys import Keys
+            password_input.send_keys(Keys.ENTER)
+            submit_label = "<ENTER>"
+        except Exception as exc:
+            logger.info("%s 密码页无提交按钮且回车失败：%s", _log_prefix(driver), type(exc).__name__)
+    logger.info("%s 已在登录密码页提交存储密码（输入长度=%s 按钮=%s）", _log_prefix(driver), typed_len, submit_label or "-")
+    time.sleep(3)
+    return True
+
+
 def _pass_mfa_challenge_if_needed(driver, email: str, timeout: int = 25) -> bool:
     """账号启用 2FA 时，用本地保存的 totp_secret 生成动态码通过 mfa-challenge。"""
     if not _is_mfa_challenge_page(driver):
