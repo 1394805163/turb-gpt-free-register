@@ -17,8 +17,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
+
+WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(WT)
+sys.path.insert(0, WT)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("probe_shortcall")
