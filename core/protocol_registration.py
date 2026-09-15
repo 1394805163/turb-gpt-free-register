@@ -121,10 +121,11 @@ def run_protocol_registration(
     try:
         from core.cloakbrowser_driver import account_fingerprint_seed
 
+        profile_seed = account_fingerprint_seed(email)
         driver, _opened = build_cloak_driver(
             proxy=proxy,
             proxy_selection=proxy_selection,
-            fingerprint_seed=account_fingerprint_seed(email),
+            fingerprint_seed=profile_seed,
         )
         session = PageSession(driver)
 
@@ -334,7 +335,8 @@ def run_protocol_registration(
         if save:
             extra = {"user": info.get("user"), "account": info.get("account"),
                      "expires": info.get("expires"), "protocol_registration": True,
-                     "name": name, "birthday": birthday}
+                     "name": name, "birthday": birthday,
+                     "cloak_profile_seed": profile_seed}
             if registration_password:
                 extra["registration_password"] = registration_password
             exit_country = str((proxy_selection or {}).get("exit_country") or "").strip().upper()
