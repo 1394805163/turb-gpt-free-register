@@ -263,6 +263,19 @@ def set_account_password(
                 "error": f"提交后仍停留在新密码页：{json.dumps(final, ensure_ascii=False)[:240]}",
             }
 
+        # 复核：回到设置页读"密码"行（已设置会从 "Add" 变为 "Change"/"更改"）
+        verify_label = ""
+        try:
+            driver.get(SETTINGS_URL)
+            time.sleep(5)
+            verify_label = str(driver.execute_script(r"""
+            const el = document.querySelector('[data-testid="password-setting"]');
+            return el ? (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+            """) or "")
+            logger.info("[补密码] 设置页复核：password-setting=%s", verify_label)
+        except Exception as exc:
+            logger.info("[补密码] 设置页复核失败（不影响结果）：%s", str(exc)[:120])
+
         if save:
             try:
                 from core import db
@@ -271,7 +284,10 @@ def set_account_password(
                 logger.info("[补密码] 已回写密码到账号记录")
             except Exception as exc:
                 logger.warning("[补密码] 回写 DB 失败：%s", str(exc)[:160])
-        return {"ok": True, "status": "updated", "email": email, "password": new_password, "url": final_url}
+        return {
+            "ok": True, "status": "updated", "email": email, "password": new_password,
+            "url": final_url, "settings_label": verify_label,
+        }
     except Exception as exc:
         logger.exception("[补密码] 失败")
         return {"ok": False, "status": "failed", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
