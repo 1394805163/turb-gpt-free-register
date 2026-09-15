@@ -1026,6 +1026,11 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             # 继续等待真实 URL；不要用旧 URL 判定 authorize，避免把一次短暂空读
             # 误当成已经停留在旧页面。
             url = ""
+        if "auth.openai.com/error" in str(url or "").lower():
+            # 服务端错误页（rate_limit_exceeded / 风控拒绝等）：重试没有意义，
+            # 立即返回让上层停止重填重试、给出准确错误。
+            logger.warning("%s 邮箱提交后进入 auth 服务端错误页：%s", _log_prefix(driver), str(url)[:200])
+            return "auth_error"
         if _is_authorize_intermediate_url(url):
             now = time.time()
             if authorize_seen_at is None:
@@ -1101,6 +1106,16 @@ def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, ti
     """填写并提交邮箱，必须确认进入 password/otp/logged_in 才返回。"""
     last_state = None
     for attempt in range(1, attempts + 1):
+        if attempt > 1 and not _is_email_login_page_still_present(driver):
+            # 上一轮提交可能把页面推进到 authorize 中间态/CF 挑战页；重试前回到登录页，
+            # 否则 _type_email_address 找不到输入框会直接抛错（进程级失败）。
+            logger.info("%s 邮箱重试前页面已不在登录页，重新打开登录页", _log_prefix(driver))
+            try:
+                driver.get("https://chatgpt.com/auth/login")
+                time.sleep(2)
+                _maybe_accept(driver)
+            except Exception as exc:
+                logger.info("%s 重新打开登录页失败（继续尝试）：%s", _log_prefix(driver), redact_emails(exc)[:120])
         if str(email or "").strip():
             _type_email_address(driver, email, timeout=20)
         else:
@@ -1123,6 +1138,11 @@ def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, ti
         _submit_email_step(driver, email)
         logger.info("%s 已提交邮箱，等待进入密码页或验证码页（%s/%s）", _log_prefix(driver), attempt, attempts)
         state_name = _wait_email_submit_next_state(driver, email, timeout=max(8, int(timeout or 20)))
+        if state_name == "auth_error":
+            raise RuntimeError(
+                "提交邮箱后进入 auth 服务端错误页（可能为限流 rate_limit_exceeded / 风控拒绝），"
+                f"已停止重试: url={getattr(driver, 'current_url', '') or ''}"
+            )
         if state_name == "login_password":
             raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
         if state_name in ("password", "otp", "logged_in"):

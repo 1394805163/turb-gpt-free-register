@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from config import email as email_config
 from config import register as register_config
@@ -169,3 +169,39 @@ class EmailSubmittedMarkerTests(unittest.TestCase):
         finally:
             for p in filter(None, (submitted_path, clean_path)):
                 os.unlink(p)
+
+class AuthErrorPageFastFailTests(unittest.TestCase):
+    """邮箱提交后落到 auth.openai.com/error（限流等）必须快速失败、不再盲重试。"""
+
+    def test_wait_state_returns_auth_error(self):
+        module = roxy
+        driver = Mock()
+        driver.current_url = "https://auth.openai.com/error?payload=fixture"
+        with patch.object(module, "_has_access_token", return_value=False), patch.object(
+            module, "_is_login_password_page", return_value=False
+        ), patch.object(module, "_is_email_verification_page", return_value=False), patch.object(
+            module, "_is_signup_password_page", return_value=False
+        ), patch.object(
+            module,
+            "_email_input_value_state",
+            return_value={"url": "https://auth.openai.com/error?payload=fixture", "inputs": []},
+        ):
+            outcome = module._wait_email_submit_next_state(driver, "fixture@example.com", timeout=1)
+        self.assertEqual(outcome, "auth_error")
+
+    def test_submit_email_raises_on_auth_error(self):
+        module = roxy
+        driver = Mock()
+        driver.current_url = "https://auth.openai.com/error?payload=fixture"
+        with patch.object(
+            module,
+            "_wait_email_submit_next_state",
+            return_value="auth_error",
+        ), patch.object(module, "_type_email_address"), patch.object(
+            module, "_email_input_value_state", return_value={"inputs": [{"value": "fixture@example.com"}]}
+        ), patch.object(module, "_is_email_login_page_still_present", return_value=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                module._submit_email_and_wait_next(driver, "fixture@example.com", attempts=2, timeout=5)
+        self.assertIn("auth", str(ctx.exception).lower())
+
+
