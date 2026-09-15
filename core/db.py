@@ -1201,13 +1201,23 @@ def claim_account_plan_check(
         return True
 
 
-def mark_account_plan_check_running(acc_id: int) -> bool:
-    """把已排队的套餐查询标记为执行中。"""
+def mark_account_plan_check_running(
+    acc_id: int,
+    expected_token_fingerprint: str | None = None,
+) -> bool:
+    """把已排队的套餐查询标记为执行中。
+
+    expected_token_fingerprint：token 已刷新时拒绝标记（上游调用方会传），
+    避免用旧 token 的结果覆盖新凭证。
+    """
     with _LOCK:
         accounts = _load_accounts()
         row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None or row.get("plan_check_status") not in {"queued", "running"}:
             return False
+        if expected_token_fingerprint:
+            if _token_fingerprint(row.get("access_token") or "") != str(expected_token_fingerprint):
+                return False
         row["plan_check_status"] = "running"
         row["plan_check_started_at"] = _now()
         row["plan_check_error"] = None
@@ -1236,8 +1246,17 @@ def recover_interrupted_plan_checks() -> int:
         return recovered
 
 
-def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None) -> bool:
-    """更新账号套餐/Plus 试用资格查询结果。"""
+def update_account_plan_check(
+    acc_id: int | None = None,
+    email: str | None = None,
+    result: dict | None = None,
+    expected_token_fingerprint: str | None = None,
+) -> bool:
+    """更新账号套餐/Plus 试用资格查询结果。
+
+    expected_token_fingerprint：token 已刷新时丢弃本次结果（上游调用方会传），
+    避免旧 token 的结果覆盖新凭证。
+    """
     result = result or {}
     with _LOCK:
         accounts = _load_accounts()
@@ -1249,6 +1268,9 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
         ), None)
         if row is None:
             return False
+        if expected_token_fingerprint:
+            if _token_fingerprint(row.get("access_token") or "") != str(expected_token_fingerprint):
+                return False
 
         ok = bool(result.get("ok"))
         row["plan_check_status"] = "success" if ok else "failed"
@@ -1826,7 +1848,11 @@ def recover_interrupted_email_changes() -> int:
         return count
 
 
-def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
+def update_account_liveness(
+    acc_id: int,
+    result: dict | None = None,
+    expected_token_fingerprint: str | None = None,
+) -> bool:
     """写回账号查活结果；成功时同步刷新最新 access_token 和账号基础信息。"""
     result = result or {}
     with _LOCK:
@@ -1834,6 +1860,9 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
             return False
+        if expected_token_fingerprint:
+            if _token_fingerprint(row.get("access_token") or "") != str(expected_token_fingerprint):
+                return False
 
         now = _now()
         ok = bool(result.get("ok"))
