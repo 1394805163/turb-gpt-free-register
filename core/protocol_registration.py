@@ -81,7 +81,36 @@ def run_protocol_registration(
                     "error": f"submit_email HTTP {r1.status_code}: {r1.text[:150]}"}
         d1 = r1.json()
         ptype = str((d1.get("page") or {}).get("type") or "")
-        if ptype != "email_otp_verification":
+        registration_password = ""
+        if ptype == "create_account_password":
+            # 新版"密码注册"分支：先提交密码，再走邮箱 OTP。
+            # 端点/字段与 openai_auth 里保留的备用实现一致（user/register + email-otp/send）。
+            from core.roxy_registration import _registration_password
+
+            registration_password = _registration_password()
+            r_pw = _post_json(
+                session,
+                "https://auth.openai.com/api/accounts/user/register",
+                {"username": email, "password": registration_password},
+                referer="https://auth.openai.com/create-account/password",
+            )
+            if r_pw.status_code != 200:
+                return {"ok": False, "status": "failed", "email": email,
+                        "error": f"user/register HTTP {r_pw.status_code}: {r_pw.text[:150]}"}
+            d_pw = r_pw.json() or {}
+            page_pw = d_pw.get("page") or {}
+            if str(page_pw.get("type") or "") in {"email_otp_send", "email_otp_send_registration"} or \
+                    "email-otp/send" in str(d_pw.get("continue_url") or ""):
+                session.get(
+                    "https://auth.openai.com/api/accounts/email-otp/send",
+                    headers=session.get_auth_navigate_headers(
+                        referer="https://auth.openai.com/create-account/password"
+                    ),
+                    allow_redirects=True,
+                )
+            logger.info("[协议注册] 密码注册分支：密码已提交（len=%s），转入邮箱验证", len(registration_password))
+            ptype = "email_otp_verification"
+        elif ptype != "email_otp_verification":
             return {"ok": False, "status": "not_fresh", "email": email, "page_type": ptype,
                     "error": "邮箱已被注册或流程非注册（page.type=%s）" % (ptype or "unknown")}
 
@@ -114,20 +143,37 @@ def run_protocol_registration(
                     "error": "注册后未拿到 accessToken", "page_type": page2.get("type"),
                     "continue_url": cont[:120]}
 
+        totp_secret = ""
+        try:
+            from config import twofa as _twofa_cfg
+
+            if bool(getattr(_twofa_cfg, "ENABLE_2FA", False)):
+                from core.account_export import setup_2fa
+
+                totp_secret = str(setup_2fa(session, email) or "")
+                logger.info("[协议注册] 2FA 已启用，secret_len=%s", len(totp_secret))
+        except Exception as exc:
+            logger.warning("[协议注册] 2FA 设置失败（账号已注册成功，仅缺少 2FA）：%s", str(exc)[:160])
+
         row_id = None
         if save:
+            extra = {"user": info.get("user"), "account": info.get("account"),
+                     "expires": info.get("expires"), "protocol_registration": True,
+                     "name": name, "birthday": birthday}
+            if registration_password:
+                extra["registration_password"] = registration_password
             row_id = save_account_data(
-                email=email, access_token=at, totp_secret=None,
-                extra={"user": info.get("user"), "account": info.get("account"),
-                       "expires": info.get("expires"), "protocol_registration": True,
-                       "name": name, "birthday": birthday},
+                email=email, access_token=at, totp_secret=totp_secret or None,
+                extra=extra,
                 email_source="icloud",
                 proxy_used=(proxy_selection or {}).get("node_name") or (proxy or ""),
             )
         logger.info("[协议注册] 成功: %s row_id=%s", email, row_id)
         return {"ok": True, "status": "registered", "email": email, "row_id": row_id,
                 "access_token": at, "plan": (info.get("account") or {}).get("planType"),
-                "page_type": page2.get("type"), "name": name, "birthday": birthday}
+                "page_type": page2.get("type"), "name": name, "birthday": birthday,
+                "registration_password": registration_password or None,
+                "totp_secret": totp_secret or None}
     except Exception as exc:
         logger.warning("[协议注册] 失败: %s: %s: %s", email, type(exc).__name__, str(exc)[:180])
         return {"ok": False, "status": "failed", "email": email,
