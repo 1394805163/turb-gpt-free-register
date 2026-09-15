@@ -370,23 +370,45 @@ def run_registration(
         # 不跑任何 UI 元素交互 → 官网改版/元素失效不影响注册。
         from core.protocol_registration import run_protocol_registration
 
-        if not str(email or "").strip():
-            # 邮箱服务模式：任务入队时不领邮箱，这里按需领取并回写 job 状态
-            _handle_email_acquired(acquire_email_after_input(email))
         result: dict = {}
-        for attempt in range(1, 3):
-            result = run_protocol_registration(
-                email,
-                name=name,
-                birthday=birthday or generate_random_birthday(),
-            )
+        max_email_rounds = 3
+        for email_round in range(1, max_email_rounds + 1):
+            if not str(email or "").strip():
+                # 邮箱服务模式：任务入队时不领邮箱，这里按需领取并回写 job 状态
+                _handle_email_acquired(acquire_email_after_input(email))
+            for attempt in range(1, 3):
+                result = run_protocol_registration(
+                    email,
+                    name=name,
+                    birthday=birthday or generate_random_birthday(),
+                )
+                if result.get("ok"):
+                    break
+                error_text = str(result.get("error") or "")
+                # 出口国家探测偶发失败（节点 geo 查询超时）→ 换一次节点重试；其他错误直接返回
+                if "无法确认注册出口国家" not in error_text and "Mihomo 代理选择失败" not in error_text:
+                    break
+                logger.warning("[协议注册] 出口/选路失败，换节点重试（%s/2）：%s", attempt, error_text[:120])
             if result.get("ok"):
                 break
-            error_text = str(result.get("error") or "")
-            # 出口国家探测偶发失败（节点 geo 查询超时）→ 换一次节点重试；其他错误直接返回
-            if "无法确认注册出口国家" not in error_text and "Mihomo 代理选择失败" not in error_text:
-                break
-            logger.warning("[协议注册] 出口/选路失败，换节点重试（%s/2）：%s", attempt, error_text[:120])
+            error_text = str(result.get("error") or "").lower()
+            if "deleted or deactivated" in error_text or "account_deactivated" in error_text:
+                # 池子里混着"已被停用"的老账号邮箱：停用该邮箱并换下一个，别把整个 job 判失败
+                try:
+                    from core.email_provider import release_email as _release_email
+
+                    _release_email(email, status="disabled", note="账号已废（deleted or deactivated）")
+                except Exception:
+                    pass
+                logger.warning(
+                    "[协议注册] 邮箱对应账号已废，已停用并换下一个邮箱（%s/%s）：%s",
+                    email_round, max_email_rounds, email,
+                )
+                email = ""
+                if email_round >= max_email_rounds:
+                    break
+                continue
+            break
         codex_status = None
         if result.get("ok"):
             # 与 cloak/roxy 驱动保持一致：注册成功后按 ENABLE_CODEX_AUTO 顺带跑 Codex 授权，
@@ -397,7 +419,15 @@ def run_registration(
                 if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
                     from core.codex_oauth import run_codex_oauth
 
-                    codex_result = run_codex_oauth(email, force=True) or {}
+                    # 协议注册链路统一用协议 Codex（页面会话）：不再另起一个 UI 浏览器，
+                    # OTP 走页内 fetch，实测比 Cloak UI 稳定；跑完恢复用户配置。
+                    prev_codex_driver = getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", None)
+                    try:
+                        _codex_cfg.CODEX_OAUTH_DRIVER = "protocol"
+                        codex_result = run_codex_oauth(email, force=True) or {}
+                    finally:
+                        if prev_codex_driver is not None:
+                            _codex_cfg.CODEX_OAUTH_DRIVER = prev_codex_driver
                     codex_status = str(codex_result.get("status") or "")
                     logger.info("[协议注册][Codex] 授权结果：%s", codex_status or "-")
                     if codex_status == "success" or codex_result.get("ok"):
