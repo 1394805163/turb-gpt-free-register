@@ -22,6 +22,14 @@ from typing import Any
 _state_lock = Lock()
 logger = logging.getLogger(__name__)
 
+# 收件人可能出现在这些头部；头部预过滤与全文解析共用，避免两处漂移。
+RECIPIENT_HEADER_NAMES = (
+    "To", "Cc", "Bcc", "Delivered-To", "X-Original-To", "X-Apple-Original-To",
+    "Envelope-To", "X-Envelope-To", "Apparently-To", "Resent-To",
+)
+_HEADER_FETCH_FIELDS = RECIPIENT_HEADER_NAMES + ("Date", "Subject", "Message-ID")
+_HEADER_FETCH_SPEC = "(UID BODY.PEEK[HEADER.FIELDS (%s)])" % " ".join(_HEADER_FETCH_FIELDS)
+
 
 class ICloudMailboxPool:
     """仅保留 iCloud 隐藏邮箱池与 IMAP 验证码读取。"""
@@ -369,10 +377,7 @@ class ICloudMailboxPool:
         text = f"{self._decode(message.get('Subject'))}\n{self._body(message)}"
         headers = "\n".join(f"{key}: {self._decode(value)}" for key, value in message.items())
         recipient_values: list[str] = []
-        for header_name in (
-            "To", "Cc", "Bcc", "Delivered-To", "X-Original-To", "X-Apple-Original-To",
-            "Envelope-To", "X-Envelope-To", "Apparently-To", "Resent-To",
-        ):
+        for header_name in RECIPIENT_HEADER_NAMES:
             recipient_values.extend(self._decode(value) for value in message.get_all(header_name, []))
         recipients = {
             str(address or "").strip().lower()
@@ -381,6 +386,62 @@ class ICloudMailboxPool:
         }
         message_id = str(message.get("Message-ID") or uid.decode(errors="replace"))
         return message_id, text, received, headers, recipients
+
+    def _parse_header_message(self, uid: bytes, raw: bytes):
+        """只解析头部：返回 (message_id, received, recipients, subject)。"""
+        if not raw:
+            return None
+        message = message_from_bytes(raw, policy=policy.default)
+        try:
+            received = parsedate_to_datetime(str(message.get("Date") or ""))
+            received = received if received.tzinfo else received.replace(tzinfo=timezone.utc)
+        except Exception:
+            received = None
+        recipient_values: list[str] = []
+        for header_name in RECIPIENT_HEADER_NAMES:
+            recipient_values.extend(self._decode(value) for value in message.get_all(header_name, []))
+        recipients = {
+            str(address or "").strip().lower()
+            for _display_name, address in getaddresses(recipient_values)
+            if "@" in str(address or "")
+        }
+        message_id = str(message.get("Message-ID") or uid.decode(errors="replace"))
+        subject = self._decode(message.get("Subject"))
+        return message_id, received, recipients, subject
+
+    def _fetch_uid_headers(self, imap, uids, *, deadline: float | None = None):
+        """批量拉取候选邮件头部（一次命令），用于收件人/时间预过滤。
+
+        实测：全文 3.7s/封、头部 0.6s/封、批量头部（5 封）0.5s。先过滤再取正文，
+        避免一轮迭代把窗口耗光导致新邮件要等下一轮才可见。
+        """
+        result: dict[bytes, tuple] = {}
+        pending = [uid for uid in uids if uid]
+        if not pending:
+            return result
+        # 单批过长时拆块，避免响应体过大
+        chunk_size = 40
+        for start in range(0, len(pending), chunk_size):
+            chunk = pending[start:start + chunk_size]
+            self._bind_deadline(imap, deadline)
+            status, data = imap.uid("fetch", b",".join(chunk), _HEADER_FETCH_SPEC)
+            if status != "OK":
+                continue
+            for part in data or []:
+                if not isinstance(part, tuple) or len(part) < 2:
+                    continue
+                head_raw, raw = part[0], part[1]
+                if not isinstance(raw, bytes) or not raw:
+                    continue
+                text_head = head_raw.decode(errors="replace") if isinstance(head_raw, bytes) else str(head_raw)
+                match_uid = re.search(r"UID (\d+)", text_head)
+                if not match_uid:
+                    continue
+                uid = match_uid.group(1).encode()
+                parsed = self._parse_header_message(uid, raw)
+                if parsed is not None:
+                    result[uid] = parsed
+        return result
 
     def _fetch_uid_message(
         self,
@@ -432,6 +493,9 @@ class ICloudMailboxPool:
         selected_at = 0.0
         try:
             while time.monotonic() < deadline:
+                iteration_started = time.monotonic()
+                fetched_count = 0
+                header_filtered: dict = {}
                 try:
                     now = time.monotonic()
                     remaining_budget = deadline - now
@@ -473,6 +537,12 @@ class ICloudMailboxPool:
 
                     target = str(mailbox["address"]).strip().lower()
                     scoped = self._search_uids(imap, target, deadline=deadline)
+                    scan_ms = (time.monotonic() - iteration_started) * 1000
+                    logger.info(
+                        "[iCloud IMAP] 连接+检索完成：search=%s 用时=%.1fs",
+                        "-" if scoped is None else len(scoped),
+                        scan_ms / 1000.0,
+                    )
                     if scoped is not None:
                         # 服务端按收件人过滤：候选就是"该别名的全部邮件"，
                         # 大收件箱下从 5000+ 降到个位数。
@@ -490,6 +560,11 @@ class ICloudMailboxPool:
                         if merged:
                             mailbox["_last_uid"] = max(int(uid) for uid in merged)
                         candidates = merged
+                        logger.info(
+                            "[iCloud IMAP] 候选组装：总数=%s（尾窗并入后）用时=%.1fs",
+                            len(candidates),
+                            (time.monotonic() - iteration_started),
+                        )
                     else:
                         all_uids = self._all_uids(imap, deadline=deadline)
                         candidates = self._candidate_uid_window(all_uids, mailbox)
@@ -504,7 +579,30 @@ class ICloudMailboxPool:
                     used_code_hashes = mailbox.setdefault("_used_code_hashes", set())
                     clock_skew = max(0.0, float(self.config.get("clock_skew_seconds", 30)))
                     not_before = mailbox["_code_not_before"] - timedelta(seconds=clock_skew)
+                    # 先批量拉头部做收件人/时间预过滤（批量头部 ~0.5s vs 全文 3.7s/封），
+                    # 只对命中的邮件拉正文——否则一轮迭代会耗光整个等待窗口，
+                    # 新到的验证码邮件要等下一轮才可能被看到。
+                    header_filtered = self._fetch_uid_headers(imap, list(candidates), deadline=deadline)
                     for uid in reversed(candidates):
+                        header = header_filtered.get(uid)
+                        if header is None:
+                            pending_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 头部未取到，保留 pending", uid.decode(errors="replace"))
+                            continue
+                        _hdr_message_id, hdr_received, hdr_recipients, _hdr_subject = header
+                        if target not in hdr_recipients:
+                            pending_uids.discard(uid)
+                            backfill_uids.discard(uid)
+                            seen_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 跳过非当前别名收件人", uid.decode(errors="replace"))
+                            continue
+                        if hdr_received and hdr_received < not_before:
+                            pending_uids.discard(uid)
+                            backfill_uids.discard(uid)
+                            seen_uids.add(uid)
+                            logger.debug("[iCloud IMAP] UID=%s 跳过 code_not_before 之前的邮件", uid.decode(errors="replace"))
+                            continue
+                        fetched_count += 1
                         parsed = self._fetch_uid_message(imap, uid, deadline=deadline)
                         if parsed is None:
                             pending_uids.add(uid)
@@ -558,6 +656,12 @@ class ICloudMailboxPool:
                     )
                     self._close_imap(imap, deadline=deadline)
                     imap = None
+                logger.info(
+                    "[iCloud IMAP] 本轮无码：头部=%s 正文下载=%s 用时=%.1fs",
+                    len(header_filtered),
+                    fetched_count,
+                    time.monotonic() - iteration_started,
+                )
                 remaining_budget = deadline - time.monotonic()
                 if remaining_budget <= 0:
                     break

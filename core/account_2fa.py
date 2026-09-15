@@ -114,7 +114,16 @@ def set_account_2fa(
             try:
                 from core import db
 
-                db.update_account_totp_secret(email, secret)
+                acc = db.get_account_by_email(email) or {}
+                acc_id = int(acc.get("id") or 0)
+                if not acc_id:
+                    raise RuntimeError("账号不存在，无法回写 totp_secret")
+                # update_account_totp_secret(acc_id, result_dict)：这里必须传账号 id + 结果字典，
+                # 之前误传 (email, secret) 会 int(email) 抛错导致 secret 根本没落库。
+                db.update_account_totp_secret(
+                    acc_id,
+                    {"ok": True, "status": "success", "totp_secret": secret, "message": "补设 2FA 完成"},
+                )
                 logger.info("[补2FA] 已回写 totp_secret 到账号记录")
             except Exception as exc:
                 logger.warning("[补2FA] 回写 DB 失败：%s", str(exc)[:160])

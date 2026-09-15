@@ -10,6 +10,15 @@ from core.email_provider import parse_email_sources
 from core.icloud_mail_pool import ICloudMailboxPool
 
 
+def _header_only(raw: bytes) -> bytes:
+    """截出邮件头部（到第一个空行为止），模拟 BODY.PEEK[HEADER.FIELDS ...]。"""
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        index = raw.find(sep)
+        if index != -1:
+            return raw[:index]
+    return raw
+
+
 def otp_mail(address: str, code: str, *, received: datetime | None = None) -> bytes:
     message = EmailMessage()
     message["From"] = "OpenAI <noreply@tm.openai.com>"
@@ -48,15 +57,27 @@ class ScriptedIMAP:
             index = min(self.refresh_count, len(self.snapshots) - 1)
             return "OK", [b" ".join(self.snapshots[index])]
         if str(command).lower() == "fetch":
-            uid = args[0]
-            sequence = self.fetch_sequences.get(uid)
-            if sequence:
-                index = self.fetch_counts.get(uid, 0)
-                self.fetch_counts[uid] = index + 1
-                raw = sequence[min(index, len(sequence) - 1)]
-            else:
-                raw = self.messages.get(uid, b"")
-            return "OK", [(b"BODY[]", raw)] if raw else []
+            raw_arg = args[0]
+            targets = str(raw_arg.decode(errors="replace") if isinstance(raw_arg, bytes) else raw_arg).split(",")
+            spec = str(args[1]) if len(args) > 1 else ""
+            results = []
+            for uid_text in targets:
+                uid = uid_text.strip().encode()
+                if not uid:
+                    continue
+                sequence = self.fetch_sequences.get(uid)
+                if sequence:
+                    index = self.fetch_counts.get(uid, 0)
+                    self.fetch_counts[uid] = index + 1
+                    raw = sequence[min(index, len(sequence) - 1)]
+                else:
+                    raw = self.messages.get(uid, b"")
+                if not raw:
+                    continue
+                if "HEADER.FIELDS" in spec:
+                    raw = _header_only(raw)
+                results.append((b"1 (UID %s BODY[])" % uid, raw))
+            return "OK", results
         raise AssertionError(f"unexpected uid command: {command} {args}")
 
     def noop(self):
@@ -126,7 +147,9 @@ class ICloudMailboxPoolTests(unittest.TestCase):
             snapshots=[[b"10"], [b"10", b"11"]],
             messages={b"11": otp_mail(target, "123456")},
         )
-        pool = self.pool()
+        # wait_timeout 太小（0.05s）时尾窗并集会被预算保护跳过，ALL 枚举断言必然失败；
+        # 这个用例要验证"UID 全量枚举 + 刷新会话"路径，用够用的预算保证确定性。
+        pool = self.pool(wait_timeout=5)
 
         with patch.object(pool, "_connect_imap", return_value=imap), patch(
             "core.icloud_mail_pool.time.sleep", return_value=None
@@ -136,7 +159,10 @@ class ICloudMailboxPoolTests(unittest.TestCase):
         self.assertEqual(code, "123456")
         self.assertGreaterEqual(imap.noop_calls, 1)
         self.assertTrue(any(call[1] == (None, "ALL") for call in imap.uid_calls if call[0] == "search"))
-        self.assertFalse(any("HEADER" in tuple(map(str, call[1])) for call in imap.uid_calls))
+        # 只禁止 HEADER 形式的 SEARCH（服务端索引滞后）；批量 HEADER.FIELDS FETCH 是当前实现。
+        self.assertFalse(
+            any(call[0] == "search" and "HEADER" in tuple(map(str, call[1])) for call in imap.uid_calls)
+        )
 
     def test_stale_connection_is_replaced_and_new_connection_finds_otp(self):
         """抓住回归：连接视图永久陈旧时必须在超时前重连，而不是一直复用。"""
@@ -223,7 +249,8 @@ class ICloudMailboxPoolTests(unittest.TestCase):
             code = pool.wait_for_code(self.mailbox(target))
 
         self.assertEqual(code, "678901")
-        self.assertEqual(imap.fetch_counts[b"12"], 2)
+        # 头部预过滤 + 正文下载都会走 fetch；这里只要求"空取后仍会重试该 UID"。
+        self.assertGreaterEqual(imap.fetch_counts[b"12"], 2)
 
     def test_imap_connection_timeout_is_bounded_by_remaining_otp_budget(self):
         target = "alias@icloud.com"

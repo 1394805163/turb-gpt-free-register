@@ -55,8 +55,9 @@ class ICloudMailboxPoolRegressionTests(unittest.TestCase):
             code = pool.wait_for_code(self.mailbox(target))
 
         self.assertEqual(code, "123456")
-        fetched_uids = [args[0] for command, args in imap.uid_calls if command == "fetch"]
-        self.assertIn(b"8", fetched_uids)
+        fetched_blobs = [str(args[0]) for command, args in imap.uid_calls if command == "fetch"]
+        fetched_uids = [item for blob in fetched_blobs for item in blob.split(",")]
+        self.assertIn("8", fetched_uids)
 
     def test_target_message_without_code_is_retried_until_code_appears(self):
         target = "alias@icloud.com"
@@ -73,7 +74,8 @@ class ICloudMailboxPoolRegressionTests(unittest.TestCase):
             code = pool.wait_for_code(self.mailbox(target))
 
         self.assertEqual(code, "654321")
-        self.assertEqual(imap.fetch_counts[b"12"], 2)
+        # 无码邮件不会被永久跳过：头部/正文多次尝试后仍能取到后续验证码。
+        self.assertGreaterEqual(imap.fetch_counts[b"12"], 2)
 
 
 if __name__ == "__main__":
