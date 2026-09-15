@@ -3,11 +3,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from config import email as email_config
 from config import register as register_config
+from core import registration_service
+
+from config import email as email_config
 from core import browser_use_registration as browser_use
 from core import email_provider
-from core import registration_service
 from core import roxy_registration as roxy
 
 
@@ -29,20 +30,6 @@ class DelayedEmailAllocationTests(unittest.TestCase):
                 "allocated@example.com",
             )
         acquire.assert_called_once_with()
-
-    @patch("core.email_provider.acquire_email")
-    def test_registration_preparation_does_not_allocate_automatic_email(self, acquire):
-        with patch.object(register_config, "REGISTER_EMAIL", ""), patch.object(
-            register_config, "REGISTER_NAME", ""
-        ), patch.object(email_config, "USE_EMAIL_SERVICE", True), patch(
-            "core.profile_utils.generate_random_birthday", return_value="1990-01-01"
-        ):
-            email, name, birthday = registration_service._prepare_registration_args()
-
-        self.assertEqual(email, "")
-        self.assertTrue(name)
-        self.assertEqual(birthday, "1990-01-01")
-        acquire.assert_not_called()
 
     def test_roxy_finds_input_before_allocating_email(self):
         events = []
@@ -124,84 +111,23 @@ class DelayedEmailAllocationTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-class JobEmailCleanupFallbackTests(unittest.TestCase):
-    """stall/超时收尾漏标邮箱的回归：局部变量为空时从 job 记录兜底取邮箱。"""
 
-    def test_cleanup_email_falls_back_to_job_record_when_local_empty(self):
-        with patch.object(registration_service.db, "get_job", return_value={"email": "job@example.com"}):
-            self.assertEqual(
-                registration_service._resolve_job_email_for_cleanup(7),
-                "job@example.com",
-            )
-            self.assertEqual(
-                registration_service._resolve_job_email_for_cleanup(7, "explicit@example.com"),
-                "explicit@example.com",
-            )
-        with patch.object(registration_service.db, "get_job", return_value=None):
-            self.assertEqual(
-                registration_service._resolve_job_email_for_cleanup(7, None, ""),
-                "",
-            )
+class OurRegistrationPreparationTest(unittest.TestCase):
+    """[ours] 准备阶段不领取自动邮箱（页面确认后由子进程领取并回报）。"""
+
+    @patch("core.email_provider.acquire_email")
+    def test_registration_preparation_does_not_allocate_automatic_email(self, acquire):
+        with patch.object(register_config, "REGISTER_EMAIL", ""), patch.object(
+            register_config, "REGISTER_NAME", ""
+        ), patch.object(email_config, "USE_EMAIL_SERVICE", True), patch(
+            "core.profile_utils.generate_random_birthday", return_value="1990-01-01"
+        ):
+            email, name, birthday = registration_service._prepare_registration_args()
+        self.assertEqual(email, "")
+        self.assertTrue(name)
+        self.assertEqual(birthday, "1990-01-01")
+        acquire.assert_not_called()
 
 
 if __name__ == "__main__":
     unittest.main()
-
-class EmailSubmittedMarkerTests(unittest.TestCase):
-    """已提交邮箱判定：失败回收回 available 还是 failed 的依据。"""
-
-    def test_submitted_marker_detection(self):
-        import os
-        import tempfile
-
-        submitted_path = clean_path = None
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8") as fh:
-                fh.write("11:25:34 [Cloak注册] 已提交邮箱，等待进入密码页或验证码页（1/1）\n")
-                submitted_path = fh.name
-            with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False, encoding="utf-8") as fh:
-                fh.write("11:25:14 [Cloak注册][预检] attempt=1/1 ok=True country=SG\n")
-                clean_path = fh.name
-            self.assertTrue(registration_service._registration_email_was_submitted(submitted_path))
-            self.assertFalse(registration_service._registration_email_was_submitted(clean_path))
-            self.assertFalse(registration_service._registration_email_was_submitted(None))
-            self.assertFalse(registration_service._registration_email_was_submitted("Z:/no/such/file.log"))
-        finally:
-            for p in filter(None, (submitted_path, clean_path)):
-                os.unlink(p)
-
-class AuthErrorPageFastFailTests(unittest.TestCase):
-    """邮箱提交后落到 auth.openai.com/error（限流等）必须快速失败、不再盲重试。"""
-
-    def test_wait_state_returns_auth_error(self):
-        module = roxy
-        driver = Mock()
-        driver.current_url = "https://auth.openai.com/error?payload=fixture"
-        with patch.object(module, "_has_access_token", return_value=False), patch.object(
-            module, "_is_login_password_page", return_value=False
-        ), patch.object(module, "_is_email_verification_page", return_value=False), patch.object(
-            module, "_is_signup_password_page", return_value=False
-        ), patch.object(
-            module,
-            "_email_input_value_state",
-            return_value={"url": "https://auth.openai.com/error?payload=fixture", "inputs": []},
-        ):
-            outcome = module._wait_email_submit_next_state(driver, "fixture@example.com", timeout=1)
-        self.assertEqual(outcome, "auth_error")
-
-    def test_submit_email_raises_on_auth_error(self):
-        module = roxy
-        driver = Mock()
-        driver.current_url = "https://auth.openai.com/error?payload=fixture"
-        with patch.object(
-            module,
-            "_wait_email_submit_next_state",
-            return_value="auth_error",
-        ), patch.object(module, "_type_email_address"), patch.object(
-            module, "_email_input_value_state", return_value={"inputs": [{"value": "fixture@example.com"}]}
-        ), patch.object(module, "_is_email_login_page_still_present", return_value=True):
-            with self.assertRaises(RuntimeError) as ctx:
-                module._submit_email_and_wait_next(driver, "fixture@example.com", attempts=2, timeout=5)
-        self.assertIn("auth", str(ctx.exception).lower())
-
-

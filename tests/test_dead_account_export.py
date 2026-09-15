@@ -64,6 +64,7 @@ class DeadAccountExportTests(unittest.TestCase):
             with self.subTest(precedence=exc):
                 self.assertEqual(classify_liveness_failure(exc)["status"], "temporary_error")
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_confirmed_dead_filter_and_txt_export_are_one_email_per_line(self):
         dead_ids = []
         for email in ("dead-one@example.com", "dead-two@example.com"):
@@ -96,6 +97,7 @@ class DeadAccountExportTests(unittest.TestCase):
             {"dead-one@example.com", "dead-two@example.com"},
         )
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_oauth_status_filter_separates_complete_and_access_only_accounts(self):
         complete = db.insert_account(email="complete@example.com", access_token="complete-token")
         db.update_account_chatgpt_oauth("complete@example.com", {
@@ -111,6 +113,7 @@ class DeadAccountExportTests(unittest.TestCase):
         self.assertEqual({row["id"] for row in complete_rows}, {complete})
         self.assertEqual({row["id"] for row in access_only_rows}, {access_only})
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_ambiguous_invalid_requires_a_second_check_after_interval(self):
         acc_id = db.insert_account(email="review@example.com", access_token="review-token")
         candidate = classify_liveness_failure(RuntimeError("invalid_account"))

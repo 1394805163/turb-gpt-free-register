@@ -313,7 +313,7 @@ def _random_display_name() -> str:
     return random_display_name()
 
 
-def _prepare_registration_args() -> tuple[str, str, str]:
+def _prepare_registration_args() -> tuple[str | None, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
     from config import register as _r, email as _e
@@ -331,15 +331,14 @@ def _prepare_registration_args() -> tuple[str, str, str]:
 
     birthday = generate_random_birthday()
 
-    # 自动邮箱领取延迟到浏览器确认可见邮箱输入框后，避免拦截/空白页面消耗邮箱池。
-    if not email:
-        if _e.USE_EMAIL_SERVICE:
-            return "", name, birthday
-        else:
-            raise RuntimeError(
-                "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
-                "或开启 USE_EMAIL_SERVICE 并从邮箱池领取。"
-            )
+    # 自动邮箱不在准备阶段领取：浏览器驱动会等页面找到邮箱输入框后再领取，
+    # 协议驱动则在 run_registration 即将开始认证时领取。这样页面打不开/找不到
+    # 输入框时不会提前消耗邮箱订单或池中素材。
+    if not email and not _e.USE_EMAIL_SERVICE:
+        raise RuntimeError(
+            "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
+            "或开启 USE_EMAIL_SERVICE 并从邮箱池领取。"
+        )
 
     return email, name, birthday
 
@@ -705,6 +704,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
                 db.update_job(
                     job_id,
                     status="stopped",
+                    network_traffic=(result or {}).get("network_traffic") if isinstance(result, dict) else None,
                     error="用户手动停止",
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
@@ -716,6 +716,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
                     status="success",
                     email=result.get("email"),
                     account_id=result.get("account_id"),
+                    network_traffic=result.get("network_traffic"),
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 log_logger.info("[Job %s] 成功: %s", job_id, redact_email(result.get("email")))
@@ -728,6 +729,7 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
                     status="failed",
                     email=result_email,
                     account_id=(result or {}).get("account_id") if isinstance(result, dict) else None,
+                    network_traffic=(result or {}).get("network_traffic") if isinstance(result, dict) else None,
                     error=str(err)[:500],
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )

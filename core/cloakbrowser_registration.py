@@ -11,13 +11,16 @@ import time
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Callable
 
 from config import cloakbrowser as _cfg
 from config import email as _email_cfg
 from config import twofa as _twofa_cfg
-from core.account_export import save_account_data
+from core.account_export import save_account_data, post_register_dwell
+from core.browser_data_saver import BrowserDataSaver
+from core.browser_traffic import PlaywrightTrafficTracker
 from core.cloakbrowser_driver import account_fingerprint_seed, build_cloak_driver
-from core.email_provider import OtpWaitSession, wait_for_otp, resolve_email_source
+from core.email_provider import OtpWaitSession, acquire_email_after_input, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.log_safety import redact_email, redact_emails
 
@@ -165,7 +168,10 @@ def run_cloak_registration(
     *,
     defer_email_release: bool = False,
     proxy_selection: dict | None = None,
-    on_email_acquired=None,
+    on_email_acquired: Callable[[str], None] | None = None,
+    traffic_tracker: PlaywrightTrafficTracker | None = None,
+    data_saver: BrowserDataSaver | None = None,
+    network_traffic: dict | None = None,
 ) -> dict:
     """CloakBrowser 自动化注册入口。"""
     driver = None
@@ -396,6 +402,12 @@ def run_cloak_registration(
         except Exception as exc:
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
+        # 统计注册浏览器关闭前的完整会话；注册后停留期间的网络请求也计入。
+        post_register_dwell(email, label="Cloak注册")
+        if traffic_tracker is not None:
+            network_traffic = traffic_tracker.stop()
+        if data_saver is not None:
+            data_saver.stop()
         account_id = save_account_data(
             email=email,
             access_token=access_token,
@@ -419,6 +431,7 @@ def run_cloak_registration(
                 "cloak_profile_seed": profile_seed,
                 "registration_password": openai_password,
                 "codex": codex_result,
+                "network_traffic": network_traffic,
             },
         )
         try:
@@ -432,7 +445,16 @@ def run_cloak_registration(
                 redact_emails(exc),
             )
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
-        return {"success": bool(codex_ok), "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "codex": codex_result, "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}"}
+        return {
+            "success": bool(codex_ok),
+            "email": email,
+            "account_id": account_id,
+            "access_token": access_token,
+            "totp_secret": totp_secret,
+            "codex": codex_result,
+            "network_traffic": network_traffic,
+            "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
+        }
     except Exception as exc:
         logger.error("[Cloak注册] 失败：%s: %s", type(exc).__name__, redact_emails(exc))
         logger.debug("[Cloak注册] 失败详情\n%s", redact_emails(traceback.format_exc()))

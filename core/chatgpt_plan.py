@@ -8,6 +8,7 @@ import json
 import logging
 import socket
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
@@ -245,20 +246,19 @@ def token_claims(token: str) -> dict:
     }
 
 
-def _common_headers(env: BrowserSession, token: str) -> dict[str, str]:
-    headers = env._get_common_headers()
+def _common_headers(env: BrowserSession, token: str, claims: dict | None = None) -> dict[str, str]:
+    """生成与 ChatGPT 登录态前端一致的套餐查询头。"""
+    headers = env.get_chatgpt_headers(referer="https://chatgpt.com/")
+    # GET 导航后的前端 fetch 不主动设置 content-type。
+    headers.pop("content-type", None)
     headers.update({
-        "accept": "*/*",
         "authorization": f"Bearer {normalize_token(token)}",
-        "oai-device-id": env.device_id,
-        "oai-language": env.navigator_language(),
-        "referer": "https://chatgpt.com/",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
         "x-openai-target-path": ACCOUNTS_CHECK_PATH,
         "x-openai-target-route": ACCOUNTS_CHECK_PATH,
     })
+    account_id = str((claims or {}).get("account_id") or "").strip()
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
     return headers
 
 
@@ -419,6 +419,32 @@ def _retryable_plan_error(http_status: int | None) -> bool:
     if http_status is None:
         return True
     return http_status in {403, 408, 409, 425, 429} or http_status >= 500
+def _clear_plan_circuit(env: BrowserSession) -> None:
+    """清除可重试响应产生的本地熔断，同时保留 Cookie Jar。"""
+    reset = getattr(env, "reset_circuit_breaker", None)
+    if callable(reset):
+        reset()
+    else:
+        env.blocked_until = 0.0
+        env.blocked_reason = ""
+
+
+def _warm_plan_session(env: BrowserSession) -> None:
+    """先访问 ChatGPT document 建立同一会话的边缘 Cookie；失败不阻断正式查询。"""
+    try:
+        resp = env.get(
+            "https://chatgpt.com/",
+            headers=env.get_chatgpt_navigate_headers(
+                referer="https://chatgpt.com/", user_initiated=False,
+            ),
+            allow_redirects=True,
+        )
+        if int(getattr(resp, "status_code", 0) or 0) >= 400:
+            logger.info("[Plan] document 预热返回 HTTP %s，保留响应 Cookie 后继续", resp.status_code)
+    except Exception as exc:
+        logger.debug("[Plan] document 预热失败，继续正式查询：%s: %s", type(exc).__name__, str(exc)[:160])
+    finally:
+        _clear_plan_circuit(env)
 
 
 def _retry_wait_seconds(resp: Any, base_delay: float, attempt: int) -> float:

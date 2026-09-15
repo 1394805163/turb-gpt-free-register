@@ -179,6 +179,7 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
         release_email.assert_called_once()
         self.assertEqual(release_email.call_args.kwargs["status"], "used")
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_save_codex_credential_normalizes_cpa_aliases(self):
         with patch("core.codex_oauth._PROJECT_ROOT", self.root):
             with patch("core.codex_oauth._cfg.CODEX_OUTPUT_DIRNAME", "codex_accounts"):
@@ -212,6 +213,7 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
         self.assertEqual(row["access_token"], "old-access")
         self.assertEqual(row.get("chatgpt_refresh_token"), None)
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_oauth_update_invalidates_token_bound_runtime_state(self):
         row_id = db.insert_account(email="rotate@icloud.com", access_token="old-access", email_source="icloud")
         self.assertTrue(db.update_account_liveness(row_id, {

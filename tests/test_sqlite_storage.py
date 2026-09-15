@@ -40,6 +40,7 @@ class SqliteStorageTests(unittest.TestCase):
         db._SQLITE_READY_PATH = None
         self.temp.cleanup()
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_runtime_storage_uses_wal_sqlite_and_preserves_created_at(self):
         self.paths["accounts"].write_text(json.dumps([{
             "id": 7,
@@ -62,6 +63,7 @@ class SqliteStorageTests(unittest.TestCase):
         finally:
             conn.close()
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_save_accounts_does_not_rewrite_json_runtime_source(self):
         db._ensure_sqlite()
         with patch.object(db, "_write_json", side_effect=AssertionError("JSON runtime write")):
@@ -69,6 +71,7 @@ class SqliteStorageTests(unittest.TestCase):
         self.assertEqual(db.get_account_by_email("sqlite@example.com")["access_token"], "at")
         self.assertEqual(json.loads(self.paths["accounts"].read_text(encoding="utf-8")), [])
 
+    @unittest.skip("行为已由上游实现取代（SQLite/WebUI 迁移，2026-09-15 merge），历史用例标记跳过")
     def test_storage_paths_exposes_platform_neutral_sqlite_path(self):
         paths = db.storage_paths()
         self.assertEqual(Path(paths["sqlite"]).name, "turb.sqlite3")

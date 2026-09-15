@@ -55,7 +55,7 @@ class AccountTotpFilterTests(unittest.TestCase):
                 _GENERIC_API_EMAIL_JSON=missing,
                 _JOBS_JSON=missing,
                 _DOMAIN_EMAIL_JSON=missing,
-            ):
+            ), patch.object(db, "_SQLITE_READY", False), patch.object(db, "_SQLITE_READY_PATH", None):
                 def account_ids(totp_filter):
                     result = db.list_accounts_page(limit=20, totp_filter=totp_filter)
                     return [item["id"] for item in result["items"]]
