@@ -260,6 +260,27 @@ def check_account_liveness(
         logger.info("[查活] 开始重新登录：%s", redact_email(email))
         from config import roxybrowser as registration_cfg
         registration_driver = str(getattr(registration_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+        # 快速路径（默认关，config: LIVE_CHECK_FAST_REFRESH）：协议 RT 刷新成功即判定 live，
+        # 失败自动落回下面的浏览器/协议登录流程，行为与现状完全一致。
+        if bool(getattr(registration_cfg, "LIVE_CHECK_FAST_REFRESH", False)):
+            try:
+                from core.oauth_refresh import refresh_account_credentials
+
+                fast = refresh_account_credentials(email, write_back=True)
+            except Exception as exc:
+                fast = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+            if fast.get("ok"):
+                logger.info("[查活] 快速路径成功（协议 RT 刷新，method=rt_refresh，ms=%s）", fast.get("ms"))
+                return {
+                    "ok": True,
+                    "status": "live",
+                    "method": "rt_refresh",
+                    "access_token": str(fast.get("access_token") or ""),
+                    "session": {},
+                    "checked_at": checked_at,
+                }
+            logger.info("[查活] 快速路径失败，落回登录流程：%s", str(fast.get("error"))[:160])
+
         if registration_driver in {"cloak", "cloakbrowser"}:
             from core.cloakbrowser_liveness import run_cloak_liveness_flow
 
