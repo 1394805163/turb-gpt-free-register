@@ -82,6 +82,21 @@ class ScriptedIMAP:
         return "BYE", [b""]
 
 
+
+class ScopedSearchLagIMAP(ScriptedIMAP):
+    """模拟 iCloud SEARCH TO 索引滞后：过滤结果里没有刚到的邮件，ALL 尾部才有。"""
+
+    def __init__(self, to_uids: list[bytes], all_uids: list[bytes], messages: dict[bytes, bytes]) -> None:
+        super().__init__([all_uids], messages)
+        self.to_uids = to_uids
+
+    def uid(self, command, *args):
+        if str(command).lower() == "search" and len(args) >= 2 and str(args[1]).upper() == "TO":
+            self.uid_calls.append((str(command).lower(), args))
+            return "OK", [b" ".join(self.to_uids)]
+        return super().uid(command, *args)
+
+
 class ICloudMailboxPoolTests(unittest.TestCase):
     def pool(self, **overrides) -> ICloudMailboxPool:
         config = {
@@ -454,6 +469,29 @@ class ICloudMailboxPoolTests(unittest.TestCase):
         self.assertEqual(len(fetches), 1)
         self.assertTrue(all(seconds <= 0.025 for seconds in clock.sleeps))
         self.assertLessEqual(clock.now, 200.025 + 1e-9)
+
+    def test_scoped_search_lag_is_covered_by_inbox_tail(self):
+        """抓住回归：SEARCH TO 漏掉刚到的新邮件时会取到旧码（服务端拒绝→页面卡住）。
+
+        修复：scoped 结果并上收件箱末尾窗口，旧码由 _code_not_before 过滤，新码可达。
+        """
+        target = "alias@icloud.com"
+        imap = ScopedSearchLagIMAP(
+            to_uids=[b"900"],
+            all_uids=[b"900", b"901"],
+            messages={
+                b"900": otp_mail(target, "111111", received=datetime.now(timezone.utc) - timedelta(hours=2)),
+                b"901": otp_mail(target, "222222"),
+            },
+        )
+        pool = self.pool(wait_timeout=1.0, wait_interval=0)
+
+        with patch.object(pool, "_connect_imap", return_value=imap), patch(
+            "core.icloud_mail_pool.time.sleep", return_value=None
+        ):
+            code = pool.wait_for_code(self.mailbox(target))
+
+        self.assertEqual(code, "222222")
 
     def test_pool_claim_and_success_state_are_persistent(self):
         with tempfile.TemporaryDirectory() as tmp:

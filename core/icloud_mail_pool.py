@@ -471,12 +471,22 @@ class ICloudMailboxPool:
                     target = str(mailbox["address"]).strip().lower()
                     scoped = self._search_uids(imap, target, deadline=deadline)
                     if scoped is not None:
-                        # 服务端已按收件人过滤：候选就是"该别名的全部邮件"，
-                        # 无需 backfill 窗口逻辑（大收件箱下从 5000+ 降到个位数）。
+                        # 服务端按收件人过滤：候选就是"该别名的全部邮件"，
+                        # 大收件箱下从 5000+ 降到个位数。
+                        #
+                        # 但 iCloud 的 SEARCH TO 索引会滞后：实测新邮件已落盘，
+                        # 过滤结果里却没有它（于是取到旧验证码被服务端拒绝，
+                        # 表现为"OTP 提交后页面不动"）。这里再并上收件箱末尾窗口兜底，
+                        # 非别名邮件在本地收件人匹配阶段被丢弃，只多花一次尾部 FETCH。
+                        window = max(1, min(100, int(self.config.get("initial_scan_limit") or 20)))
+                        if remaining_budget > 0.05:
+                            tail_uids = self._all_uids(imap, deadline=deadline)[-window:]
+                            scoped = sorted(set(scoped) | set(tail_uids), key=lambda value: int(value))
                         all_uids = scoped
-                        if all_uids:
-                            mailbox["_last_uid"] = max(int(uid) for uid in all_uids)
-                        candidates = all_uids
+                        merged = scoped
+                        if merged:
+                            mailbox["_last_uid"] = max(int(uid) for uid in merged)
+                        candidates = merged
                     else:
                         all_uids = self._all_uids(imap, deadline=deadline)
                         candidates = self._candidate_uid_window(all_uids, mailbox)
