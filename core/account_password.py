@@ -167,7 +167,9 @@ def set_account_password(
         _clear_otp_inputs,
         _click_continue,
         _fetch_chatgpt_session,
+        _is_mfa_challenge_page,
         _maybe_accept,
+        _pass_mfa_challenge_if_needed,
         _submit_email_and_wait_next,
         _type_otp,
         _wait_after_email_otp_submit,
@@ -201,6 +203,12 @@ def set_account_password(
         outcome = _wait_after_email_otp_submit(driver, timeout=25)
         logger.info("[补密码] 登录验证码提交结果：%s", outcome)
         time.sleep(2)
+        # 账号已启用 2FA 时登录后会停在 mfa-challenge，需要本地 TOTP 动态码。
+        if _is_mfa_challenge_page(driver):
+            logger.info("[补密码] 检测到 2FA 挑战页，提交本地 TOTP 动态码")
+            if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
+                raise RuntimeError("2FA 动态码未通过，无法继续设置密码")
+            time.sleep(2)
         info = _fetch_chatgpt_session(driver, timeout=90)
         if not info.get("accessToken"):
             raise RuntimeError("登录后未拿到 accessToken")
@@ -230,6 +238,13 @@ def set_account_password(
             logger.info("[补密码] 添加密码验证码提交结果：%s", outcome2)
         else:
             logger.info("[补密码] 未进入邮箱验证码页（继续等待新密码页）")
+
+        # 账号启用 2FA 时，"添加密码"重新认证后会再次要求 TOTP 动态码。
+        if _is_mfa_challenge_page(driver):
+            logger.info("[补密码] 添加密码步骤检测到 2FA 挑战页，提交本地 TOTP 动态码")
+            if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
+                raise RuntimeError("添加密码步骤的 2FA 动态码未通过")
+            time.sleep(2)
 
         # ---- 4) 设置新密码页 ----
         _wait_url_contains(driver, NEW_PASSWORD_MARKER, timeout=30)
