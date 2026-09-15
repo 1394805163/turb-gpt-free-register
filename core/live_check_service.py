@@ -57,6 +57,15 @@ def _young_account_country_hint(account_id: int, *, max_age_hours: float = 6.0) 
         age_hours = (_dt.now() - _dt.fromisoformat(created)).total_seconds() / 3600.0
         if age_hours > max_age_hours:
             return ""
+        # 注册国家来源：显式 proxy_exit_country -> registration_proxy.node_name -> 旧 proxy_used
+        explicit = str(acc.get("proxy_exit_country") or "").strip().upper()
+        if len(explicit) == 2:
+            return explicit
+        registration_proxy = acc.get("registration_proxy")
+        if isinstance(registration_proxy, dict):
+            code = proxy_cfg.node_country_code(str(registration_proxy.get("node_name") or ""))
+            if code:
+                return code
         return proxy_cfg.node_country_code(str(acc.get("proxy_used") or ""))
     except Exception:
         return ""

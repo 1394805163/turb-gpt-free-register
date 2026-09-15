@@ -337,6 +337,13 @@ def run_protocol_registration(
                      "name": name, "birthday": birthday}
             if registration_password:
                 extra["registration_password"] = registration_password
+            exit_country = str((proxy_selection or {}).get("exit_country") or "").strip().upper()
+            if not exit_country:
+                from config import proxy as _proxy_cfg
+
+                exit_country = _proxy_cfg.node_country_code(str((proxy_selection or {}).get("node_name") or ""))
+            if exit_country:
+                extra["proxy_exit_country"] = exit_country
             row_id = save_account_data(
                 email=email, access_token=at, totp_secret=totp_secret or None,
                 extra=extra,

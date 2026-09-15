@@ -31,6 +31,17 @@ from core.roxy_registration import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
+def _registration_exit_country(opened) -> str:
+    """注册出口国家（节点名推断；透明路由场景 proxy/exit_country 常为空）。"""
+    try:
+        from config import proxy as _proxy_cfg
+
+        node = str(((opened.raw or {}).get("proxy_node") if opened else "") or "")
+        return _proxy_cfg.node_country_code(node)
+    except Exception:
+        return ""
+
+
 def _register_active_browser(driver) -> None:
     """登记当前任务浏览器；独立注册子进程中没有父线程上下文时安全跳过。"""
     try:
@@ -394,6 +405,7 @@ def run_cloak_registration(
                     "exit_ip": ((opened.raw or {}).get("proxy_exit_ip") if opened else "") or "",
                     "selection_ms": ((opened.raw or {}).get("proxy_selection_ms") if opened else 0) or 0,
                 },
+                "proxy_exit_country": _registration_exit_country(opened),
                 "registration_password": openai_password,
                 "codex": codex_result,
             },
