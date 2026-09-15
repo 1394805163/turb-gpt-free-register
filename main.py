@@ -387,6 +387,38 @@ def run_registration(
             if "无法确认注册出口国家" not in error_text and "Mihomo 代理选择失败" not in error_text:
                 break
             logger.warning("[协议注册] 出口/选路失败，换节点重试（%s/2）：%s", attempt, error_text[:120])
+        codex_status = None
+        if result.get("ok"):
+            # 与 cloak/roxy 驱动保持一致：注册成功后按 ENABLE_CODEX_AUTO 顺带跑 Codex 授权，
+            # 走用户配置的 CODEX_OAUTH_DRIVER（默认 cloak）。失败只记日志，不影响注册结果。
+            try:
+                from config import codex as _codex_cfg
+
+                if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
+                    from core.codex_oauth import run_codex_oauth
+
+                    codex_result = run_codex_oauth(email, force=True) or {}
+                    codex_status = str(codex_result.get("status") or "")
+                    logger.info("[协议注册][Codex] 授权结果：%s", codex_status or "-")
+                    if codex_status == "success" or codex_result.get("ok"):
+                        # 与补跑一致：把 Codex 凭据回写数据库并进查活/推送队列
+                        try:
+                            from core import db as _db
+                            from core.codex_retry_service import _persist_oauth_result_and_queue_liveness
+
+                            account_now = _db.get_account_by_email(email) or {}
+                            _persist_oauth_result_and_queue_liveness(
+                                email,
+                                codex_result,
+                                expected_access_token=str(account_now.get("access_token") or "").strip() or None,
+                            )
+                            logger.info("[协议注册][Codex] 凭据已回写数据库")
+                        except Exception as persist_exc:
+                            logger.warning("[协议注册][Codex] 凭据回写失败：%s", str(persist_exc)[:160])
+                else:
+                    logger.info("[协议注册][Codex] ENABLE_CODEX_AUTO=False，跳过 Codex 授权")
+            except Exception as exc:
+                logger.warning("[协议注册][Codex] 授权失败（账号已注册成功）：%s", str(exc)[:160])
         return {
             "success": bool(result.get("ok")),
             "email": result.get("email") or email,
@@ -394,6 +426,7 @@ def run_registration(
             "error": result.get("error"),
             "page_type": result.get("page_type"),
             "protocol_transport": "page",
+            "codex_status": codex_status,
         }
     if driver_mode in ("browser_use", "browseruse", "browser-use", "bu"):
         from core.browser_use_registration import run_browser_use_registration

@@ -196,7 +196,31 @@ def run_protocol_registration(
                     "error": "邮箱已被注册或流程非注册（page.type=%s）" % (ptype or "unknown")}
 
         # 4) 邮箱 OTP
-        code = wait_for_otp(email, after_ts=t0)
+        # iCloud 投递偶发延迟 2~4 分钟（实测 id=220/10:37 那批），单次 wait 超时后
+        # 主动请求重发并再等一轮，最多 3 轮；仍失败才算失败。
+        from core.openai_auth import send_email_otp
+
+        otp_after_ts = t0
+        code = ""
+        last_otp_error: Exception | None = None
+        for otp_attempt in range(1, 4):
+            try:
+                code = wait_for_otp(email, after_ts=otp_after_ts)
+                break
+            except Exception as exc:
+                last_otp_error = exc
+                logger.warning("[协议注册] 等待 OTP 超时（%s/3）：%s", otp_attempt, str(exc)[:120])
+                if otp_attempt >= 3:
+                    break
+                otp_after_ts = time.time()
+                try:
+                    send_email_otp(session, referer="https://auth.openai.com/email-verification")
+                    logger.info("[协议注册] 已请求重发邮箱验证码，继续等待")
+                except Exception as send_exc:
+                    logger.warning("[协议注册] 重发验证码请求失败：%s", str(send_exc)[:120])
+        if not code:
+            return {"ok": False, "status": "failed", "email": email,
+                    "error": f"OTP 等待超时: {last_otp_error}"}
         r2 = _post_json(
             session,
             "https://auth.openai.com/api/accounts/email-otp/validate",
