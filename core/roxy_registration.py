@@ -1207,6 +1207,41 @@ def _ensure_otp_input_value(driver, code: str, attempts: int = 3) -> bool:
     return False
 
 
+def _submit_email_otp_via_page(driver, code: str) -> bool:
+    """页内 fetch 直接提交邮箱验证码（UI 点击被 Cloudflare/错误页挡住时的兜底）。
+
+    成功后把页面真实导航到服务端返回的 continue_url（通常是 about-you），
+    否则 SPA 停在错误页时后续"资料页"步骤找不到元素。
+    """
+    try:
+        from core.page_session import PageSession
+        from core.codex_oauth import _post_json
+
+        session = PageSession(driver)
+        resp = _post_json(
+            session,
+            "https://auth.openai.com/api/accounts/email-otp/validate",
+            {"code": str(code or "").strip()},
+            referer="https://auth.openai.com/email-verification",
+        )
+        logger.info("%s[OTP] 页内 fetch 提交验证码：HTTP %s", _log_prefix(driver), resp.status_code)
+        if resp.status_code != 200:
+            return False
+        data = resp.json() or {}
+        cont = str(data.get("continue_url") or (data.get("page") or {}).get("continue_url") or "")
+        if cont:
+            url = cont if cont.startswith("http") else "https://auth.openai.com" + cont
+            try:
+                driver.get(url)
+                time.sleep(2)
+            except Exception:
+                pass
+        return True
+    except Exception as exc:
+        logger.warning("%s[OTP] 页内 fetch 提交失败：%s", _log_prefix(driver), str(exc)[:140])
+        return False
+
+
 def _type_otp(driver, code: str) -> None:
     from selenium.webdriver.common.by import By
 
@@ -2337,10 +2372,18 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             outcome = _wait_after_email_otp_submit(driver, timeout=30)
             _check_manual_stop()
             if outcome == 'stalled':
-                logger.warning("[Roxy注册][OTP] 首次提交没有产生页面状态变化，使用同一验证码重提一次")
-                _click_continue(driver)
-                logger.info("[Roxy注册][OTP] 已完成第二次提交，等待页面状态")
-                outcome = _wait_after_email_otp_submit(driver, timeout=15)
+                # 点击提交后页面没动：常见于页面进入 SPA 错误页（Cloudflare/HTML 响应）或点击未生效。
+                # 先用页内 fetch 直接提交（不依赖 DOM 元素），失败再退化回点击重提。
+                logger.warning("[Roxy注册][OTP] 首次提交没有产生页面状态变化，改用页内 fetch 直接提交验证码")
+                if _submit_email_otp_via_page(driver, current_otp):
+                    outcome = _wait_after_email_otp_submit(driver, timeout=15)
+                if outcome == 'stalled':
+                    logger.warning("[Roxy注册][OTP] 页内提交后仍未跳转，使用同一验证码点击重提一次")
+                    try:
+                        _click_continue(driver)
+                    except Exception as exc:
+                        logger.info("[Roxy注册][OTP] 未找到提交按钮（页面可能已是错误页）：%s", redact_emails(exc)[:120])
+                    outcome = _wait_after_email_otp_submit(driver, timeout=15)
                 _check_manual_stop()
                 if outcome == 'stalled':
                     raise RuntimeError("OTP 提交两次后仍停留在验证码页，结束当前代理并轮换")
