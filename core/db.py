@@ -1157,8 +1157,13 @@ def claim_account_plan_check(
     acc_id: int | None = None,
     email: str | None = None,
     trigger: str = "manual",
+    expected_token_fingerprint: str | None = None,
 ) -> bool:
-    """原子占用账号的套餐查询；已有未超时查询时返回 False。"""
+    """原子占用账号的套餐查询；已有未超时查询时返回 False。
+
+    expected_token_fingerprint：仅当账号当前 access_token 指纹一致时才占用，
+    避免把"基于旧 token 的查询"落到刚刷新凭证的账号上（合并后上游调用方会传）。
+    """
     with _LOCK:
         accounts = _load_accounts()
         target_email = (email or "").lower()
@@ -1169,6 +1174,9 @@ def claim_account_plan_check(
         ), None)
         if row is None:
             return False
+        if expected_token_fingerprint:
+            if _token_fingerprint(row.get("access_token") or "") != str(expected_token_fingerprint):
+                return False
 
         current_status = row.get("plan_check_status")
         if current_status in {"queued", "running"}:

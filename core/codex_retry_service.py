@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Codex 授权补跑服务，供账号页和注册任务队列共同使用。"""
 import ctypes
+import json
 import logging
 import threading
 import time
@@ -195,6 +196,16 @@ def _persist_oauth_result_and_queue_liveness(
     """OAuth 文件落盘后回写账号，再由轻量查活成功路径触发 chatgpt2api 推送。"""
     file_path = str(result.get("file_path") or "").strip()
     credential = result.get("credential") if isinstance(result.get("credential"), dict) else None
+    if credential is None and file_path.startswith("sqlite://"):
+        # 新版 codex_oauth 把凭据直接写进 SQLite（file_path 是 sqlite:// 伪路径），
+        # 旧回写逻辑按磁盘文件读会报"授权文件不存在"，这里改从 codex_accounts 表读回。
+        try:
+            filename = file_path.rsplit("/", 1)[-1]
+            raw_text, _ = db.read_codex_credential(filename)
+            credential = json.loads(raw_text) if raw_text else None
+        except Exception as exc:
+            credential = None
+            logger.warning("[Codex 补跑] 从 sqlite 读取 Codex 凭据失败：%s: %s", type(exc).__name__, exc)
     if credential is not None:
         persisted = db.update_account_chatgpt_oauth(
             email,

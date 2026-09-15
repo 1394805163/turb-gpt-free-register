@@ -287,33 +287,46 @@ def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> boo
             if not _is_mfa_challenge_page(driver):
                 time.sleep(0.4)
                 continue
-            result = driver.execute_script(r"""
-            const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-              && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
-              && !el.disabled && !el.readOnly;
-            const form = [...document.querySelectorAll('form')].find(f => /\/mfa-challenge/i.test(f.getAttribute('action') || ''));
-            if (!form) return {ok:false, reason:'missing_form'};
-            const input = [...form.querySelectorAll('input[name="code"], input[autocomplete="one-time-code"], input[maxlength="6"]')].find(visible);
-            if (!input) return {ok:false, reason:'missing_code_input'};
-            const button = [...form.querySelectorAll('button[type="submit"], button[data-dd-action-name="Continue"], button')].find(visible);
-            if (!button) return {ok:false, reason:'missing_submit'};
-            return {ok:true, input, button};
-            """) or {}
-            if not result.get("ok"):
+            # 原生查找，避免 CloakBrowser 适配层不支持 JS 返回的元素句柄
+            # （会抛 el.scrollIntoView is not a function，旧实现因此静默失败）。
+            code_input = _find_any(driver, [
+                "form[action*='mfa-challenge' i] input[name='code']",
+                "input[name='code']",
+                "input[autocomplete='one-time-code']",
+                "input[maxlength='6']",
+            ], timeout=5)
+            if code_input is None:
                 time.sleep(0.4)
                 continue
-            _human_type_text(driver, result.get("input"), code, clear=True)
+            submit_button = None
+            for _selector in (
+                "form[action*='mfa-challenge' i] button[type='submit']",
+                "button[type='submit']",
+                "button[data-dd-action-name='Continue']",
+            ):
+                try:
+                    submit_button = _find_any(driver, [_selector], timeout=2)
+                except Exception:
+                    submit_button = None
+                if submit_button is not None:
+                    break
+            _human_type_text(driver, code_input, code, clear=True)
             human_delay("otp_input")
-            _human_click(driver, result.get("button"), label="codex_mfa_submit")
+            if submit_button is not None:
+                _human_click(driver, submit_button, label="codex_mfa_submit")
+            else:
+                from selenium.webdriver.common.keys import Keys
+                code_input.send_keys(Keys.ENTER)
             logger.info("[Codex][Browser] 已填写并提交 MFA 验证码：%s", email)
             wait_end = time.time() + 12
             while time.time() < wait_end:
                 if not _is_mfa_challenge_page(driver):
                     return True
                 time.sleep(0.4)
-            return True
+            # 仍在 MFA 页：换一个新动态码再试
+            code = _account_totp_code_for_email(email) or code
         except Exception as exc:
-            logger.debug("[Codex][Browser] MFA challenge 处理失败：%s", str(exc)[:160])
+            logger.info("[Codex][Browser] MFA challenge 处理失败：%s: %s", type(exc).__name__, str(exc)[:120])
             time.sleep(0.5)
     return False
 
@@ -330,41 +343,52 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
         if not _is_login_password_page(driver):
             time.sleep(0.4)
             continue
-        result = driver.execute_script(r"""
-        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
-          && !el.disabled && !el.readOnly;
-        const input = [...document.querySelectorAll('input[type="password"],input[name*="password" i],input[autocomplete="current-password"]')]
-          .find(visible);
-        if (!input) return {ok:false, reason:'missing_password_input'};
-        const form = input.closest('form');
-        const scope = form || document;
-        const buttons = [...scope.querySelectorAll('button,input[type="submit"]')]
-          .filter(el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true')
-          .map((el, idx) => {
-            const r = el.getBoundingClientRect();
-            const ir = input.getBoundingClientRect();
-            return {el, idx, below: r.top >= ir.bottom - 10, dist: Math.max(0, r.top - ir.bottom) + Math.abs((r.left+r.right-ir.left-ir.right)/2)/10};
-          })
-          .filter(x => x.below)
-          .sort((a,b) => a.dist - b.dist || a.idx - b.idx);
-        if (!buttons.length) return {ok:false, reason:'missing_submit'};
-        buttons[0].el.scrollIntoView({block:'center'});
-        return {ok:true, reason:'password_targets', input, button: buttons[0].el};
-        """) or {}
-        if not result.get("ok"):
-            logger.info("[Codex][Browser] 登录密码页未找到输入/提交按钮：%s", result)
+        # 不用 JS 返回的元素句柄（CloakBrowser 适配层对句柄回传支持不佳，
+        # 会抛 el.scrollIntoView is not a function）；改用原生查找 + human 输入。
+        try:
+            password_input = _find_any(driver, [
+                "input[type='password']",
+                "input[name*='password' i]",
+                "input[autocomplete='current-password']",
+            ], timeout=6)
+        except Exception:
+            password_input = None
+        if password_input is None:
+            logger.info("[Codex][Browser] 登录密码页未找到密码输入框，稍后重试")
             time.sleep(0.5)
             continue
-        _human_type_text(driver, result.get("input"), password, clear=True)
-        human_delay("form", minimum=2.0, maximum=3.6)
-        _human_click(driver, result.get("button"), label="codex_password_submit")
+        submit_button = None
+        for _selector in ("form button[type='submit']", "button[type='submit']", "input[type='submit']"):
+            try:
+                submit_button = _find_any(driver, [_selector], timeout=2)
+            except Exception:
+                submit_button = None
+            if submit_button is not None:
+                break
+        try:
+            _human_type_text(driver, password_input, password, clear=True)
+            human_delay("form", minimum=1.8, maximum=3.2)
+            if submit_button is not None:
+                _human_click(driver, submit_button, label="codex_password_submit")
+            else:
+                logger.info("[Codex][Browser] 未找到提交按钮，回退 Enter 提交")
+                from selenium.webdriver.common.keys import Keys
+                password_input.send_keys(Keys.ENTER)
+        except Exception as exc:
+            logger.info("[Codex][Browser] 填写/提交登录密码失败（页面可能正在跳转），稍后重试：%s: %s", type(exc).__name__, str(exc)[:100])
+            time.sleep(0.6)
+            continue
         logger.info("[Codex][Browser] 已填写并提交登录密码：%s", email)
-        wait_end = time.time() + 12
+        wait_end = time.time() + 24
+        mfa_attempts = 0
         while time.time() < wait_end:
             if _is_mfa_challenge_page(driver):
-                _fill_mfa_challenge_if_present(driver, email, timeout=15)
-                return "next_step"
+                mfa_attempts += 1
+                if _fill_mfa_challenge_if_present(driver, email, timeout=20):
+                    return "next_step"
+                if mfa_attempts >= 2:
+                    raise RuntimeError("MFA 验证码提交后仍停留在 mfa-challenge 页")
+                continue
             if _is_email_verification_page(driver):
                 return "email_otp"
             if not _is_login_password_page(driver):
@@ -415,15 +439,35 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         if accepted_state:
             logger.info("[Codex][Browser] 未检测到邮箱输入框，但当前已处于后续授权阶段：url=%s", current[:180])
             return
-        state = _email_otp_page_state(driver)
-        logger.error(
-            "[Codex][Browser] OAuth 登录入口识别失败：url=%s inputs=%s buttons=%s text=%s",
-            str(state.get("url") or current)[:220],
-            len(state.get("inputs") or []),
-            [(b.get("text") or "")[:32] for b in (state.get("buttons") or [])][:8],
-            str(state.get("text") or "")[:200],
-        )
-        raise RuntimeError(f"未找到邮箱输入框/邮箱入口，当前页面不是可跳过登录的后续阶段: {current[:160]}") from exc
+        if _is_login_password_page(driver):
+            logger.info("[Codex][Browser] 异常后检测到登录密码页，重试密码登录")
+            try:
+                pw_retry = _fill_login_password_if_present(driver, email, timeout=20)
+            except Exception as retry_exc:
+                logger.info("[Codex][Browser] 密码重试仍异常：%s", type(retry_exc).__name__)
+                pw_retry = None
+            if pw_retry == "next_step":
+                logger.info("[Codex][Browser] 密码重试成功，进入后续步骤")
+                return
+            if pw_retry == "email_otp":
+                # 不 raise：except 块正常结束后会继续执行下面的 OTP 等待逻辑。
+                logger.info("[Codex][Browser] 密码重试后进入邮箱 OTP 页，继续后续等待")
+            else:
+                logger.error(
+                    "[Codex][Browser] OAuth 登录入口识别失败（密码重试未成功）：url=%s",
+                    str(getattr(driver, "current_url", "") or "")[:200],
+                )
+                raise RuntimeError(f"登录密码页重试未成功: {current[:160]}") from exc
+        else:
+            state = _email_otp_page_state(driver)
+            logger.error(
+                "[Codex][Browser] OAuth 登录入口识别失败：url=%s inputs=%s buttons=%s text=%s",
+                str(state.get("url") or current)[:220],
+                len(state.get("inputs") or []),
+                [(b.get("text") or "")[:32] for b in (state.get("buttons") or [])][:8],
+                str(state.get("text") or "")[:200],
+            )
+            raise RuntimeError(f"未找到邮箱输入框/邮箱入口，当前页面不是可跳过登录的后续阶段: {current[:160]}") from exc
 
     # 提交邮箱后不再执行任何全局“继续/授权/分支”兜底点击；后续只等待验证码页。
     # 避免页面已进入 OAuth consent 时误点授权按钮。
