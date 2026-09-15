@@ -76,6 +76,11 @@ class PageResponse:
         self.text = str(payload.get("text") or "")
         self.elapsed_ms = int(payload.get("ms") or 0)
 
+    @property
+    def content(self) -> bytes:
+        """部分调用方（openai_auth 的错误日志）会读 .content，补齐避免 AttributeError 掩盖真实错误。"""
+        return str(self.text or "").encode("utf-8", errors="replace")
+
     def json(self) -> dict:
         try:
             data = json.loads(self.text)

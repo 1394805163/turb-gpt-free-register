@@ -212,7 +212,17 @@ def run_protocol_registration(
 
         # 5) 资料页（如出现）
         if "about-you" in cont or str(page2.get("type") or "") in {"about_you", "about-you"}:
-            navigate_about_you(session, cont or None)
+            try:
+                navigate_about_you(session, cont or None)
+            except Exception as exc:
+                # Cloudflare 偶发挑战（页内 GET 403 "Just a moment"）：真实导航一次建立 clearance 再重试。
+                if "403" not in str(exc) and "Just a moment" not in str(exc):
+                    raise
+                logger.warning("[协议注册] about-you 导航被 Cloudflare 拦截，改真实导航后重试")
+                about_url = cont if str(cont or "").startswith("http") else "https://auth.openai.com/about-you"
+                driver.get(about_url)
+                time.sleep(2)
+                navigate_about_you(session, cont or None)
             # create_account 的 sentinel 流名与登录不同：流名不匹配时服务端虽然返回 200，
             # 但回调会变成 ?error=invalid_request（missing required parameter），拿不到 code。
             prev_flow = getattr(session, "_flow", None)
