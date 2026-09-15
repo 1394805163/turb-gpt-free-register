@@ -12,6 +12,34 @@ import time
 logger = logging.getLogger(__name__)
 
 
+def _stored_password(email: str) -> str:
+    from core import db
+
+    acc = db.get_account_by_email(email) or {}
+    return str(acc.get("password") or acc.get("registration_password") or "").strip()
+
+
+def _submit_login_password(driver, password: str, timeout: int = 15) -> bool:
+    """登录密码页兜底：没有"一次性验证码"入口时直接填 DB 密码并提交。"""
+    try:
+        element = _find_any(driver, [
+            "input[type='password']",
+            "input[name*='password' i]",
+            "input[autocomplete='current-password']",
+        ], timeout=timeout)
+    except Exception:
+        element = None
+    if not element:
+        return False
+    try:
+        _human_type_text(driver, element, str(password), clear=True)
+        time.sleep(1)
+        _click_continue(driver)
+        return True
+    except Exception:
+        return False
+
+
 def set_account_2fa(
     email: str,
     *,
@@ -32,6 +60,11 @@ def set_account_2fa(
         _clear_otp_inputs,
         _click_continue,
         _fetch_chatgpt_session,
+        _fill_password_page_if_present,
+        _find_any,
+        _human_type_text,
+        _is_email_verification_page,
+        _is_login_password_page,
         _maybe_accept,
         _submit_email_and_wait_next,
         _type_otp,
@@ -51,20 +84,33 @@ def set_account_2fa(
         driver.set_page_load_timeout(90)
         logger.info("[补2FA] 启动：%s profile=%s", email, opened.profile_id)
 
-        # ---- 1) OTP 登录（与补密码一致的登录序列）----
+        # ---- 1) 登录：邮箱 OTP；账号已设密码时走"一次性验证码入口"或密码兜底 ----
         driver.get("https://chatgpt.com/auth/login")
         _maybe_accept(driver)
         time.sleep(2)
         login_otp_after = time.time()
-        _submit_email_and_wait_next(driver, email, attempts=2, timeout=120)
-        login_session = OtpWaitSession(wait_fn=wait_for_otp)
-        login_code = login_session.wait(email, after_ts=login_otp_after, max_wait=90)
-        logger.info("[补2FA] 登录验证码已收到（len=%s），提交", len(str(login_code or "")))
-        _clear_otp_inputs(driver)
-        _type_otp(driver, login_code)
-        _click_continue(driver)
-        outcome = _wait_after_email_otp_submit(driver, timeout=25)
-        logger.info("[补2FA] 登录验证码提交结果：%s", outcome)
+        next_state = _submit_email_and_wait_next(
+            driver, email, attempts=2, timeout=120, allow_password_page=True
+        )
+        if next_state == "login_password":
+            logger.info("[补2FA] 进入登录密码页：优先切换一次性验证码入口")
+            _fill_password_page_if_present(driver, email, timeout=45)
+            if _is_login_password_page(driver):
+                stored_password = _stored_password(email)
+                if not stored_password:
+                    raise RuntimeError("账号已设密码且无一次性验证码入口，DB 中也缺少密码")
+                logger.info("[补2FA] 未找到一次性验证码入口，改用 DB 密码登录")
+                _submit_login_password(driver, stored_password)
+                time.sleep(4)
+        if _is_email_verification_page(driver):
+            login_session = OtpWaitSession(wait_fn=wait_for_otp)
+            login_code = login_session.wait(email, after_ts=login_otp_after, max_wait=90)
+            logger.info("[补2FA] 登录验证码已收到（len=%s），提交", len(str(login_code or "")))
+            _clear_otp_inputs(driver)
+            _type_otp(driver, login_code)
+            _click_continue(driver)
+            outcome = _wait_after_email_otp_submit(driver, timeout=25)
+            logger.info("[补2FA] 登录验证码提交结果：%s", outcome)
         time.sleep(2)
         info = _fetch_chatgpt_session(driver, timeout=90)
         if not info.get("accessToken"):

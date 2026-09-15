@@ -1102,8 +1102,12 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     return "email_page" if _is_email_login_page_still_present(driver) else "unknown"
 
 
-def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, timeout: int = 20, email_supplier=None) -> str:
-    """填写并提交邮箱，必须确认进入 password/otp/logged_in 才返回。"""
+def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, timeout: int = 20, email_supplier=None, allow_password_page: bool = False) -> str:
+    """填写并提交邮箱，必须确认进入 password/otp/logged_in 才返回。
+
+    allow_password_page=True 时，"login_password"（账号已设密码的登录密码页）作为
+    合法状态返回而不是判成"已注册/不可用邮箱"——补2FA/查活等登录场景需要继续处理。
+    """
     last_state = None
     for attempt in range(1, attempts + 1):
         if attempt > 1 and not _is_email_login_page_still_present(driver):
@@ -1143,9 +1147,9 @@ def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, ti
                 "提交邮箱后进入 auth 服务端错误页（可能为限流 rate_limit_exceeded / 风控拒绝），"
                 f"已停止重试: url={getattr(driver, 'current_url', '') or ''}"
             )
-        if state_name == "login_password":
+        if state_name == "login_password" and not allow_password_page:
             raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
-        if state_name in ("password", "otp", "logged_in"):
+        if state_name in ("password", "otp", "logged_in") or (state_name == "login_password" and allow_password_page):
             logger.info("%s 邮箱提交后已进入下一步：%s", _log_prefix(driver), state_name)
             return state_name
         logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _email_input_value_state(driver))
