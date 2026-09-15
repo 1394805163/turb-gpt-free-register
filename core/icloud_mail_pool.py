@@ -308,6 +308,21 @@ class ICloudMailboxPool:
         values = [value for value in data[0].split() if value.isdigit()]
         return sorted(values, key=lambda value: int(value))
 
+    def _search_uids(self, imap, target: str, *, deadline: float | None = None) -> list[bytes] | None:
+        """服务端按收件人过滤 UID（大收件箱下避免全量扫描）。
+
+        iCloud IMAP 支持 `SEARCH TO "<alias>"`；失败时返回 None 让调用方回退全量逻辑。
+        """
+        self._bind_deadline(imap, deadline)
+        try:
+            status, data = imap.uid("search", None, "TO", f'"{target}"')
+        except Exception:
+            return None
+        if status != "OK" or data is None:
+            return None
+        values = [value for value in (data[0] or b"").split() if value.isdigit()]
+        return sorted(values, key=lambda value: int(value))
+
     def _candidate_uid_window(self, all_uids: list[bytes], mailbox: dict[str, Any]) -> list[bytes]:
         seen_uids = mailbox.setdefault("_seen_uids", set())
         pending_uids = mailbox.setdefault("_pending_uids", set())
@@ -453,12 +468,21 @@ class ICloudMailboxPool:
                     if uidvalidity:
                         mailbox["_uidvalidity"] = uidvalidity
 
-                    all_uids = self._all_uids(imap, deadline=deadline)
-                    candidates = self._candidate_uid_window(all_uids, mailbox)
-                    if all_uids:
-                        # 新 UID 基线可以前移；首轮窗口之外的旧 UID 由 backfill_uids 逐批回补。
-                        mailbox["_last_uid"] = max(int(uid) for uid in all_uids)
                     target = str(mailbox["address"]).strip().lower()
+                    scoped = self._search_uids(imap, target, deadline=deadline)
+                    if scoped is not None:
+                        # 服务端已按收件人过滤：候选就是"该别名的全部邮件"，
+                        # 无需 backfill 窗口逻辑（大收件箱下从 5000+ 降到个位数）。
+                        all_uids = scoped
+                        if all_uids:
+                            mailbox["_last_uid"] = max(int(uid) for uid in all_uids)
+                        candidates = all_uids
+                    else:
+                        all_uids = self._all_uids(imap, deadline=deadline)
+                        candidates = self._candidate_uid_window(all_uids, mailbox)
+                        if all_uids:
+                            # 新 UID 基线可以前移；首轮窗口之外的旧 UID 由 backfill_uids 逐批回补。
+                            mailbox["_last_uid"] = max(int(uid) for uid in all_uids)
                     seen_uids = mailbox.setdefault("_seen_uids", set())
                     pending_uids = mailbox.setdefault("_pending_uids", set())
                     backfill_uids = mailbox.setdefault("_backfill_uids", set())
