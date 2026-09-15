@@ -106,7 +106,7 @@ def get_csrf_token(session: BrowserSession) -> str:
     return csrf_token
 
 
-def signin_openai(session: BrowserSession, csrf_token: str, email: str) -> str:
+def signin_openai(session: BrowserSession, csrf_token: str, email: str, prompt: str = "login") -> str:
     """
     步骤3: 发起 OAuth Signin 请求。
     POST https://chatgpt.com/api/auth/signin/openai
@@ -123,7 +123,7 @@ def signin_openai(session: BrowserSession, csrf_token: str, email: str) -> str:
     """
     # 构造 URL 查询参数
     query_params = {
-        "prompt": "login",
+        "prompt": str(prompt or "login"),
         "ext-oai-did": session.device_id,
         "auth_session_logging_id": session.auth_session_logging_id,
         "ext-passkey-client-capabilities": _PASSKEY_CLIENT_CAPABILITIES,
