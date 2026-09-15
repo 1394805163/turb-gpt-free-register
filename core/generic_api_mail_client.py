@@ -143,7 +143,8 @@ def _fetch_public_inbox_page_otp(
         verify=False,
     )
     if resp.status_code != 200:
-        logger.debug("[GenericAPI] public inbox 页面 API HTTP %s: %s", resp.status_code, (resp.text or "")[:160])
+        body_len = len(resp.text or "")
+        logger.debug("[GenericAPI] public inbox 页面 API HTTP %s（响应体 %s 字符）", resp.status_code, body_len)
         return None
     try:
         data = resp.json()

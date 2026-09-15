@@ -2762,7 +2762,7 @@ def run_browser_use_registration(
                         _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500/chrome-error")
                         current_otp = None
                         continue
-                logger.info("[BrowserUse][OTP] 收到验证码：%s", current_otp)
+                logger.info("[BrowserUse][OTP] 收到验证码（len=%s）", len(current_otp or ""))
                 _t_otp_submit = _StepTimer("提交邮箱 OTP")
                 _clear_otp_inputs(page)
                 _type_otp(page, current_otp)

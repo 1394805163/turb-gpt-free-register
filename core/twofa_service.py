@@ -102,7 +102,7 @@ def _run_twofa(
             {"ok": True, "status": "success", "totp_secret": secret, "message": "2FA 设置完成"},
         )
         _append_log(email, f"[2FA] 完成：secret={secret[:4]}...{secret[-4:]}")
-        logger.info("[2FA] 完成：email=%s secret=%s...%s", email, secret[:4], secret[-4:])
+        logger.info("[2FA] 完成：email=%s secret_len=%s", email, len(secret or ""))
         return {"ok": True, "status": "success", "totp_secret": secret, "message": "2FA 设置完成"}
     except Exception as exc:
         result = {"ok": False, "status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}

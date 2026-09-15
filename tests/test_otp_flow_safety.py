@@ -10,13 +10,17 @@ class OtpFlowSafetyTests(unittest.TestCase):
         for relative in (
             "core/cloakbrowser_registration.py",
             "core/roxy_registration.py",
-            "core/browser_use_registration.py",
         ):
             text = (root / relative).read_text(encoding="utf-8")
             self.assertIn("OtpWaitSession", text, relative)
             self.assertIn("otp_wait_session.mark_used", text, relative)
         roxy = (root / "core/roxy_registration.py").read_text(encoding="utf-8")
         self.assertNotIn("wait_for_otp(email, after_ts=0.0", roxy)
+        # BrowserUse 驱动（上游实现）不用 OtpWaitSession，改为自带总预算的
+        # 短轮询 + 页面心跳；这里保留"等待必须有上限"的约束。
+        bu = (root / "core/browser_use_registration.py").read_text(encoding="utf-8")
+        self.assertIn("OTP_MAX_WAIT", bu)
+        self.assertIn("deadline", bu)
 
     def test_logger_calls_never_persist_otp_or_sms_code_variables(self):
         root = Path(__file__).resolve().parent.parent

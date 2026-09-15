@@ -168,7 +168,7 @@ def fetch_latest_otp(
             if ts >= best_ts:
                 if otp != best_otp:
                     best_otp, best_ts, settle_until = otp, ts, time.time() + settle
-                    logger.info("[IMAP] 锁定候选 OTP=%s，等待 %ss settle", otp, settle)
+                    logger.info("[IMAP] 锁定候选 OTP（len=%s），等待 %ss settle", len(otp or ""), settle)
             break
         if best_otp and settle_until is not None and time.time() >= settle_until:
             return best_otp
