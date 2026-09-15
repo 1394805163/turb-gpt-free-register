@@ -605,6 +605,15 @@ def account_fingerprint_seed(email: str) -> str:
     target = str(email or "").strip().lower()
     if not target:
         return ""
+    try:
+        from core import db
+
+        acc = db.get_account_by_email(target) or {}
+        recorded = str(acc.get("cloak_profile_seed") or "").strip()
+        if recorded:
+            return recorded
+    except Exception:
+        pass
     return hashlib.sha256(f"cloak-profile:{target}".encode("utf-8")).hexdigest()[:16]
 
 

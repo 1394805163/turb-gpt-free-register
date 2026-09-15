@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import traceback
@@ -15,7 +16,7 @@ from config import cloakbrowser as _cfg
 from config import email as _email_cfg
 from config import twofa as _twofa_cfg
 from core.account_export import save_account_data
-from core.cloakbrowser_driver import build_cloak_driver
+from core.cloakbrowser_driver import account_fingerprint_seed, build_cloak_driver
 from core.email_provider import OtpWaitSession, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.log_safety import redact_email, redact_emails
@@ -186,7 +187,16 @@ def run_cloak_registration(
         return email
 
     try:
-        driver, opened = build_cloak_driver(proxy=proxy, proxy_selection=proxy_selection)
+        # 注册画像种子：邮箱已确定时用账号级 sha256(email)（与后续流程一致）；
+        # 邮箱延迟领取（页面确认后才分配）时先生成随机种子，注册成功后随账号落盘
+        # 为 cloak_profile_seed，保证"本次注册使用的画像"可被后续查活/补跑复用。
+        profile_seed = account_fingerprint_seed(email) if str(email or "").strip() else secrets.token_hex(8)
+        logger.info("[Cloak注册] 画像种子：%s（email_known=%s）", profile_seed, bool(str(email or "").strip()))
+        driver, opened = build_cloak_driver(
+            proxy=proxy,
+            proxy_selection=proxy_selection,
+            fingerprint_seed=profile_seed,
+        )
         logger.info("[Cloak注册] 开始：%s，profile=%s", redact_email(email), opened.profile_id)
 
         otp_after_ts = time.time()
@@ -406,6 +416,7 @@ def run_cloak_registration(
                     "selection_ms": ((opened.raw or {}).get("proxy_selection_ms") if opened else 0) or 0,
                 },
                 "proxy_exit_country": _registration_exit_country(opened),
+                "cloak_profile_seed": profile_seed,
                 "registration_password": openai_password,
                 "codex": codex_result,
             },
