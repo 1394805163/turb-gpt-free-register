@@ -109,12 +109,14 @@ def _terminate_registration_process(process: mp.Process, reason: str) -> None:
         return
     if not pid:
         return
+    # Windows 没有 os.getpgid/getpgrp：直接退化到 process.terminate()，
+    # 否则 AttributeError 会顶掉真正的停止/超时原因。
     try:
-        pgid = os.getpgid(pid)
+        pgid = os.getpgid(pid) if hasattr(os, "getpgid") else None
     except ProcessLookupError:
         pgid = None
     try:
-        if pgid and pgid != os.getpgrp():
+        if pgid and hasattr(os, "getpgrp") and pgid != os.getpgrp():
             os.killpg(pgid, signal.SIGTERM)
         else:
             process.terminate()
@@ -137,8 +139,8 @@ def _terminate_registration_process(process: mp.Process, reason: str) -> None:
         alive = False
     if alive:
         try:
-            pgid = os.getpgid(pid)
-            if pgid != os.getpgrp():
+            pgid = os.getpgid(pid) if hasattr(os, "getpgid") else None
+            if pgid and hasattr(os, "getpgrp") and pgid != os.getpgrp():
                 os.killpg(pgid, signal.SIGKILL)
             else:
                 process.kill()

@@ -365,6 +365,36 @@ def run_registration(
                 f"{last_result.get('error') or ''}"
             )[:500]
         return last_result or {"success": False, "email": email, "error": "代理池轮换耗尽"}
+    if driver_mode in ("protocol_page", "page_protocol", "page_session"):
+        # 页面会话协议注册：内核浏览器只当请求载体（页内 fetch + 页面 sentinel），
+        # 不跑任何 UI 元素交互 → 官网改版/元素失效不影响注册。
+        from core.protocol_registration import run_protocol_registration
+
+        if not str(email or "").strip():
+            # 邮箱服务模式：任务入队时不领邮箱，这里按需领取并回写 job 状态
+            _handle_email_acquired(acquire_email_after_input(email))
+        result: dict = {}
+        for attempt in range(1, 3):
+            result = run_protocol_registration(
+                email,
+                name=name,
+                birthday=birthday or generate_random_birthday(),
+            )
+            if result.get("ok"):
+                break
+            error_text = str(result.get("error") or "")
+            # 出口国家探测偶发失败（节点 geo 查询超时）→ 换一次节点重试；其他错误直接返回
+            if "无法确认注册出口国家" not in error_text and "Mihomo 代理选择失败" not in error_text:
+                break
+            logger.warning("[协议注册] 出口/选路失败，换节点重试（%s/2）：%s", attempt, error_text[:120])
+        return {
+            "success": bool(result.get("ok")),
+            "email": result.get("email") or email,
+            "account_id": result.get("row_id"),
+            "error": result.get("error"),
+            "page_type": result.get("page_type"),
+            "protocol_transport": "page",
+        }
     if driver_mode in ("browser_use", "browseruse", "browser-use", "bu"):
         from core.browser_use_registration import run_browser_use_registration
         return run_browser_use_registration(
@@ -389,7 +419,8 @@ def run_registration(
         )
     if driver_mode not in ("protocol", "api", "http"):
         raise RuntimeError(
-            f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，可选 protocol / roxy / cloak / browser_use / skyvern"
+            f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，"
+            "可选 protocol / protocol_page / roxy / cloak / browser_use / skyvern"
         )
 
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
