@@ -226,7 +226,12 @@ def run_registration(
         pool_size = len(_proxy_cfg.get_proxy_pool()) if not use_mihomo_source else 1
         # 可恢复失败继续轮换；配置为 0 或负数表示最多无重复走完当前代理池。
         configured_attempts = int(getattr(_cloak_cfg, "CLOAK_PROXY_ROTATION_ATTEMPTS", 0) or 0)
-        max_attempts = pool_size if configured_attempts <= 0 else min(configured_attempts, pool_size or 1)
+        if use_mihomo_source:
+            # Mihomo 没有静态地址池，每次 pick 都换节点 → 用独立次数控制（默认 3），
+            # 避免单节点 CF 挑战/预检失败就把整条注册任务判死。
+            max_attempts = max(1, int(getattr(_cloak_cfg, "CLOAK_MIHOMO_ROTATION_ATTEMPTS", 3) or 3))
+        else:
+            max_attempts = pool_size if configured_attempts <= 0 else min(configured_attempts, pool_size or 1)
         max_attempts = max(1, max_attempts)
         from core.registration_preflight import preflight_proxy
         last_result = None

@@ -22,7 +22,7 @@ from core.log_safety import redact_email, redact_emails
 
 # 复用 Roxy 注册流程里已维护好的页面操作函数。
 from core.roxy_registration import (  # noqa: F401
-    _maybe_accept, _submit_email_and_wait_next, _fill_password_page_if_present,
+    _maybe_accept, _page_warmup, _submit_email_and_wait_next, _fill_password_page_if_present,
     _clear_otp_inputs, _type_otp, _click_continue, _wait_after_email_otp_submit,
     _click_resend_email_otp, _complete_profile_page, _fetch_chatgpt_session, _check_manual_stop,
     _is_chatgpt_logged_in_page,
@@ -179,9 +179,33 @@ def run_cloak_registration(
         logger.info("[Cloak注册] 开始：%s，profile=%s", redact_email(email), opened.profile_id)
 
         otp_after_ts = time.time()
-        logger.info("[Cloak注册] 打开登录页：https://chatgpt.com/auth/login")
         normal_timeout = int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90)
         login_timeout = max(8, min(normal_timeout, int(getattr(_cfg, "CLOAK_LOGIN_PAGE_TIMEOUT", 25) or 25)))
+
+        # 预热浏览：像普通访客一样先打开首页（拿 cf_clearance/oai-did/埋点 cookie + 产生滚动/鼠标行为），
+        # 再进登录页。直接开浏览器冲 /auth/login 是明显的自动化特征。
+        if bool(getattr(_cfg, "CLOAK_WARMUP_ENABLED", True)):
+            try:
+                driver.set_page_load_timeout(login_timeout)
+                try:
+                    driver.get("https://chatgpt.com/")
+                finally:
+                    driver.set_page_load_timeout(normal_timeout)
+                human_delay("navigate")
+                _maybe_accept(driver)
+                _page_warmup(driver, reason="homepage")
+                try:
+                    driver.execute_script(
+                        "window.scrollTo({top: Math.round(300 + Math.random() * 700), behavior: 'smooth'});"
+                    )
+                except Exception:
+                    pass
+                human_delay("page_warmup")
+                logger.info("[Cloak注册] 预热浏览完成（chatgpt.com 首页 → 登录页）")
+            except Exception as exc:
+                logger.info("[Cloak注册] 预热浏览失败（继续注册）：%s", str(exc)[:120])
+
+        logger.info("[Cloak注册] 打开登录页：https://chatgpt.com/auth/login")
         with _stage_deadline(driver, "浏览器启动/登录页", login_timeout):
             driver.set_page_load_timeout(login_timeout)
             try:

@@ -3,6 +3,13 @@
 from config.env_loader import apply_env_overrides
 
 # 是否无头启动：False=显示窗口，True=无头。
+# 注册前先逛一下首页（建立 cf_clearance / oai-did / 埋点 cookie 与浏览行为），
+# 再进登录页；"刚开浏览器就直冲 /auth/login" 是明显的自动化特征。
+CLOAK_WARMUP_ENABLED: bool = True
+
+# Mihomo 出口每次选择都会换节点：给几次机会，避免单个坏节点/CF 挑战直接判死整条注册任务。
+CLOAK_MIHOMO_ROTATION_ATTEMPTS: int = 3
+
 CLOAK_HEADLESS: bool = True
 
 # 是否启用 CloakBrowser humanize 行为。
@@ -63,4 +70,4 @@ CLOAK_SESSION_TIMEOUT: int = 90
 CLOAK_OTP_SUBMIT_TIMEOUT: int = 20
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'CLOAK_HEADLESS': 'bool', 'CLOAK_HUMANIZE': 'bool', 'CLOAK_GEOIP': 'bool', 'CLOAK_LOCALE': 'str', 'CLOAK_TIMEZONE': 'str', 'CLOAK_USE_PROXY': 'bool', 'CLOAK_LICENSE_KEY': 'str', 'CLOAK_FINGERPRINT_SEED': 'str', 'CLOAK_USER_DATA_DIR': 'str', 'CLOAK_SELENIUM_TIMEOUT': 'int', 'CLOAK_KEEP_BROWSER_OPEN': 'bool', 'CLOAK_PROXY_ROTATION_ATTEMPTS': 'int', 'CLOAK_LOGIN_PAGE_TIMEOUT': 'int', 'CLOAK_EMAIL_STEP_TIMEOUT': 'int', 'CLOAK_AUTHORIZE_GRACE_TIMEOUT': 'int', 'CLOAK_NAVIGATION_GRACE_TIMEOUT': 'int', 'CLOAK_PASSWORD_PAGE_TIMEOUT': 'int', 'CLOAK_PROFILE_TIMEOUT': 'int', 'CLOAK_SESSION_TIMEOUT': 'int', 'CLOAK_OTP_SUBMIT_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'CLOAK_HEADLESS': 'bool', 'CLOAK_HUMANIZE': 'bool', 'CLOAK_GEOIP': 'bool', 'CLOAK_LOCALE': 'str', 'CLOAK_TIMEZONE': 'str', 'CLOAK_USE_PROXY': 'bool', 'CLOAK_LICENSE_KEY': 'str', 'CLOAK_FINGERPRINT_SEED': 'str', 'CLOAK_USER_DATA_DIR': 'str', 'CLOAK_SELENIUM_TIMEOUT': 'int', 'CLOAK_KEEP_BROWSER_OPEN': 'bool', 'CLOAK_PROXY_ROTATION_ATTEMPTS': 'int', 'CLOAK_LOGIN_PAGE_TIMEOUT': 'int', 'CLOAK_EMAIL_STEP_TIMEOUT': 'int', 'CLOAK_AUTHORIZE_GRACE_TIMEOUT': 'int', 'CLOAK_NAVIGATION_GRACE_TIMEOUT': 'int', 'CLOAK_PASSWORD_PAGE_TIMEOUT': 'int', 'CLOAK_PROFILE_TIMEOUT': 'int', 'CLOAK_SESSION_TIMEOUT': 'int', 'CLOAK_OTP_SUBMIT_TIMEOUT': 'int', 'CLOAK_WARMUP_ENABLED': 'bool', 'CLOAK_MIHOMO_ROTATION_ATTEMPTS': 'int'})
