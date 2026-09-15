@@ -127,7 +127,7 @@ def main() -> int:
                         db.update_account_registration_password(email, password)
                         if totp:
                             db.update_account_totp_secret(email, totp)
-                        old_at = str(acc.get("chatgpt_oauth_access_token") or acc.get("access_token") or "")
+                        old_at = str(acc.get("access_token") or acc.get("chatgpt_oauth_access_token") or "")
                         write_result = db.update_account_chatgpt_oauth(email, credential, expected_access_token=old_at)
                     else:
                         db.insert_account(

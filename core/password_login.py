@@ -291,7 +291,8 @@ def login_with_password(
             try:
                 from core import db
                 old = db.get_account_by_email(target) or {}
-                old_at = str(old.get("chatgpt_oauth_access_token") or old.get("access_token") or "")
+                # CAS 校验的是顶层 access_token（update_account_chatgpt_oauth 语义），优先用它
+                old_at = str(old.get("access_token") or old.get("chatgpt_oauth_access_token") or "")
                 wb = db.update_account_chatgpt_oauth(
                     target,
                     {
