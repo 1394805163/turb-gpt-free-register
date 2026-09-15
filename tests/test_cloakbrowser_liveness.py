@@ -28,7 +28,12 @@ class CloakBrowserLivenessOtpTests(unittest.TestCase):
                 patch.object(module, "_clear_otp_inputs"),
                 patch.object(module, "_type_otp"),
                 patch.object(module, "_click_continue"),
-                patch.object(module, "_wait_after_email_otp_submit", return_value=outcome),
+                patch.object(
+                    module,
+                    "_wait_after_email_otp_submit",
+                    side_effect=outcome if isinstance(outcome, list) else None,
+                    return_value=None if isinstance(outcome, list) else outcome,
+                ),
                 patch.object(module, "_fetch_chatgpt_session", return_value={"accessToken": "fixture-token"}),
                 patch.object(module.cloak_cfg, "CLOAK_KEEP_BROWSER_OPEN", False),
             ):
@@ -65,6 +70,23 @@ class CloakBrowserLivenessOtpTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(otp_session.wait.call_count, 1)
         resend.assert_not_called()
+
+
+    def test_invalid_otp_resends_then_succeeds(self):
+        otp_session = Mock()
+        otp_session.wait.side_effect = ["123456", "654321"]
+        resend = Mock(return_value={"ok": True})
+
+        result = self._run_flow(
+            otp_session=otp_session,
+            resend=resend,
+            logged_in=[False, False],
+            outcome=["invalid", "accepted"],
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(otp_session.wait.call_count, 2)
+        self.assertEqual(resend.call_count, 1)
 
 
 if __name__ == "__main__":

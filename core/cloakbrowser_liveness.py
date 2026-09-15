@@ -6,6 +6,7 @@ import logging
 import time
 
 from config import cloakbrowser as cloak_cfg
+from config import email as email_cfg
 from core.cloakbrowser_driver import build_cloak_driver
 from core.email_provider import OtpWaitSession, wait_for_otp
 from core.humanize import delay as human_delay
@@ -105,8 +106,8 @@ def run_cloak_liveness_flow(
         otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
         otp_after_ts = time.time()
         current_otp = None
-        resend_used = False
-        otp_wait = _setting_int("OTP_SINGLE_WAIT", 75, 15)
+        resend_count = 0
+        otp_wait = max(15, int(getattr(email_cfg, "OTP_SINGLE_WAIT", 75) or 75))
         otp_submit_timeout = _setting_int("CLOAK_OTP_SUBMIT_TIMEOUT", 20, 8)
         for attempt in range(1, 4):
             if current_otp is None:
@@ -128,9 +129,9 @@ def run_cloak_liveness_flow(
                     if _is_chatgpt_logged_in_page(driver):
                         logger.info("[Cloak查活][OTP] 等待取码期间已检测到 ChatGPT 首页，按成功继续")
                         break
-                    if resend_used:
+                    if resend_count >= 2:
                         raise RuntimeError("邮箱验证码等待超时，重发机会已用尽") from exc
-                    resend_used = True
+                    resend_count += 1
                     resend_result = _click_resend_email_otp(driver, timeout=25)
                     if resend_result.get("reason") == "otp_page_left":
                         break
@@ -173,8 +174,8 @@ def run_cloak_liveness_flow(
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
             if outcome == "stalled" and attempt >= 3:
                 raise RuntimeError("OTP 提交后页面停滞，已达到最大重试次数")
-            if not resend_used:
-                resend_used = True
+            if resend_count < 2:
+                resend_count += 1
                 resend_result = _click_resend_email_otp(driver, timeout=25)
                 if resend_result.get("reason") == "otp_page_left":
                     break

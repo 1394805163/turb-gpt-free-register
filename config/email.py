@@ -49,8 +49,8 @@ OUTLOOK_API_BASE = "https://mail.chatai.codes"
 
 OTP_POLL_INTERVAL = 3
 # 单轮取码上限；多轮重发共用 OTP_MAX_WAIT 总预算。
-OTP_SINGLE_WAIT = 75
-OTP_MAX_WAIT = 180
+OTP_SINGLE_WAIT = 150
+OTP_MAX_WAIT = 420
 
 # Outlook 双协议取件：抓到一封 OTP 后再多等多少秒看是否有更晚到达的邮件。
 OTP_SETTLE_SECONDS = 5

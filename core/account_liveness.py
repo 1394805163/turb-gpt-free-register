@@ -618,7 +618,7 @@ def _validate_with_retry(
     session: BrowserSession,
     email: str,
     otp_after_ts: float,
-    max_otp_attempts: int = 2,
+    max_otp_attempts: int = 3,
     email_source: str | None = None,
 ) -> dict:
     current_otp = None
