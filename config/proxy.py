@@ -609,8 +609,22 @@ def select_mihomo_us_proxy(
     )
 
 
-def pick_registration_proxy() -> dict:
-    """选择注册代理；Resin 和 Mihomo 均不允许失败时回退直连。"""
+def node_country_code(node_name: str) -> str:
+    """从节点名推断国家码（推断不出返回空串）。用于"新号出口粘性"判断。"""
+    name = str(node_name or "")
+    if not name:
+        return ""
+    for code in ("US", "JP", "SG", "TW", "KR", "HK", "GB", "DE", "FR", "NL", "CA", "AU", "TR", "RU", "MY", "IN", "ID", "PH", "VN", "TH"):
+        if node_matches_country(name, code):
+            return code
+    return ""
+
+
+def pick_registration_proxy(*, allowed_countries_override: object = None) -> dict:
+    """选择注册代理；Resin 和 Mihomo 均不允许失败时回退直连。
+
+    allowed_countries_override 只影响本次选择（用于新号查活固定注册国家）。
+    """
     source = str(REGISTRATION_PROXY_SOURCE or "").strip().lower()
     explicit_source = source
     if bool(REGISTRATION_PROXY_REQUIRED):
@@ -672,6 +686,9 @@ def pick_registration_proxy() -> dict:
                 password=MIHOMO_CONTROLLER_PASSWORD,
             )
         mihomo_allowed = allowed or _normalize_country_codes(MIHOMO_REGISTRATION_ALLOWED_COUNTRIES)
+        override_codes = _normalize_country_codes(allowed_countries_override)
+        if override_codes:
+            mihomo_allowed = override_codes
         mihomo_excluded = excluded | {"HK"}
         return select_mihomo_proxy(
             controller_url=MIHOMO_CONTROLLER_URL,

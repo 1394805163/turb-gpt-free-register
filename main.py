@@ -372,6 +372,19 @@ def run_registration(
 
         result: dict = {}
         max_email_rounds = 3
+        # 一个任务只用一条出口：注册 → 授权（→ 后续查活尽量粘住同国家），
+        # 新号几分钟内跨国跳变是最明显的风控特征之一。
+        from config import proxy as _proxy_cfg
+
+        proxy_selection: dict = {}
+        try:
+            proxy_selection = _proxy_cfg.pick_registration_proxy() or {}
+            logger.info(
+                "[协议注册] 本次任务锁定出口：node=%s mode=%s",
+                proxy_selection.get("node_name") or "-", proxy_selection.get("mode") or "-",
+            )
+        except Exception as exc:
+            logger.warning("[协议注册] 选路失败，交给注册流程内自行选择：%s", str(exc)[:120])
         for email_round in range(1, max_email_rounds + 1):
             if not str(email or "").strip():
                 # 邮箱服务模式：任务入队时不领邮箱，这里按需领取并回写 job 状态
@@ -381,6 +394,7 @@ def run_registration(
                     email,
                     name=name,
                     birthday=birthday or generate_random_birthday(),
+                    proxy_selection=proxy_selection or None,
                 )
                 if result.get("ok"):
                     break
@@ -424,7 +438,11 @@ def run_registration(
                     prev_codex_driver = getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", None)
                     try:
                         _codex_cfg.CODEX_OAUTH_DRIVER = "protocol"
-                        codex_result = run_codex_oauth(email, force=True) or {}
+                        codex_result = run_codex_oauth(
+                            email,
+                            force=True,
+                            proxy_selection=proxy_selection or None,
+                        ) or {}
                     finally:
                         if prev_codex_driver is not None:
                             _codex_cfg.CODEX_OAUTH_DRIVER = prev_codex_driver

@@ -40,12 +40,45 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
         f.write(f"{stamp} [INFO] {line}\n")
 
 
-def _resolve_live_check_route(proxy: str | None) -> dict:
-    """查活跟随注册出口策略；Resin 关闭时使用通用 Mihomo 筛选。"""
+def _young_account_country_hint(account_id: int, *, max_age_hours: float = 6.0) -> str:
+    """新注册账号（默认 6 小时内）查活时尽量固定注册时的出口国家。
+
+    新号在几分钟内从 A 国注册、B 国登录、C 国查活，是典型的"账号被倒卖/接管"风控特征。
+    """
+    try:
+        from config import proxy as proxy_cfg
+
+        acc = db.get_account(int(account_id)) or {}
+        created = str(acc.get("created_at") or "").strip()
+        if not created:
+            return ""
+        from datetime import datetime as _dt
+
+        age_hours = (_dt.now() - _dt.fromisoformat(created)).total_seconds() / 3600.0
+        if age_hours > max_age_hours:
+            return ""
+        return proxy_cfg.node_country_code(str(acc.get("proxy_used") or ""))
+    except Exception:
+        return ""
+
+
+def _resolve_live_check_route(proxy: str | None, *, country_hint: str = "") -> dict:
+    """查活跟随注册出口策略；Resin 关闭时使用通用 Mihomo 筛选。
+
+    country_hint：新号指定候选国家（固定注册出口），失败自动回退默认筛选。
+    """
     from config import proxy as proxy_cfg
 
     if not bool(getattr(proxy_cfg, "REGISTRATION_PROXY_REQUIRED", False)):
-        selection = proxy_cfg.pick_registration_proxy()
+        hint = str(country_hint or "").strip().upper()
+        if hint:
+            try:
+                selection = proxy_cfg.pick_registration_proxy(allowed_countries_override={hint})
+            except Exception:
+                # 指定国家选不出来就回退默认筛选，不让"出口粘性"变成硬失败
+                selection = proxy_cfg.pick_registration_proxy()
+        else:
+            selection = proxy_cfg.pick_registration_proxy()
         selected = str(selection.get("proxy_url") or "")
         transparent = bool(selection.get("transparent"))
         from core.registration_preflight import preflight_proxy
@@ -97,7 +130,8 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
         if not db.mark_account_live_check_running(account_id):
             _append_log(email, "[查活] 账号已删除或查活状态已被重置，取消执行")
             return {"ok": False, "status": "failed", "error": "账号已删除或查活状态已被重置"}
-        route = _resolve_live_check_route(proxy)
+        country_hint = _young_account_country_hint(account_id)
+        route = _resolve_live_check_route(proxy, country_hint=country_hint)
         selected_proxy = route.get("proxy")
         _append_log(
             email,
@@ -105,6 +139,7 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
             f"trigger={trigger} network_route={route.get('network_route')} "
             f"proxy_mode={route.get('proxy_mode')} proxy_used={route.get('proxy_used') or '-'} "
             f"group={route.get('proxy_group') or '-'} node={route.get('proxy_node') or '-'} "
+            f"country_hint={country_hint or '-'} "
             f"fallback_reason={route.get('proxy_fallback_reason') or '-'}"
         )
         result = check_account_liveness(
