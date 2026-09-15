@@ -13,6 +13,76 @@ import time
 logger = logging.getLogger(__name__)
 
 
+def _read_auth_page(driver, timeout: int = 12) -> dict:
+    """等登录/验证码页出现输入框，返回 {url, text, inputs}（用于判断是否已过邮箱步）。"""
+    end = time.time() + timeout
+    state: dict = {}
+    while time.time() < end:
+        try:
+            state = driver.execute_script(r"""
+            const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+            return {
+              url: location.href,
+              text: (document.body ? document.body.innerText : '').slice(0, 400),
+              inputs: [...document.querySelectorAll('input')].filter(vis).map(el => ({
+                type: el.getAttribute('type') || '', name: el.getAttribute('name') || '',
+                placeholder: el.getAttribute('placeholder') || ''
+              }))
+            };
+            """) or {}
+        except Exception:
+            state = {}
+        inputs = state.get("inputs") or []
+        if any(str(i.get("name") or "") in {"code", "one-time-code"} for i in inputs) or \
+                any(str(i.get("type") or "").lower() == "email" for i in inputs):
+            return state
+        time.sleep(0.5)
+    return state
+
+
+def _login_and_fetch_session(driver, session, email: str) -> dict:
+    """邮箱 OTP 登录一次并取回 session（含 accessToken/user/account）。
+
+    账号已经创建成功，只是 create_account 返回的回调偶发
+    ``?error=invalid_request``（缺参数）导致 chatgpt.com 登录态没建立。
+    """
+    from core.chatgpt_auth import signin_openai
+    from core.codex_oauth import _post_json
+    from core.email_provider import wait_for_otp
+    from core.account_export import fetch_session
+
+    driver.get("https://chatgpt.com/auth/login")
+    time.sleep(3)
+    csrf = str((session.get(
+        "https://chatgpt.com/api/auth/csrf",
+        headers=session.get_nextauth_headers(referer="https://chatgpt.com/auth/login"),
+    ).json() or {}).get("csrfToken") or "")
+    if not csrf:
+        raise RuntimeError("兜底登录未取得 csrfToken")
+    t0 = time.time()
+    auth_url = signin_openai(session, csrf, email, prompt="login")
+    driver.get(auth_url)
+    time.sleep(4)
+    code = wait_for_otp(email, after_ts=t0)
+    resp = _post_json(
+        session,
+        "https://auth.openai.com/api/accounts/email-otp/validate",
+        {"code": code},
+        referer="https://auth.openai.com/email-verification",
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"兜底登录 OTP 验证失败 HTTP {resp.status_code}: {resp.text[:150]}")
+    data = resp.json() or {}
+    cont = str(data.get("continue_url") or (data.get("page") or {}).get("continue_url") or "")
+    if cont:
+        driver.get(cont if cont.startswith("http") else "https://auth.openai.com" + cont)
+        time.sleep(3)
+    info = fetch_session(session) or {}
+    if not str(info.get("accessToken") or ""):
+        raise RuntimeError("兜底登录后仍未拿到 accessToken")
+    return info
+
+
 def run_protocol_registration(
     email: str,
     *,
@@ -69,19 +139,30 @@ def run_protocol_registration(
         time.sleep(4)
 
         # 3) 提交邮箱（页内 fetch，sentinel 由页面 SDK 生成）
+        #    注意：authorize URL 带 login_hint 时服务端可能已经走到验证码页（新邮箱=注册、
+        #    老邮箱=登录）。此时再提交一次邮箱会把新邮箱推进 password 分支并返回
+        #    login_password，被误判成"已注册"——所以先看页面，已经在验证码页就跳过提交。
         t0 = time.time()
-        r1 = _post_json(
-            session,
-            "https://auth.openai.com/api/accounts/authorize/continue",
-            {"username": {"kind": "email", "value": email}},
-            referer="https://auth.openai.com/log-in",
+        state = _read_auth_page(driver)
+        on_code_page = any(
+            str(i.get("name") or "") in {"code", "one-time-code"} for i in (state.get("inputs") or [])
         )
-        if r1.status_code != 200:
-            return {"ok": False, "status": "failed", "email": email,
-                    "error": f"submit_email HTTP {r1.status_code}: {r1.text[:150]}"}
-        d1 = r1.json()
-        ptype = str((d1.get("page") or {}).get("type") or "")
         registration_password = ""
+        if on_code_page:
+            logger.info("[协议注册] 已直接落在验证码页，跳过邮箱提交：%s", state.get("url"))
+            ptype = "email_otp_verification"
+        else:
+            r1 = _post_json(
+                session,
+                "https://auth.openai.com/api/accounts/authorize/continue",
+                {"username": {"kind": "email", "value": email}},
+                referer="https://auth.openai.com/log-in",
+            )
+            if r1.status_code != 200:
+                return {"ok": False, "status": "failed", "email": email,
+                        "error": f"submit_email HTTP {r1.status_code}: {r1.text[:150]}"}
+            d1 = r1.json()
+            ptype = str((d1.get("page") or {}).get("type") or "")
         if ptype == "create_account_password":
             # 新版"密码注册"分支：先提交密码，再走邮箱 OTP。
             # 端点/字段与 openai_auth 里保留的备用实现一致（user/register + email-otp/send）。
@@ -132,16 +213,70 @@ def run_protocol_registration(
         # 5) 资料页（如出现）
         if "about-you" in cont or str(page2.get("type") or "") in {"about_you", "about-you"}:
             navigate_about_you(session, cont or None)
-            create_account(session, name, birthday, None, None)
+            # create_account 的 sentinel 流名与登录不同：流名不匹配时服务端虽然返回 200，
+            # 但回调会变成 ?error=invalid_request（missing required parameter），拿不到 code。
+            prev_flow = getattr(session, "_flow", None)
+            if prev_flow is not None:
+                session._flow = "oauth_create_account"
+            try:
+                created = create_account(session, name, birthday, None, None)
+            finally:
+                if prev_flow is not None:
+                    session._flow = prev_flow
+            created_page = (created or {}).get("page") if isinstance(created, dict) else {}
+            created_cont = str(
+                (created or {}).get("continue_url")
+                or (created_page or {}).get("continue_url")
+                or ""
+            ) if isinstance(created, dict) else ""
+            if created_cont:
+                # 回调 URL 必须真实导航一次：它负责把 auth 会话换成 chatgpt.com 的 session cookie，
+                # 否则后面 /api/auth/session 只会返回 WARNING_BANNER（没有 accessToken）。
+                cont = created_cont
+                page_url = str(((created_page or {}).get("payload") or {}).get("url") or "")
+                logger.info("[协议注册] 已拿到回调地址（page=%s），导航建立 chatgpt.com 登录态：%s",
+                            str((created_page or {}).get("type") or "-"),
+                            (page_url or cont)[:120])
 
         # 6) 拿 session（AT）
+        # create_account 之后必须先真实导航回 chatgpt.com 域：auth.openai.com 页面里
+        # 页内 fetch https://chatgpt.com/api/auth/session 会因跨域直接 "Failed to fetch"。
+        back_url = str(cont or "").strip()
+        if back_url and not back_url.startswith("http"):
+            back_url = "https://auth.openai.com" + back_url
+        try:
+            driver.get(back_url or "https://chatgpt.com/")
+        except Exception:
+            try:
+                driver.get("https://chatgpt.com/")
+            except Exception:
+                pass
         time.sleep(2)
-        info = fetch_session(session)
-        at = str(info.get("accessToken") or "")
+        info: dict = {}
+        at = ""
+        try:
+            info = fetch_session(session) or {}
+            at = str(info.get("accessToken") or "")
+        except Exception as exc:
+            message = str(exc)
+            if "Failed to fetch" in message:
+                # 页内 fetch 跨域失败：真实导航回 chatgpt.com 再取一次
+                try:
+                    driver.get("https://chatgpt.com/")
+                    time.sleep(2)
+                    info = fetch_session(session) or {}
+                    at = str(info.get("accessToken") or "")
+                except Exception:
+                    at = ""
+            elif "未拿到 accessToken" not in message:
+                raise
         if not at:
-            return {"ok": False, "status": "failed", "email": email,
-                    "error": "注册后未拿到 accessToken", "page_type": page2.get("type"),
-                    "continue_url": cont[:120]}
+            # 账号已创建成功，只是回调没建立 chatgpt.com 登录态 → 用邮箱 OTP 兜底登录取 AT。
+            logger.warning("[协议注册] 回调未建立登录态，改用邮箱 OTP 登录取 AT：%s", email)
+            recovered = _login_and_fetch_session(driver, session, email)
+            at = str(recovered.get("accessToken") or "")
+            info = dict(recovered)
+            info["recovered_via_login"] = True
 
         totp_secret = ""
         try:

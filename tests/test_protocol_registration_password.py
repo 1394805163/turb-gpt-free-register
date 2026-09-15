@@ -38,6 +38,8 @@ class ProtocolRegistrationPasswordTests(unittest.TestCase):
             raise AssertionError(f"unexpected POST {url}")
 
         driver = Mock()
+        # 默认落点还是邮箱输入页（没有 code 输入框）→ 流程会照常提交邮箱
+        driver.execute_script.return_value = {"url": "https://auth.openai.com/log-in", "inputs": [{"type": "email", "name": "email"}]}
         session = Mock()
         saved: dict = {}
 
@@ -80,6 +82,39 @@ class ProtocolRegistrationPasswordTests(unittest.TestCase):
         # 密码落盘到 extra
         self.assertEqual(saved["extra"]["registration_password"], result["registration_password"])
         self.assertEqual(saved["totp_secret"], None)
+
+    def test_already_on_code_page_skips_email_submit(self):
+        """login_hint 让服务端先走到验证码页时，重复提交邮箱会把新邮箱误判成已注册。"""
+        from core import protocol_registration as pr
+        from unittest.mock import Mock as _Mock, patch as _patch
+
+        calls = []
+
+        def fake_post(session, url, payload, referer=None, **kwargs):
+            calls.append(url)
+            if url.endswith("/email-otp/validate"):
+                return _Resp(200, {"page": {"type": "email_otp_verification"}, "continue_url": "https://chatgpt.com/"})
+            raise AssertionError(f"unexpected POST {url}")
+
+        driver = _Mock()
+        driver.execute_script.return_value = {"url": "https://auth.openai.com/email-verification", "inputs": [{"name": "code", "type": "text"}]}
+        session = _Mock()
+
+        with _patch.object(pr, "time") as fake_time, _patch(
+            "core.cloakbrowser_driver.build_cloak_driver", return_value=(driver, _Mock())
+        ), _patch("core.page_session.PageSession", return_value=session), _patch(
+            "core.chatgpt_auth.signin_openai", return_value="https://auth.openai.com/api/accounts/authorize?x=1"
+        ), _patch("core.codex_oauth._post_json", side_effect=fake_post), _patch(
+            "core.email_provider.wait_for_otp", return_value="123456"
+        ), _patch(
+            "core.account_export.fetch_session", return_value={"accessToken": "AT-1", "user": {}, "account": {}}
+        ), _patch("core.account_export.save_account_data", return_value=7):
+            fake_time.sleep = lambda *_: None
+            fake_time.time = lambda: 0.0
+            result = pr.run_protocol_registration("fresh@icloud.com")
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse([u for u in calls if u.endswith("/authorize/continue")])
 
     def test_otp_only_branch_does_not_touch_user_register(self):
         result, calls, saved, _session = self._run(page_type="email_otp_verification")
