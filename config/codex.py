@@ -50,6 +50,12 @@ CODEX_REQUEST_TIMEOUT: int = 30
 # 注册成功后是否自动跑 Codex 授权（True=自动，False=跳过）
 ENABLE_CODEX_AUTO: bool = False
 
+# 注册后是否"先观察 AT 存活、再跑 Codex 授权"：
+# True  = 注册完成只落盘 session AT，Codex/凭据稍后（补跑或人工）再做，避免新号落地几分钟内
+#         就被多次异地登录（风控特征）。
+# False = 老行为：注册成功后立刻在同一任务里跑 Codex。
+CODEX_DEFER_AFTER_REGISTRATION: bool = True
+
 # Codex OAuth 授权驱动：
 #   "protocol" = 原有 curl_cffi 协议授权
 #   "roxy"     = 调用 RoxyBrowser 指纹浏览器完成授权页面/回调捕获
@@ -175,4 +181,4 @@ L_ADMIN_AUTH_CODE: str = env_str("L_ADMIN_AUTH_CODE", "")
 L_PHONE_PREFIX: str = ""
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_OAUTH_PROTOCOL_TRANSPORT': 'str', 'CODEX_OAUTH_SKIP_PHONE_VERIFICATION': 'bool', 'CODEX_OAUTH_MIN_AGE_DAYS': 'int', 'CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN': 'bool', 'CODEX_AUTH_URL_SOURCE': 'str', 'CODEX_AUTH0_CLIENT': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})
+apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_DEFER_AFTER_REGISTRATION': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_OAUTH_PROTOCOL_TRANSPORT': 'str', 'CODEX_OAUTH_SKIP_PHONE_VERIFICATION': 'bool', 'CODEX_OAUTH_MIN_AGE_DAYS': 'int', 'CODEX_OAUTH_REQUIRE_EXPIRED_TOKEN': 'bool', 'CODEX_AUTH_URL_SOURCE': 'str', 'CODEX_AUTH0_CLIENT': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})

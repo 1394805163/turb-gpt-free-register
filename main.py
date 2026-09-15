@@ -430,7 +430,9 @@ def run_registration(
             try:
                 from config import codex as _codex_cfg
 
-                if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
+                if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)) and not bool(
+                    getattr(_codex_cfg, "CODEX_DEFER_AFTER_REGISTRATION", False)
+                ):
                     from core.codex_oauth import run_codex_oauth
 
                     # 协议注册链路统一用协议 Codex（页面会话）：不再另起一个 UI 浏览器，
@@ -463,6 +465,14 @@ def run_registration(
                             logger.info("[协议注册][Codex] 凭据已回写数据库")
                         except Exception as persist_exc:
                             logger.warning("[协议注册][Codex] 凭据回写失败：%s", str(persist_exc)[:160])
+                elif bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
+                    logger.info("[协议注册][Codex] 已按 CODEX_DEFER_AFTER_REGISTRATION 推迟：先观察 AT 存活，稍后可补跑")
+                    try:
+                        from core import db as _db
+
+                        _db.update_account_codex_status(email, "skipped", "推迟：先观察 AT 存活（CODEX_DEFER_AFTER_REGISTRATION）")
+                    except Exception:
+                        pass
                 else:
                     logger.info("[协议注册][Codex] ENABLE_CODEX_AUTO=False，跳过 Codex 授权")
             except Exception as exc:

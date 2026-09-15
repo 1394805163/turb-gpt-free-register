@@ -310,7 +310,9 @@ def run_cloak_registration(
         }
         try:
             from config import codex as _codex_cfg
-            if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
+            if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)) and not bool(
+                getattr(_codex_cfg, "CODEX_DEFER_AFTER_REGISTRATION", False)
+            ):
                 from core.roxy_codex_oauth import run_roxy_codex_oauth
                 logger.info("[Cloak注册][Codex] ENABLE_CODEX_AUTO=True，复用当前 CloakBrowser 窗口执行 Codex 授权")
                 _check_manual_stop()
@@ -322,6 +324,8 @@ def run_cloak_registration(
                     force=True,
                     clear_existing_state=True,
                 )
+            elif bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
+                logger.info("[Cloak注册][Codex] 已按 CODEX_DEFER_AFTER_REGISTRATION 推迟：先观察 AT 存活，稍后补跑 Codex")
             else:
                 logger.info("[Cloak注册][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
         except Exception as exc:
