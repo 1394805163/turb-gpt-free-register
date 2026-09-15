@@ -122,7 +122,7 @@ def main() -> int:
 
         from curl_cffi import requests as curl_requests
 
-        s = curl_requests.Session(impersonate="chrome146")
+        s = curl_requests.Session(impersonate="chrome150")
         base_headers = {"accept": "application/json", "user-agent": ua or "Mozilla/5.0"}
 
         t0 = time.time()

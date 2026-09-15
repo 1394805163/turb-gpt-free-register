@@ -63,7 +63,7 @@ def main() -> int:
     except Exception:
         ua = "Mozilla/5.0"
 
-    session = curl_requests.Session(impersonate="chrome146")
+    session = curl_requests.Session(impersonate="chrome150")
     t0 = time.time()
     try:
         resp = session.post(

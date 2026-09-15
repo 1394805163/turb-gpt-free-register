@@ -8,8 +8,9 @@ from functools import wraps
 from typing import Iterator
 
 
-# 硬上限：所有流水线阶段合计最多同时执行两个工作单元。
-PIPELINE_MAX_CONCURRENCY = 2
+# 硬上限：所有流水线阶段合计最多同时执行一个工作单元。
+# CloakBrowser 免费档限 1 个并发会话（151 内核），两个浏览器任务并发会被 license 拒绝。
+PIPELINE_MAX_CONCURRENCY = 1
 
 _SLOTS = threading.BoundedSemaphore(PIPELINE_MAX_CONCURRENCY)
 _LOCK = threading.Lock()

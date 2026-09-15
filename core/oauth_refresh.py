@@ -45,13 +45,8 @@ def refresh_account_credentials(
 
     from curl_cffi import requests as curl_requests
 
-    try:
-        from config import USER_AGENT as _ua
-        ua = str(_ua or "Mozilla/5.0")
-    except Exception:
-        ua = "Mozilla/5.0"
-
-    session = curl_requests.Session(impersonate="chrome146")
+    # impersonate 档自带配套 UA/头；显式传旧版 UA 反而制造不一致。
+    session = curl_requests.Session(impersonate="chrome150")
     t0 = time.time()
     try:
         resp = session.post(
@@ -59,7 +54,6 @@ def refresh_account_credentials(
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": ua,
             },
             data={"grant_type": "refresh_token", "refresh_token": rt, "client_id": cid},
             timeout=timeout,
