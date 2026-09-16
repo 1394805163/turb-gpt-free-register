@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("init", "start", "stop", "status", "health")]
     [string]$Action = "status"
@@ -208,6 +208,21 @@ function Stop-WebUi {
 
     $servicePid = [int]$process.ProcessId
     Write-Step "Stopping WebUI. PID=$servicePid"
+    # 连带清理注册子进程/浏览器：只杀父进程会把带 CloakBrowser 会话的子进程留成孤儿，
+    # license 席位不释放，后续所有浏览器任务都会报 session limit reached。
+    $script:tree = @()
+    function Get-ChildTree([int]$Parent) {
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $Parent" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessId)
+        foreach ($kid in $kids) {
+            $script:tree += [int]$kid
+            Get-ChildTree -Parent ([int]$kid)
+        }
+    }
+    Get-ChildTree -Parent $servicePid
+    foreach ($childPid in $tree) {
+        Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
+    }
+    if ($tree.Count -gt 0) { Write-Step "Stopped $($tree.Count) child process(es)." }
     Stop-Process -Id $servicePid -Force
     Wait-Process -Id $servicePid -Timeout 10 -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
