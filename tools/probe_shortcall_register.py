@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 
@@ -125,10 +126,45 @@ def main() -> int:
                 proxy_selection=proxy_selection,
                 fingerprint_seed=seed,
             )
-            driver.get("https://chatgpt.com/auth/login")
-            time.sleep(6)
-            driver.get("https://auth.openai.com/log-in")
-            time.sleep(5)
+            # 预热浏览（与 cloak 注册流程同一套人类行为）：
+            # 先逛首页拿 cf_clearance/埋点 cookie 并产生滚动/鼠标行为，再依次进登录页/认证页。
+            from core.humanize import delay as human_delay
+            from core.roxy_registration import _maybe_accept, _page_warmup
+
+            normal_timeout = 90
+            warm_timeout = 25
+
+            def _nav(url: str, label: str) -> bool:
+                try:
+                    driver.set_page_load_timeout(warm_timeout)
+                    try:
+                        driver.get(url)
+                    finally:
+                        driver.set_page_load_timeout(normal_timeout)
+                    human_delay("navigate")
+                    _maybe_accept(driver)
+                    _page_warmup(driver, reason=label)
+                    return True
+                except Exception as exc:
+                    logger.info("[短调用] 预热访问 %s 失败（继续后续步骤）：%s", label, str(exc)[:110])
+                    try:
+                        driver.set_page_load_timeout(normal_timeout)
+                    except Exception:
+                        pass
+                    return False
+
+            if _nav("https://chatgpt.com/", "homepage"):
+                try:
+                    driver.execute_script(
+                        "window.scrollTo({top: Math.round(300 + Math.random() * 700), behavior: 'smooth'});"
+                    )
+                except Exception:
+                    pass
+                human_delay("page_warmup")
+            _nav("https://chatgpt.com/auth/login", "login")
+            human_delay("form")
+            _nav("https://auth.openai.com/log-in", "auth")
+            human_delay("form")
             harv = harvest(driver)
             try:
                 driver.get("https://chatgpt.com/cdn-cgi/trace")
@@ -161,7 +197,7 @@ def main() -> int:
             raise RuntimeError("harvest 未取到 cookies")
 
         # ── 2) 协议会话：注入 cookies + 环境对齐 ──────────────────────
-        session = BrowserSession(proxy=proxy_url)
+        session = BrowserSession(proxy=proxy_url, fingerprint_seed=(seed or None))
         injected = 0
         for c in harv.get("cookies") or []:
             try:
