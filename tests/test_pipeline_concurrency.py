@@ -22,15 +22,17 @@ from webui import config_editor
 class PipelineConcurrencyTests(unittest.TestCase):
     def test_default_and_hard_pipeline_concurrency_limits(self):
         # 53eda37（2026-09-15）：CloakBrowser 151 免费档仅允许 1 个并发会话，
-        # 全局流水线闸门因此从 2 收紧为 1；注册服务的请求上限保持 2 由闸门串行化。
+        # 浏览器层闸门因此为 1；纯网络阶段（套餐查询/推送/提链）走独立网络层，
+        # 否则注册跑批会把额度探测和查活饿死。
         self.assertEqual(pipeline_concurrency.PIPELINE_MAX_CONCURRENCY, 1)
+        self.assertEqual(pipeline_concurrency.PIPELINE_NET_CONCURRENCY, 2)
         self.assertEqual(registration_service._DEFAULT_MAX_WORKERS, 1)
         self.assertEqual(registration_service._MAX_MAX_WORKERS, 2)
         self.assertEqual(registration_service._normalize_workers(99), 2)
         self.assertEqual(live_check_service._WORKERS, 1)
         self.assertEqual(chatgpt2api_push.queue_settings()["workers"], 1)
         self.assertEqual(proxy_config.PLAN_CHECK_WORKERS, 2)
-        self.assertEqual(plan_check_service._WORKERS, 1)
+        self.assertEqual(plan_check_service._WORKERS, 2)
         self.assertEqual(codex_agent_service._WORKERS, 1)
         self.assertEqual(extract_link_service._WORKERS, 1)
 
@@ -59,8 +61,11 @@ class PipelineConcurrencyTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=9) as executor:
             list(executor.map(work, stages))
 
-        self.assertEqual(peak, pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
-        self.assertEqual(pipeline_concurrency.pipeline_snapshot()["active"], 0)
+        snapshot = pipeline_concurrency.pipeline_snapshot()
+        self.assertEqual(snapshot["browser"]["peak"], pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
+        self.assertLessEqual(snapshot["net"]["peak"], pipeline_concurrency.PIPELINE_NET_CONCURRENCY)
+        self.assertLessEqual(peak, pipeline_concurrency.PIPELINE_MAX_CONCURRENCY + pipeline_concurrency.PIPELINE_NET_CONCURRENCY)
+        self.assertEqual(snapshot["active"], 0)
 
     def test_extract_link_and_codex_retry_also_use_shared_pipeline_slots(self):
         observed = {}
@@ -121,7 +126,7 @@ class PipelineConcurrencyTests(unittest.TestCase):
         self.assertEqual(observed["codex_retry"], 1)
         self.assertEqual(pipeline_concurrency.pipeline_snapshot()["active"], 0)
 
-    def test_registration_plan_check_liveness_and_push_share_the_same_two_slots(self):
+    def test_registration_plan_check_liveness_and_push_respect_tier_limits(self):
         lock = threading.Lock()
         active = 0
         peak = 0
@@ -183,7 +188,35 @@ class PipelineConcurrencyTests(unittest.TestCase):
                 for future in futures:
                     future.result()
 
-        self.assertEqual(peak, pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
+        snapshot = pipeline_concurrency.pipeline_snapshot()
+        self.assertEqual(snapshot["browser"]["peak"], pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
+        self.assertLessEqual(snapshot["net"]["peak"], pipeline_concurrency.PIPELINE_NET_CONCURRENCY)
+        self.assertEqual(snapshot["active"], 0)
+
+    def test_plan_check_is_not_starved_by_a_held_registration_slot(self):
+        """回归：注册占满浏览器层时，套餐查询（网络层）仍必须能立即拿到槽位。"""
+        started = threading.Event()
+        release = threading.Event()
+
+        def hold_registration():
+            with pipeline_concurrency.pipeline_slot("registration"):
+                release.wait(5.0)
+
+        def run_plan_check():
+            with pipeline_concurrency.pipeline_slot("plan_check"):
+                started.set()
+
+        holder = threading.Thread(target=hold_registration)
+        holder.start()
+        try:
+            time.sleep(0.05)
+            worker = threading.Thread(target=run_plan_check)
+            worker.start()
+            self.assertTrue(started.wait(2.0), "套餐查询被注册槽位饿死")
+            worker.join(2.0)
+        finally:
+            release.set()
+            holder.join(2.0)
         self.assertEqual(pipeline_concurrency.pipeline_snapshot()["active"], 0)
 
     def test_actual_registration_liveness_and_push_wrappers_never_exceed_limit(self):
@@ -242,8 +275,10 @@ class PipelineConcurrencyTests(unittest.TestCase):
                 for future in futures:
                     future.result()
 
-        self.assertEqual(peak, pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
-        self.assertEqual(pipeline_concurrency.pipeline_snapshot()["active"], 0)
+        snapshot = pipeline_concurrency.pipeline_snapshot()
+        self.assertEqual(snapshot["browser"]["peak"], pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
+        self.assertLessEqual(snapshot["net"]["peak"], pipeline_concurrency.PIPELINE_NET_CONCURRENCY)
+        self.assertEqual(snapshot["active"], 0)
 
 
 if __name__ == "__main__":

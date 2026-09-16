@@ -13,7 +13,7 @@ from config import proxy as proxy_cfg
 from core import db
 from core.chatgpt_plan import check_account_plan
 from core.log_safety import redact_email
-from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_slot
+from core.pipeline_concurrency import PIPELINE_NET_CONCURRENCY, pipeline_slot
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def _float_setting(name: str, default: float, lower: float, upper: float) -> flo
     return max(lower, min(upper, value))
 
 
-_WORKERS = _int_setting("PLAN_CHECK_WORKERS", PIPELINE_MAX_CONCURRENCY, 1, PIPELINE_MAX_CONCURRENCY)
+_WORKERS = _int_setting("PLAN_CHECK_WORKERS", PIPELINE_NET_CONCURRENCY, 1, PIPELINE_NET_CONCURRENCY)
 _QUEUE_LIMIT = _int_setting("PLAN_CHECK_QUEUE_LIMIT", 500, _WORKERS, 5000)
 _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="plan-check")
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
@@ -404,7 +404,7 @@ def queue_settings() -> dict:
     return {
         "workers": _WORKERS,
         "queue_limit": _QUEUE_LIMIT,
-        "shared_pipeline_limit": PIPELINE_MAX_CONCURRENCY,
+        "shared_pipeline_limit": PIPELINE_NET_CONCURRENCY,
         "min_interval": _float_setting("PLAN_CHECK_MIN_INTERVAL", 0.4, 0.0, 30.0),
         "jitter": _float_setting("PLAN_CHECK_JITTER", 0.3, 0.0, 30.0),
         "auto_retry_max": _auto_retry_max(),
