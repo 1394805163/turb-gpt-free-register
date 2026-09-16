@@ -535,7 +535,9 @@ def run_registration(
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
     if not str(email or "").strip():
         _handle_email_acquired(acquire_email_after_input(email))
-    session = BrowserSession(proxy=proxy)
+    from core.cloakbrowser_driver import account_fingerprint_seed as _account_fingerprint_seed
+    # 账号级画像种子（与 cloak/protocol_page 注册同源）：协议侧 device_id/画像池/React keys 按账号稳定派生
+    session = BrowserSession(proxy=proxy, fingerprint_seed=(_account_fingerprint_seed(email) or None))
 
     # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
     proxy_label = "无"
