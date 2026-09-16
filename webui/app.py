@@ -24,6 +24,7 @@ import pyotp
 from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, registration_scheduler, overnight_pipeline
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
+from core.codex_oauth_policy import evaluate_oauth_eligibility
 from webui import config_editor
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "has_access_token": bool(str(row.get("access_token") or "").strip()),
         "totp_enabled": bool(row.get("totp_secret")),
         "codex_agent_has_token": bool(str(row.get("codex_agent_token") or "").strip()),
+        "oauth_eligibility": evaluate_oauth_eligibility(row),
     }
 
     extra_raw = row.get("extra_json")
@@ -2716,6 +2718,32 @@ def create_app(auth_code: str | None = None) -> Flask:
         acc = db.get_account_by_email(email)
         if acc is None:
             return jsonify({"ok": False, "error": f"账号不存在: {email}"}), 404
+        eligibility = evaluate_oauth_eligibility(acc)
+        if not eligibility.get("eligible"):
+            token = str(acc.get("access_token") or "").strip()
+            if not token:
+                return jsonify({
+                    "ok": False,
+                    "error": "账号未达到 OAuth 条件且没有 access_token，无法执行轻量查活",
+                    "action": "plan_check",
+                    "eligibility": eligibility,
+                }), 409
+            queued = plan_check_service.enqueue_account_plan_check(
+                account_id=int(acc.get("id") or 0),
+                email=email,
+                access_token=token,
+                trigger="oauth_gate",
+                proxy=None,
+                timezone_offset_min="-",
+            )
+            return jsonify({
+                "ok": True,
+                "started": bool(queued.get("accepted")),
+                "action": "plan_check",
+                "message": "账号尚未满足完整 OAuth 条件，已转为轻量查活",
+                "eligibility": eligibility,
+                "plan_check": {k: v for k, v in queued.items() if k != "future"},
+            }), 202
         if (acc.get("live_check_status") or "") == "deactivated":
             return jsonify({"ok": False, "error": "账号已废号，不能补跑 Codex"}), 409
         if not _reserve_codex_retry(email):
@@ -2749,6 +2777,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "单次最多选择 500 个账号"}), 400
 
         selected = []
+        simple_check_started = []
+        simple_check_busy = []
         skipped = []
         seen_ids = set()
         for raw in ids:
@@ -2768,6 +2798,33 @@ def create_app(auth_code: str | None = None) -> Flask:
             if not email:
                 skipped.append({"id": acc_id, "reason": "邮箱为空"})
                 continue
+            eligibility = evaluate_oauth_eligibility(acc)
+            if not eligibility.get("eligible"):
+                token = str(acc.get("access_token") or "").strip()
+                if not token:
+                    skipped.append({
+                        "id": acc_id,
+                        "email": email,
+                        "reason": "未达到 OAuth 条件且缺少 access_token",
+                        "eligibility": eligibility,
+                    })
+                    continue
+                queued = plan_check_service.enqueue_account_plan_check(
+                    account_id=acc_id,
+                    email=email,
+                    access_token=token,
+                    trigger="oauth_gate_bulk",
+                    proxy=None,
+                    timezone_offset_min="-",
+                )
+                item = {"id": acc_id, "email": email, "eligibility": eligibility}
+                if queued.get("accepted"):
+                    simple_check_started.append(item)
+                elif queued.get("busy"):
+                    simple_check_busy.append(item)
+                else:
+                    skipped.append({**item, "reason": queued.get("error") or "轻量查活入队失败"})
+                continue
             if (acc.get("live_check_status") or "") == "deactivated":
                 skipped.append({"id": acc_id, "email": email, "reason": "账号已废号"})
                 continue
@@ -2776,7 +2833,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 continue
             selected.append({"id": acc_id, "email": email})
 
-        if not selected:
+        if not selected and not simple_check_started and not simple_check_busy:
             return jsonify({"ok": False, "error": "没有可补跑的账号", "skipped": skipped}), 409
 
         batch_id = _dt.now().strftime("%Y%m%d-%H%M%S")
@@ -2801,17 +2858,22 @@ def create_app(auth_code: str | None = None) -> Flask:
                         logger.exception(f"[Codex 批量补跑] 子任务异常 batch={batch}")
             logger.info(f"[Codex 批量补跑] 完成 batch={batch}")
 
-        threading.Thread(
-            target=_bulk_runner,
-            args=(selected, workers, batch_id),
-            name=f"codex-bulk-dispatch-{batch_id}",
-            daemon=True,
-        ).start()
+        if selected:
+            threading.Thread(
+                target=_bulk_runner,
+                args=(selected, workers, batch_id),
+                name=f"codex-bulk-dispatch-{batch_id}",
+                daemon=True,
+            ).start()
         return jsonify({
             "ok": True,
-            "message": f"已开始批量补跑 {len(selected)} 个账号，并发 {workers}",
+            "message": f"已补跑 {len(selected)} 个账号，并发 {workers}",
             "started": selected,
             "started_count": len(selected),
+            "simple_check_started": simple_check_started,
+            "simple_check_started_count": len(simple_check_started),
+            "simple_check_busy": simple_check_busy,
+            "simple_check_busy_count": len(simple_check_busy),
             "skipped": skipped,
             "batch_id": batch_id,
         })

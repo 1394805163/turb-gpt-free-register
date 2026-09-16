@@ -19,6 +19,28 @@ import time
 
 logger = logging.getLogger(__name__)
 
+_DRIVER_WATCHDOG_SECONDS = 600.0
+
+
+def _start_driver_watchdog(driver, *, seconds: float = _DRIVER_WATCHDOG_SECONDS):
+    """WebDriver 命令无超时；卡死时到点强退浏览器，让主流程抛错走失败分支。"""
+    import threading
+
+    def _force_quit():
+        try:
+            logger.warning("[补密码/2FA] 浏览器看门狗超时（%.0fs），强制退出被卡住的会话", seconds)
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    timer = threading.Timer(max(60.0, float(seconds)), _force_quit)
+    timer.daemon = True
+    timer.start()
+    return timer
+
 SETTINGS_URL = "https://chatgpt.com/#settings/Security"
 EMAIL_VERIFY_MARKER = "email-verification"
 NEW_PASSWORD_MARKER = "new-password"
@@ -187,6 +209,7 @@ def set_account_password(
         )
         driver.set_page_load_timeout(90)
         logger.info("[补密码] 启动：%s profile=%s", email, opened.profile_id)
+        _watchdog_timer = _start_driver_watchdog(driver)
 
         # ---- 1) OTP 登录 ----
         driver.get("https://chatgpt.com/auth/login")
@@ -307,6 +330,10 @@ def set_account_password(
         logger.exception("[补密码] 失败")
         return {"ok": False, "status": "failed", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
     finally:
+        try:
+            _watchdog_timer.cancel()
+        except Exception:
+            pass
         if driver is not None:
             try:
                 driver.quit()
