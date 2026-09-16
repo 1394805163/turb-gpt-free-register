@@ -351,24 +351,32 @@ def create_app(auth_code: str | None = None) -> Flask:
             logger.info("iCloud 邮箱池文件不存在，跳过启动回填")
     except Exception:
         logger.exception("启动时同步注册账号到 iCloud 邮箱池失败")
-    recovered_plan_checks = db.recover_interrupted_plan_checks()
-    if recovered_plan_checks:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
-    recovered_extract_links = db.recover_interrupted_extract_links()
-    if recovered_extract_links:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
-    recovered_live_checks = db.recover_interrupted_live_checks()
-    if recovered_live_checks:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
-    recovered_codex_agents = db.recover_interrupted_codex_agents()
-    if recovered_codex_agents:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
-    recovered_totp_setups = db.recover_interrupted_totp_setups()
-    if recovered_totp_setups:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的 2FA 状态", recovered_totp_setups)
-    recovered_email_changes = db.recover_interrupted_email_changes()
-    if recovered_email_changes:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的邮箱换绑状态", recovered_email_changes)
+    if str(os.environ.get("TURB_WEBUI_BOOT", "")).strip() == "1":
+        recovered_registration_jobs = db.recover_interrupted_registration_jobs()
+        if recovered_registration_jobs:
+            logger.warning("已回收 %s 个因 WebUI 重启中断的注册任务状态", recovered_registration_jobs)
+        recovered_pushes = db.recover_interrupted_account_pushes()
+        if recovered_pushes:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的推送任务", recovered_pushes)
+        recovered_plan_checks = db.recover_interrupted_plan_checks()
+        if recovered_plan_checks:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
+        recovered_extract_links = db.recover_interrupted_extract_links()
+        if recovered_extract_links:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
+        recovered_live_checks = db.recover_interrupted_live_checks()
+        if recovered_live_checks:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
+        recovered_codex_agents = db.recover_interrupted_codex_agents()
+        if recovered_codex_agents:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
+        recovered_totp_setups = db.recover_interrupted_totp_setups()
+        if recovered_totp_setups:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的 2FA 状态", recovered_totp_setups)
+        recovered_email_changes = db.recover_interrupted_email_changes()
+        if recovered_email_changes:
+            logger.warning("已恢复 %s 个因 WebUI 重启中断的邮箱换绑状态", recovered_email_changes)
+
 
     # ----------------------------------------------------------
     # 页面
@@ -3634,6 +3642,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": True, **_password_fix_state})
 
 
-    registration_scheduler.start()
-    overnight_pipeline.ensure_started()
+    if str(os.environ.get("TURB_WEBUI_BOOT", "")).strip() == "1":
+        registration_scheduler.start()
+        overnight_pipeline.ensure_started()
     return app

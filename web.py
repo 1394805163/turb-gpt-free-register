@@ -21,6 +21,9 @@ from threading import Timer
 from webui.app import create_app
 from webui.auth import is_generated_code
 
+# 仅真实 WebUI 服务进程允许执行启动恢复/自动拉起（测试与工具进程不触发）。
+os.environ.setdefault("TURB_WEBUI_BOOT", "1")
+
 
 def _acquire_single_instance(port: int):
     """持有跨进程文件锁，防止同一端口启动多个 WebUI 实例。"""

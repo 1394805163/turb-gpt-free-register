@@ -992,6 +992,7 @@ def insert_account(
         else:
             row = existing
             row_id = int(row["id"])
+            previous_token_fingerprint = _token_fingerprint(row.get("access_token") or "")
 
         if _oauth_dict.get("access_token") or _oauth_dict.get("refresh_token"):
             row["chatgpt_oauth_access_token"] = str(_oauth_dict.get("access_token") or "").strip() or row.get("chatgpt_oauth_access_token")
@@ -1017,6 +1018,26 @@ def insert_account(
             "codex_error": codex_error if codex_error is not None else row.get("codex_error"),
             "updated_at": _now(),
         })
+        current_token_fingerprint = _token_fingerprint(access_token)
+        if existing is None:
+            row.setdefault("pipeline_status", "pending")
+            row.setdefault("push_status", "pending")
+        elif current_token_fingerprint != previous_token_fingerprint:
+            # access token 变化后必须重新测活并重新推送，旧幂等指纹不能复用。
+            row["pipeline_status"] = "pending"
+            # 旧 Token 的 live 状态不能授权新 Token 直接进入推送；必须先由
+            # 新 Token 的套餐快速检查或完整 OTP 登录重新确认。
+            row["live_check_status"] = "pending"
+            row["live_check_ok"] = False
+            row["live_check_method"] = None
+            row["live_check_error"] = None
+            row["plan_check_status"] = "pending"
+            row["plan_check_ok"] = False
+            row["plan_check_error"] = "Token 已更新，等待重新查询"
+            row["push_status"] = "pending"
+            row["push_claim_fingerprint"] = None
+            row["push_error"] = None
+            row["push_next_retry_at"] = None
 
         if outlook_row:
             row["password"] = outlook_row.get("password")
@@ -1172,6 +1193,33 @@ def get_codex_agent_credential(acc_id: int) -> tuple[str, str] | None:
         return None
     return json.dumps(json.loads(row["payload"]), ensure_ascii=False, indent=2) + "\n", row["filename"]
 
+
+def recover_interrupted_registration_jobs() -> int:
+    """服务启动时收敛上次进程遗留的注册任务状态。
+
+    注册线程池只存在于当前进程；服务被重启后历史任务不可能继续执行。running/
+    stopping 标记为 stopped，pending 标记为 cancelled，避免前端永久显示活动任务，
+    也避免用户误以为排队任务仍会自动启动。
+    """
+    with _LOCK:
+        rows = _load_jobs()
+        now = _now()
+        recovered = 0
+        for row in rows:
+            status = row.get("status")
+            if status not in ("running", "stopping", "pending"):
+                continue
+            row["status"] = "cancelled" if status == "pending" else "stopped"
+            row["error_message"] = (
+                "WebUI/注册机重启，原排队实例已取消；可按需重新提交"
+                if status == "pending"
+                else "WebUI/注册机重启，原运行实例已回收；可按需重试"
+            )
+            row["completed_at"] = now
+            recovered += 1
+        if recovered:
+            _save_jobs(rows)
+        return recovered
 
 def recover_interrupted_codex_agents() -> int:
     """服务启动时恢复上次进程中断的 Codex Agent 任务状态。"""
@@ -3679,6 +3727,27 @@ def update_account_registration_password(email: str, password: str) -> bool:
 
 
 
+def recover_interrupted_account_pushes() -> int:
+    """进程启动时把中断的推送任务恢复为可重试状态。"""
+    with _LOCK:
+        rows = _load_accounts()
+        recovered = 0
+        now = _now()
+        for row in rows:
+            if row.get("push_status") not in {"queued", "running"}:
+                continue
+            row["push_status"] = "push_failed"
+            # 账号仍是已测活状态，恢复后允许重新 claim；不把网络中断误记为死亡。
+            row["pipeline_status"] = "live"
+            row["push_error"] = "WebUI 重启或任务异常中断，已恢复等待重试"
+            row["push_claim_fingerprint"] = None
+            row["push_next_retry_at"] = None
+            row["updated_at"] = now
+            recovered += 1
+        if recovered:
+            _save_accounts(rows)
+        return recovered
+
 def claim_account_push(acc_id: int, token_fingerprint: str) -> str:
     """原子占用推送任务，返回 claimed/idempotent/busy/not_live/missing。"""
     with _LOCK:
@@ -3893,8 +3962,54 @@ def _write_json(*args, **kwargs):
     return None
 
 
-def _reset_token_bound_runtime_state(*args, **kwargs):
-    return None
+def _reset_token_bound_runtime_state(row: dict, *, reason: str) -> None:
+    """令新 access token 重新经过查活、额度查询和推送。
+
+    OAuth 凭据更新后，旧 token 的 live/plan/push 结果都不再能证明新 token
+    有效。历史成功时间和结果 JSON 保留作审计，但当前状态统一回到待确认，
+    避免旧状态把新凭据直接当成已推送账号。
+    """
+    row["pipeline_status"] = "pending"
+
+    row["live_check_status"] = "pending"
+    row["live_check_ok"] = False
+    row["live_check_method"] = None
+    row["live_checked_at"] = None
+    row["live_check_error"] = reason
+    row["live_check_proxy_used"] = None
+    row["needs_live_check"] = True
+
+    row["plan_check_status"] = "pending"
+    row["plan_check_ok"] = False
+    row["plan_check_error"] = reason
+    row["plan_check_http_status"] = None
+    row["plan_checked_at"] = None
+    row["plan_check_queued_at"] = None
+    row["plan_check_started_at"] = None
+    row["plan_check_completed_at"] = None
+    row["plan_check_proxy_mode"] = None
+    row["plan_check_network_route"] = None
+    row["plan_check_proxy_used"] = None
+    row["plan_check_proxy_fallback_reason"] = None
+    row["plan_check_result_json"] = None
+    row["plan_check_auto_retry_count"] = 0
+
+    row["image_quota"] = None
+    row["image_quota_reset_at"] = None
+    row["image_quota_unknown"] = True
+    row["image_quota_checked_at"] = None
+    row["image_quota_error"] = reason
+
+    row["push_status"] = "pending"
+    row["push_claim_fingerprint"] = None
+    row["push_token_fingerprint"] = None
+    row["push_error"] = None
+    row["push_next_retry_at"] = None
+    row["push_http_status"] = None
+    row["push_attempts"] = 0
+    row["push_started_at"] = None
+    row["push_last_attempt_at"] = None
+    row["push_completed_at"] = None
 
 
 def _load_codex_export_state(*args, **kwargs):
