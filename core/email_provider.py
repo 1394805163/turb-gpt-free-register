@@ -142,28 +142,47 @@ def acquire_email() -> str:
     raise RuntimeError(f"所有邮箱来源均领取失败: {sources}; last={last_exc}")
 
 
-def acquire_email_from_source(source: str) -> str:
-    """从调用方指定的单一来源领取邮箱，不受 EMAIL_SOURCE 兜底顺序影响。"""
-    source = str(source or "").strip().lower()
-    if source not in _VALID_SOURCES:
-        raise ValueError(f"不支持的邮箱来源: {source}")
-    email = _pick_from_source(source)
-    logger.info("[EmailProvider] 指定来源领取邮箱: source=%s, email=%s", source, email)
+def acquire_email_from_source(source: str) -> str:
+
+    """从调用方指定的单一来源领取邮箱，不受 EMAIL_SOURCE 兜底顺序影响。"""
+
+    source = str(source or "").strip().lower()
+
+    if source not in _VALID_SOURCES:
+
+        raise ValueError(f"不支持的邮箱来源: {source}")
+
+    email = _pick_from_source(source)
+
+    logger.info("[EmailProvider] 指定来源领取邮箱: source=%s, email=%s", source, redact_email(email))
+
     return email
 
 
-def acquire_email_after_input(email: str | None = None) -> str:
-    """固定邮箱直接复用；自动模式延迟到页面确认输入框后再领取邮箱。"""
-    fixed = str(email or "").strip()
-    if fixed:
-        return fixed
-    try:
-        from config import email as _email_cfg
-        use_service = bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
-    except Exception:
-        use_service = True
-    if not use_service:
-        raise RuntimeError("当前未启用自动邮箱服务，无法延迟领取邮箱")
+def acquire_email_after_input(email: str | None = None) -> str:
+
+    """固定邮箱直接复用；自动模式延迟到页面确认输入框后再领取邮箱。"""
+
+    fixed = str(email or "").strip()
+
+    if fixed:
+
+        return fixed
+
+    try:
+
+        from config import email as _email_cfg
+
+        use_service = bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
+
+    except Exception:
+
+        use_service = True
+
+    if not use_service:
+
+        raise RuntimeError("当前未启用自动邮箱服务，无法延迟领取邮箱")
+
     return acquire_email()
 
 

@@ -717,7 +717,7 @@ def _fill_mfa_challenge_if_present(page, email: str, timeout: int = 15) -> bool:
                     page.keyboard.press("Enter")
                 except Exception:
                     pass
-            logger.info("[Codex][BrowserUse] 已填写并提交 MFA 验证码：%s", email)
+            logger.info("[Codex][BrowserUse] 已填写并提交 MFA 验证码：%s", redact_email(email))
             wait_end = time.time() + 12
             while time.time() < wait_end:
                 if not _looks_mfa_challenge_page(page):
@@ -782,7 +782,7 @@ def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str 
                 page.keyboard.press("Enter")
             except Exception:
                 pass
-        logger.info("[Codex][BrowserUse] 已填写并提交登录密码：%s", email)
+        logger.info("[Codex][BrowserUse] 已填写并提交登录密码：%s", redact_email(email))
         wait_end = time.time() + 12
         while time.time() < wait_end:
             if _looks_mfa_challenge_page(page):

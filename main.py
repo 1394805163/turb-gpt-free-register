@@ -423,7 +423,7 @@ def run_registration(
                     pass
                 logger.warning(
                     "[协议注册] 邮箱对应账号已废，已停用并换下一个邮箱（%s/%s）：%s",
-                    email_round, max_email_rounds, email,
+                    email_round, max_email_rounds, redact_email(email),
                 )
                 email = ""
                 if email_round >= max_email_rounds:

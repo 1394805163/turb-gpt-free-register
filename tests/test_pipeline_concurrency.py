@@ -21,16 +21,18 @@ from webui import config_editor
 
 class PipelineConcurrencyTests(unittest.TestCase):
     def test_default_and_hard_pipeline_concurrency_limits(self):
-        self.assertEqual(pipeline_concurrency.PIPELINE_MAX_CONCURRENCY, 2)
+        # 53eda37（2026-09-15）：CloakBrowser 151 免费档仅允许 1 个并发会话，
+        # 全局流水线闸门因此从 2 收紧为 1；注册服务的请求上限保持 2 由闸门串行化。
+        self.assertEqual(pipeline_concurrency.PIPELINE_MAX_CONCURRENCY, 1)
         self.assertEqual(registration_service._DEFAULT_MAX_WORKERS, 1)
         self.assertEqual(registration_service._MAX_MAX_WORKERS, 2)
         self.assertEqual(registration_service._normalize_workers(99), 2)
-        self.assertEqual(live_check_service._WORKERS, 2)
-        self.assertEqual(chatgpt2api_push.queue_settings()["workers"], 2)
+        self.assertEqual(live_check_service._WORKERS, 1)
+        self.assertEqual(chatgpt2api_push.queue_settings()["workers"], 1)
         self.assertEqual(proxy_config.PLAN_CHECK_WORKERS, 2)
-        self.assertEqual(plan_check_service._WORKERS, 2)
-        self.assertEqual(codex_agent_service._WORKERS, 2)
-        self.assertEqual(extract_link_service._WORKERS, 2)
+        self.assertEqual(plan_check_service._WORKERS, 1)
+        self.assertEqual(codex_agent_service._WORKERS, 1)
+        self.assertEqual(extract_link_service._WORKERS, 1)
 
         source = Path(proxy_config.__file__).read_text(encoding="utf-8")
         self.assertEqual(
@@ -38,7 +40,7 @@ class PipelineConcurrencyTests(unittest.TestCase):
             2,
         )
 
-    def test_shared_slots_limit_mixed_pipeline_stages_to_two(self):
+    def test_shared_slots_limit_mixed_pipeline_stages_to_gate_limit(self):
         lock = threading.Lock()
         active = 0
         peak = 0
@@ -57,7 +59,7 @@ class PipelineConcurrencyTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=9) as executor:
             list(executor.map(work, stages))
 
-        self.assertEqual(peak, 2)
+        self.assertEqual(peak, pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
         self.assertEqual(pipeline_concurrency.pipeline_snapshot()["active"], 0)
 
     def test_extract_link_and_codex_retry_also_use_shared_pipeline_slots(self):
@@ -181,10 +183,10 @@ class PipelineConcurrencyTests(unittest.TestCase):
                 for future in futures:
                     future.result()
 
-        self.assertEqual(peak, 2)
+        self.assertEqual(peak, pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
         self.assertEqual(pipeline_concurrency.pipeline_snapshot()["active"], 0)
 
-    def test_actual_registration_liveness_and_push_wrappers_never_exceed_two(self):
+    def test_actual_registration_liveness_and_push_wrappers_never_exceed_limit(self):
         lock = threading.Lock()
         active = 0
         peak = 0
@@ -240,7 +242,7 @@ class PipelineConcurrencyTests(unittest.TestCase):
                 for future in futures:
                     future.result()
 
-        self.assertEqual(peak, 2)
+        self.assertEqual(peak, pipeline_concurrency.PIPELINE_MAX_CONCURRENCY)
         self.assertEqual(pipeline_concurrency.pipeline_snapshot()["active"], 0)
 
 

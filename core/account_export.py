@@ -211,7 +211,7 @@ def post_register_dwell(email: str, *, label: str = "注册后") -> None:
     seconds = _post_register_dwell_seconds()
     if seconds <= 0:
         return
-    logger.info("[%s] 注册成功后随机停留 %.1fs：%s", label, seconds, email)
+    logger.info("[%s] 注册成功后随机停留 %.1fs：%s", label, seconds, redact_email(email))
     time.sleep(seconds)
 
 
@@ -800,15 +800,15 @@ def save_account_data(
                 proxy=proxy_used,
             )
             if queued.get("accepted"):
-                logger.info(f"[2FA] 注册后自动开启 2FA 已入队: id={row_id}, email={email}")
+                logger.info(f"[2FA] 注册后自动开启 2FA 已入队: id={row_id}, email={redact_email(email)}")
             elif queued.get("busy"):
-                logger.info(f"[2FA] 账号已有 2FA 任务，注册流程不重复入队: id={row_id}, email={email}")
+                logger.info(f"[2FA] 账号已有 2FA 任务，注册流程不重复入队: id={row_id}, email={redact_email(email)}")
             else:
-                logger.warning(f"[2FA] 注册后自动开启 2FA 入队失败（不影响注册结果）: {email}, {queued.get('error')}")
+                logger.warning(f"[2FA] 注册后自动开启 2FA 入队失败（不影响注册结果）: {redact_email(email)}, {queued.get('error')}")
         except Exception as exc:
             logger.warning(
                 f"[2FA] 注册后自动开启 2FA 入队异常（不影响注册结果）: "
-                f"{email}, {type(exc).__name__}: {str(exc)[:180]}"
+                f"{redact_email(email)}, {type(exc).__name__}: {str(exc)[:180]}"
             )
 
     if auto_plan_check is None:
@@ -819,7 +819,7 @@ def save_account_data(
         except Exception:
             auto_plan_check = False
     if not auto_plan_check:
-        logger.info(f"[Plan] 注册后自动套餐查询已跳过: id={row_id}, email={email}")
+        logger.info(f"[Plan] 注册后自动套餐查询已跳过: id={row_id}, email={redact_email(email)}")
         return row_id
     # session 中的 account.planType 不能说明 Plus 试用资格。账号落库后只负责
     # 入队，由专用线程池异步查询并回写，避免占用注册工作线程。

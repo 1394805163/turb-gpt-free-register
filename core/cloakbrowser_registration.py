@@ -197,7 +197,7 @@ def run_cloak_registration(
         # 邮箱延迟领取（页面确认后才分配）时先生成随机种子，注册成功后随账号落盘
         # 为 cloak_profile_seed，保证"本次注册使用的画像"可被后续查活/补跑复用。
         profile_seed = account_fingerprint_seed(email) if str(email or "").strip() else secrets.token_hex(8)
-        logger.info("[Cloak注册] 画像种子：%s（email_known=%s）", profile_seed, bool(str(email or "").strip()))
+        logger.info("[Cloak注册] 画像种子：%s（email_known=%s）", profile_seed, bool(str(redact_email(email) or "").strip()))
         driver, opened = build_cloak_driver(
             proxy=proxy,
             proxy_selection=proxy_selection,

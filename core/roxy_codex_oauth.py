@@ -317,7 +317,7 @@ def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> boo
             else:
                 from selenium.webdriver.common.keys import Keys
                 code_input.send_keys(Keys.ENTER)
-            logger.info("[Codex][Browser] 已填写并提交 MFA 验证码：%s", email)
+            logger.info("[Codex][Browser] 已填写并提交 MFA 验证码：%s", redact_email(email))
             wait_end = time.time() + 12
             while time.time() < wait_end:
                 if not _is_mfa_challenge_page(driver):
@@ -378,7 +378,7 @@ def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> st
             logger.info("[Codex][Browser] 填写/提交登录密码失败（页面可能正在跳转），稍后重试：%s: %s", type(exc).__name__, str(exc)[:100])
             time.sleep(0.6)
             continue
-        logger.info("[Codex][Browser] 已填写并提交登录密码：%s", email)
+        logger.info("[Codex][Browser] 已填写并提交登录密码：%s", redact_email(email))
         wait_end = time.time() + 24
         mfa_attempts = 0
         while time.time() < wait_end:

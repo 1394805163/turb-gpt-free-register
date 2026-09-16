@@ -9,6 +9,7 @@ Browser Use Cloud + Playwright 注册驱动。
   - 默认不做 Codex（需要时可后续再接）
 """
 from __future__ import annotations
+from core.log_safety import redact_email, redact_emails
 
 import logging
 import random
@@ -367,7 +368,7 @@ def _post_register_dwell(page, context, *, provider_prefix: str, email: str) -> 
     seconds = _post_register_dwell_seconds()
     if seconds <= 0:
         return
-    logger.info("[%s] 注册成功后随机停留 %.1fs 再关闭连接：%s", _log_provider_label(), seconds, email)
+    logger.info("[%s] 注册成功后随机停留 %.1fs 再关闭连接：%s", _log_provider_label(), seconds, redact_email(email))
     end = time.time() + seconds
     last_touch = 0.0
     while time.time() < end:
@@ -1221,11 +1222,11 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
             last_log = time.time()
         if state == "email_verification" and not _is_signup_password_page(page):
             if _click_continue_with_password_if_present(page):
-                logger.info("[BrowserUse] 邮箱验证码页已点击“使用密码继续”：email=%s", email)
+                logger.info("[BrowserUse] 邮箱验证码页已点击“使用密码继续”：email=%s", redact_email(email))
                 time.sleep(0.4 if _fast_mode() else 1.0)
                 continue
             try:
-                logger.info("[BrowserUse] 邮箱验证码页未命中按钮，直接跳转到密码页兜底：email=%s", email)
+                logger.info("[BrowserUse] 邮箱验证码页未命中按钮，直接跳转到密码页兜底：email=%s", redact_email(email))
                 page.goto("https://auth.openai.com/create-account/password", wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
                 time.sleep(0.6 if _fast_mode() else 1.2)
                 continue
@@ -1246,7 +1247,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
             time.sleep(0.15 if _fast_mode() else 0.4)
             continue
         if state == "login_password" and _click_passwordless_signup_if_present(page):
-            logger.info("[BrowserUse] 检测到密码页，已点击一次性验证码入口：state=%s email=%s", state, email)
+            logger.info("[BrowserUse] 检测到密码页，已点击一次性验证码入口：state=%s email=%s", state, redact_email(email))
             wait_end = time.time() + 20
             while time.time() < wait_end:
                 state_after = _quick_auth_state(page)
@@ -1265,7 +1266,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
             logger.info("[BrowserUse] 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：url=%s", state_info.get("url") or "-")
             return None
         password = _registration_password()
-        logger.info("[BrowserUse] 检测到密码页，设置密码（%s 位）：%s", len(password), email)
+        logger.info("[BrowserUse] 检测到密码页，设置密码（%s 位）：%s", len(password), redact_email(email))
         submit_result = page.evaluate(
             r"""(password) => {
               const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
@@ -2358,7 +2359,7 @@ def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: fl
         wait_this_round = min(slice_wait, remaining)
         logger.info(
             "[BrowserUse][OTP] 邮箱短轮询：%s，第 %s 轮，最长 %ss（总剩余 %ss）",
-            email,
+            redact_email(email),
             attempt,
             wait_this_round,
             remaining,
@@ -2587,7 +2588,7 @@ def run_browser_use_registration(
     logger.info(
         "[%s] 开始注册：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
         cloud_label,
-        email,
+        redact_email(email),
         session_info_open.proxy_country_code or "-",
         session_info_open.profile_id or "-",
         "yes" if proxy else "no",
@@ -2661,7 +2662,7 @@ def run_browser_use_registration(
                 email_supplier=_email_supplier_after_input,
             )
             _t_email.done(f"state={next_state}")
-            logger.info("[BrowserUse] 已提交邮箱：%s", email)
+            logger.info("[BrowserUse] 已提交邮箱：%s", redact_email(email))
             _assert_not_external_idp(page, "提交邮箱后")
             _check_manual_stop()
 
@@ -2700,7 +2701,7 @@ def run_browser_use_registration(
                         timeout_ms=12000 if _fast_mode() else 18000,
                     )
                     _check_manual_stop()
-                    logger.info("[BrowserUse][OTP] 已重新提交邮箱：%s", email)
+                    logger.info("[BrowserUse][OTP] 已重新提交邮箱：%s", redact_email(email))
                     _assert_not_external_idp(page, "重新提交邮箱后")
                     try:
                         pwd = _fill_password_if_present(page, email, timeout=6 if _fast_mode() else 10, context=context)
@@ -2740,7 +2741,7 @@ def run_browser_use_registration(
                     time.sleep(0.2 if _fast_mode() else 0.4)
 
                 if current_otp is None:
-                    logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", email, otp_attempt, max_otp_attempts)
+                    logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", redact_email(email), otp_attempt, max_otp_attempts)
                     _t_otp_wait = _StepTimer("等待邮箱 OTP")
                     try:
                         current_otp = _wait_for_otp_with_browser_heartbeat(page, context, email, after_ts=otp_after_ts)
@@ -2812,7 +2813,7 @@ def run_browser_use_registration(
             if not access_token:
                 raise RuntimeError("注册流程结束但未拿到 accessToken")
             create_acknowledged = True
-            logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
+            logger.info("[BrowserUse] 已拿到 accessToken：%s", redact_email(email))
 
             if _twofa_cfg.ENABLE_2FA:
                 logger.warning("[BrowserUse] 当前路径暂不自动设置 2FA，已跳过")
@@ -2892,8 +2893,10 @@ def run_browser_use_registration(
                 "error": None,
             }
     except Exception as exc:
-        logger.error("[BrowserUse] 注册失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[BrowserUse] 失败详情", exc_info=True)
+        # 失败原因可能内嵌完整邮箱（外部错误透传）；统一走 redact_emails，且不再
+        # 输出原始回溯（回溯里的异常文本无法再脱敏）。
+        logger.error("[BrowserUse] 注册失败：%s: %s", type(exc).__name__, redact_emails(str(exc))[:300])
+        logger.debug("[BrowserUse] 失败详情：%s", redact_emails(f"{type(exc).__name__}: {exc}")[:600])
         try:
             if email:
                 from core.email_provider import release_email

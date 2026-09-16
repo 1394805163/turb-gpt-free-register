@@ -265,7 +265,12 @@ def _pass_mfa_challenge(session: BrowserSession, email: str, challenge: dict) ->
 
 def _safe_fingerprint_for_account(session: BrowserSession) -> dict:
     """账号里只记录运行环境画像，不保存会话/设备标识。"""
-    fp = session.fingerprint_summary()
+    try:
+        fp = session.fingerprint_summary()
+    except Exception:
+        return {}
+    if not isinstance(fp, dict):
+        return {}
     return {k: v for k, v in fp.items() if k not in _SESSION_FINGERPRINT_KEYS}
 
 
@@ -440,7 +445,7 @@ def _validate_reauth_with_retry(
     for attempt in range(1, max_otp_attempts + 1):
         try:
             if current_otp is None:
-                logger.info("[查活] 等待重认证 OTP：%s（第 %s/%s 次）", email, attempt, max_otp_attempts)
+                logger.info("[查活] 等待重认证 OTP：%s（第 %s/%s 次）", redact_email(email), attempt, max_otp_attempts)
                 current_otp = wait_for_otp(
                     email,
                     after_ts=otp_after_ts,
@@ -547,7 +552,7 @@ def _login_via_password_or_otp(
     """优先密码登录；如进入 MFA challenge 则自动用 TOTP 完成。"""
     password = _account_registration_password(email)
     if not password:
-        logger.info("[查活] 未找到注册密码，继续使用邮箱 OTP：%s", email)
+        logger.info("[查活] 未找到注册密码，继续使用邮箱 OTP：%s", redact_email(email))
         return _login_via_email_otp(
             session,
             email,
@@ -555,7 +560,7 @@ def _login_via_password_or_otp(
             email_source=email_source,
         )
 
-    logger.info("[查活] 账号存在密码，优先走密码登录：%s", email)
+    logger.info("[查活] 账号存在密码，优先走密码登录：%s", redact_email(email))
     password_result = _password_verify(session, password)
     continue_url = _extract_continue_url(password_result)
     page = password_result.get("page") if isinstance(password_result, dict) else {}
@@ -569,7 +574,7 @@ def _login_via_password_or_otp(
             raise RuntimeError(f"密码登录后进入 MFA 但未拿到 factor_id: {password_result}")
         if not secret:
             raise RuntimeError(f"密码登录后进入 MFA，但账号没有 totp_secret：{email}")
-        logger.info("[查活] 已进入 MFA challenge，开始提交 TOTP：%s factor_id=%s", email, factor_id)
+        logger.info("[查活] 已进入 MFA challenge，开始提交 TOTP：%s factor_id=%s", redact_email(email), factor_id)
         _mfa_issue_challenge(session, factor_id)
         code = _account_totp_code(email)
         if not code:
@@ -585,7 +590,7 @@ def _login_via_password_or_otp(
         )
 
     if "email-verification" in continue_url or page_type in {"email_verification", "email_otp_send"}:
-        logger.info("[查活] 密码登录后仍进入邮箱 OTP，继续完成邮箱验证：%s", email)
+        logger.info("[查活] 密码登录后仍进入邮箱 OTP，继续完成邮箱验证：%s", redact_email(email))
         return _login_via_email_otp(
             session,
             email,
@@ -594,7 +599,7 @@ def _login_via_password_or_otp(
         )
 
     if continue_url:
-        logger.info("[查活] 密码登录直接给出回调地址，继续完成回调：%s", email)
+        logger.info("[查活] 密码登录直接给出回调地址，继续完成回调：%s", redact_email(email))
         return _follow_continue_and_fetch(session, continue_url, referer="https://auth.openai.com/log-in/password")
 
     raise RuntimeError(f"密码登录成功但没有可用 continue_url: {password_result}")
