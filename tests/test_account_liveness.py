@@ -161,7 +161,7 @@ class AccountLivenessTests(unittest.TestCase):
                      "user": {"id": "user-1"},
                      "account": {"planType": "free"},
                  }) as reauth:
-                result = liveness.check_account_liveness("user@example.com", proxy="")
+                result = liveness.check_account_liveness("user@example.com", proxy="", method="protocol")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["access_token"], "new-token")
@@ -178,11 +178,12 @@ class AccountLivenessTests(unittest.TestCase):
              patch.object(live_service.db, "get_account", return_value={"email_source": "remail"}), \
              patch.object(live_service.db, "update_account_liveness"), \
              patch.object(live_service, "_append_log"), \
-             patch.object(live_service, "resolve_plan_check_route", return_value={
+             patch.object(live_service, "_resolve_live_check_route", return_value={
                  "proxy": "socks5://proxy.example:1080",
                  "network_route": "proxy",
                  "proxy_mode": "auto",
              }), \
+             patch.object(live_service, "_young_account_country_hint", return_value=""), \
              patch.object(live_service, "check_account_liveness", side_effect=[failed, success]) as check:
             result = live_service._run_live_check(
                 account_id=1,

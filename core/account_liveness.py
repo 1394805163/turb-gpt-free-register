@@ -179,26 +179,20 @@ def _network_preflight_with_retry(
 ) -> tuple[BrowserSession, str]:
     """CSRF → Signin 备用预检；失败时保留同一会话重试（含透明路由轮换）。
 
-    `/api/auth/providers` 只是 NextAuth 的发现接口，signin 端点并不依赖它返回的
+    /api/auth/providers 只是 NextAuth 的发现接口，signin 端点并不依赖它返回的
     内容。实际运行中该接口很容易先被 Cloudflare 拦截，如果把它作为硬门槛，后续
     本来可用的 CSRF/授权链永远不会执行。因此查活备用链不再把 providers 当作
     必经步骤。
 
-    这里必须原样传递 ``proxy``：``None`` 表示按配置选代理，空字符串表示明确
-    直连。之前用 ``proxy if proxy else None`` 把直连兜底误变成了再次抽取代理。
+    这里必须原样传递 proxy：None 表示按配置选代理，空字符串表示明确直连。
     """
-    session: BrowserSession | None = None
     last_exc: BaseException | None = None
     state = fingerprint_state if fingerprint_state is not None else {}
-    # 一次网络预检只创建一个 BrowserSession。403 响应下发的新 __cf_bm、
-    # OAuth/设备上下文都保留在同一 Cookie Jar 中供下一轮使用。
+    # 一次网络预检只创建一个带指纹种子的 BrowserSession。403 下发的
+    # 新 __cf_bm、OAuth/设备上下文保留在同一 Cookie Jar 中供下一轮使用；
+    # 只有透明路由轮换（出口已变化）才重建会话。
     session = _new_fingerprint_pinned_session(email, proxy, state)
     for attempt in range(1, max_attempts + 1):
-        if session is not None:
-            try:
-                session.session.close()
-            except Exception:
-                pass
         if attempt > 1 and rotate_transparent_route:
             from config import proxy as proxy_cfg
 
@@ -210,9 +204,11 @@ def _network_preflight_with_retry(
                 selection.get("group") or "-",
                 selection.get("node_name") or "-",
             )
-        # None 表示“从配置代理池随机选取”，空字符串表示“显式不设置代理”。
-        # Mihomo 透明路由必须保留空字符串，否则会意外回落到已失效的本地代理端口。
-        session = BrowserSession(proxy=proxy)
+            try:
+                session.session.close()
+            except Exception:
+                pass
+            session = _new_fingerprint_pinned_session(email, proxy, {})
         logger.info(
             "[查活] 复用统一会话：proxy=%s device_id=%s oai_session_id=%s（网络预检第 %s/%s 次）",
             session.proxy or "配置随机/直连", session.device_id,
@@ -233,10 +229,10 @@ def _network_preflight_with_retry(
                 except Exception:
                     pass
                 raise
-            action = "轮换美国节点重试" if rotate_transparent_route else "新建会话重试"
             _clear_optional_bootstrap_circuit(session)
+            action = "轮换美国节点重试" if rotate_transparent_route else "保留当前 session/deviceId/CF Cookie 重试"
             logger.warning(
-                "[查活] 网络预检失败（%s/%s），%s，保留当前 session/deviceId/CF Cookie 重试：%s",
+                "[查活] 网络预检失败（%s/%s），%s：%s",
                 attempt, max_attempts, action, str(exc)[:200],
             )
             time.sleep(2)
@@ -751,8 +747,31 @@ def check_account_liveness(
                 proxy=proxy,
                 proxy_selection=proxy_selection,
             )
+        existing_access_token = _stored_access_token(email)
+        has_totp = bool(_account_totp_secret(email))
         has_password_now = bool(_account_registration_password(email))
-        if not has_password_now:
+        if existing_access_token and not has_totp:
+            # 2FA 设置流程已经验证：先用已有 AT 预热 ChatGPT 登录态，再走
+            # reauth → 邮箱 OTP → callback。该链路不依赖容易被 CF 拦截的
+            # /api/auth/providers。已开启 TOTP 的账号保留密码 → MFA 路径，
+            # 避免把 MFA challenge 误当成邮箱 OTP 页面。
+            logger.info("[查活] 流程：登录态预热 → CSRF → Reauth Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
+            session = _new_fingerprint_pinned_session(email, proxy, fingerprint_state)
+            logger.info(
+                "[查活] 会话创建完成：proxy=%s device_id=%s（复用2FA稳定链路）",
+                session.proxy or "直连/配置随机",
+                session.device_id,
+            )
+            logger.info("[查活] 指纹摘要：%s", session.fingerprint_summary_text())
+            _warm_authenticated_session(session, existing_access_token)
+            human_delay("navigate")
+            session_info = _login_via_reauth(
+                session,
+                email,
+                time.time(),
+                email_source=email_source,
+            )
+        elif not has_password_now:
             logger.info("[查活] 流程：Providers → CSRF → Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
             session, authorize_url = _network_preflight_with_retry(
                 email,
@@ -791,51 +810,26 @@ def check_account_liveness(
             follow_oauth_callback(session, str(continue_url), referer="https://auth.openai.com/email-verification")
             session_info = fetch_session(session)
         else:
-            logger.info("[查活] 检测到账号密码：跳过直连 OTP 段，走密码/2FA 登录链")
-            logger.info("[查活] 开始重新登录：%s", email)
-            existing_access_token = _stored_access_token(email)
-            has_totp = bool(_account_totp_secret(email))
-            if existing_access_token and not has_totp:
-                # 2FA 设置流程已经验证：先用已有 AT 预热 ChatGPT 登录态，再走
-                # reauth → 邮箱 OTP → callback。该链路不依赖容易被 CF 拦截的
-                # /api/auth/providers。已开启 TOTP 的账号保留密码 → MFA 路径，
-                # 避免把 MFA challenge 误当成邮箱 OTP 页面。
-                logger.info("[查活] 流程：登录态预热 → CSRF → Reauth Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
-                session = _new_fingerprint_pinned_session(email, proxy, fingerprint_state)
-                logger.info(
-                    "[查活] 会话创建完成：proxy=%s device_id=%s（复用2FA稳定链路）",
-                    session.proxy or "直连/配置随机",
-                    session.device_id,
-                )
-                logger.info("[查活] 指纹摘要：%s", session.fingerprint_summary_text())
-                _warm_authenticated_session(session, existing_access_token)
-                human_delay("navigate")
-                session_info = _login_via_reauth(
-                    session,
-                    email,
-                    time.time(),
-                    email_source=email_source,
-                )
-            else:
-                # 兼容没有本地 AT 或已开启 TOTP 的记录。providers 不是 signin 的
-                # 前置依赖，备用链只执行 CSRF → Signin，避免在 providers 403 时提前终止。
-                logger.info("[查活] 流程：CSRF → Signin → Authorize → 密码/邮箱 OTP → MFA(如有) → OAuth callback → Session/AT")
-                session, authorize_url = _network_preflight_with_retry(
-                    email, proxy, fingerprint_state=fingerprint_state,
-                )
-    
-                otp_after_ts = time.time()
-                final_url = follow_authorize(session, authorize_url)
-                dead_code = detect_account_unusable_text(final_url)
-                if dead_code:
-                    return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": dead_code}
-    
-                session_info = _login_via_password_or_otp(
-                    session,
-                    email,
-                    otp_after_ts,
-                    email_source=email_source,
-                )
+            logger.info("[查活] 检测到账号密码：走密码/2FA 登录链")
+            # 兼容没有本地 AT 或已开启 TOTP 的记录。providers 不是 signin 的
+            # 前置依赖，备用链只执行 CSRF → Signin，避免在 providers 403 时提前终止。
+            logger.info("[查活] 流程：CSRF → Signin → Authorize → 密码/邮箱 OTP → MFA(如有) → OAuth callback → Session/AT")
+            session, authorize_url = _network_preflight_with_retry(
+                email, proxy, fingerprint_state=fingerprint_state,
+            )
+
+            otp_after_ts = time.time()
+            final_url = follow_authorize(session, authorize_url)
+            dead_code = detect_account_unusable_text(final_url)
+            if dead_code:
+                return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": dead_code}
+
+            session_info = _login_via_password_or_otp(
+                session,
+                email,
+                otp_after_ts,
+                email_source=email_source,
+            )
         access_token = str(session_info.get("accessToken") or "")
         if not access_token:
             raise RuntimeError("重新登录后未拿到 accessToken")
@@ -872,6 +866,11 @@ def check_account_liveness(
     finally:
         try:
             logger.info("[查活] 结束：%s", redact_email(email))
+            if session is not None:
+                try:
+                    session.session.close()
+                except Exception:
+                    pass
             if fh is not None:
                 root_logger.removeHandler(fh)
                 fh.close()
