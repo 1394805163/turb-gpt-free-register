@@ -2,6 +2,7 @@
 """账号查活后台队列：协议 BrowserSession 指纹环境 + 独立日志。"""
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -59,9 +60,20 @@ def _young_account_country_hint(account_id: int, *, max_age_hours: float = 6.0) 
             return ""
         # 注册国家来源：显式 proxy_exit_country -> registration_proxy.node_name -> 旧 proxy_used
         explicit = str(acc.get("proxy_exit_country") or "").strip().upper()
+        registration_proxy = acc.get("registration_proxy")
+        if len(explicit) != 2 or not isinstance(registration_proxy, dict):
+            # 注册链路把出口信息写在 extra_json；顶层字段可能为空，这里补读。
+            extra_raw = acc.get("extra_json")
+            try:
+                extra = json.loads(extra_raw) if isinstance(extra_raw, str) else (extra_raw if isinstance(extra_raw, dict) else {})
+            except Exception:
+                extra = {}
+            if len(explicit) != 2:
+                explicit = str(extra.get("proxy_exit_country") or "").strip().upper()
+            if not isinstance(registration_proxy, dict) and isinstance(extra.get("registration_proxy"), dict):
+                registration_proxy = extra.get("registration_proxy")
         if len(explicit) == 2:
             return explicit
-        registration_proxy = acc.get("registration_proxy")
         if isinstance(registration_proxy, dict):
             code = proxy_cfg.node_country_code(str(registration_proxy.get("node_name") or ""))
             if code:

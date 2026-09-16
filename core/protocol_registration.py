@@ -341,6 +341,26 @@ def run_protocol_registration(
                 extra["registration_password"] = registration_password
             exit_country = str((proxy_selection or {}).get("exit_country") or "").strip().upper()
             if not exit_country:
+                # mihomo 透明路由的实测出口国家可能与节点名不符（IPv6 出道）；优先以
+                # OpenAI 路由 trace 实测为准，节点名仅作最后兜底。
+                try:
+                    from core.registration_preflight import preflight_proxy as _preflight
+                    from config import proxy as _proxy_cfg2
+
+                    pf = _preflight(
+                        str((proxy_selection or {}).get("proxy_url") or ""),
+                        require_country="",
+                        allowed_countries=(proxy_selection or {}).get("allowed_countries") or getattr(_proxy_cfg2, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []),
+                        excluded_countries=(proxy_selection or {}).get("excluded_countries") or getattr(_proxy_cfg2, "REGISTRATION_PROXY_EXCLUDED_COUNTRIES", ["HK"]),
+                        allow_transparent=bool((proxy_selection or {}).get("transparent")),
+                        route_identity=str((proxy_selection or {}).get("node_name") or ""),
+                        force=True,
+                    )
+                    if pf.get("ok"):
+                        exit_country = str(pf.get("country") or "").strip().upper()
+                except Exception:
+                    pass
+            if not exit_country:
                 from config import proxy as _proxy_cfg
 
                 exit_country = _proxy_cfg.node_country_code(str((proxy_selection or {}).get("node_name") or ""))

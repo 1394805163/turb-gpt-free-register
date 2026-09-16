@@ -155,7 +155,12 @@ def _resolve_fresh_account_route(email: str) -> tuple[str | None, dict | None]:
         try:
             from config import proxy as proxy_cfg
 
-            selection = proxy_cfg.pick_registration_proxy(allowed_countries_override={hint})
+            allowed_union = {hint} | {
+                str(code).strip().upper()
+                for code in (getattr(proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []) or [])
+                if str(code).strip()
+            }
+            selection = proxy_cfg.pick_registration_proxy(allowed_countries_override=allowed_union)
             return None, selection
         except Exception as exc2:
             logger.warning("[补密码] 按国家直选也失败，交给默认选路：%s", str(exc2)[:120])
