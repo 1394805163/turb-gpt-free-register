@@ -2444,6 +2444,16 @@
         <div class="acc-v2-btn-group acc-v2-search-wrap">
           <input id="qOutlookV2" type="search" placeholder="搜索邮箱、状态…" autocomplete="off">
         </div>
+        <label class="acc-v2-inline" title="按邮箱池状态筛选">状态
+          <select id="poolStatusV2">
+            <option value="">全部状态</option>
+            <option value="available">可用</option>
+            <option value="in_use">使用中</option>
+            <option value="used">已用</option>
+            <option value="failed">失败</option>
+            <option value="disabled">已停用</option>
+          </select>
+        </label>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnMarkSelectedOutlookAvailableV2" disabled title="把选中的邮箱批量标记为未使用/可用">标记未使用</button>
         <button type="button" class="jobs-tb-btn" id="btnDisableSelectedOutlookV2" disabled title="批量停用选中的邮箱；停用后不会被注册任务领取">停用选中</button>
         <button type="button" class="jobs-tb-btn" id="btnFailSelectedOutlookV2" disabled title="批量标记选中的邮箱为失败">标失败</button>
@@ -3508,6 +3518,21 @@ function _planCell(r) {
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
   return `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
 }
+function _imageQuotaCell(r) {
+  const hasQuotaState = ['image_quota', 'image_quota_unknown', 'image_quota_checked_at', 'image_quota_error']
+    .some(key => Object.prototype.hasOwnProperty.call(r, key));
+  if (!hasQuotaState) return '';
+  const raw = r.image_quota;
+  const number = Number(raw);
+  const unknown = r.image_quota_unknown === true || raw === null || raw === undefined || raw === '' || Number.isNaN(number);
+  const value = unknown ? '未知' : String(Math.max(0, Math.trunc(number)));
+  const checkedAt = r.image_quota_checked_at ? `查询: ${r.image_quota_checked_at}` : '尚未完成额度查询';
+  const resetAt = r.image_quota_reset_at ? `重置: ${r.image_quota_reset_at}` : '';
+  const error = r.image_quota_error ? `错误: ${r.image_quota_error}` : '';
+  const title = [checkedAt, resetAt, error].filter(Boolean).join('；');
+  const cls = unknown ? 'status-failed' : number <= 5 ? 'status-running' : 'status-success';
+  return `<div class="acc-v2-sub" title="${esc(title)}"><span class="pill ${cls}">生图额度: ${esc(value)}</span></div>`;
+}
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {
     const automatic = r.plan_check_trigger === 'registration_auto';
@@ -3641,7 +3666,7 @@ function renderAccounts() {
       <td class="col-source">${esc(r.email_source || '-')}</td>
       <td class="col-token">${_tokenCellV2(r)}</td>
       <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}">${esc(short(r.password, 18))}</span>` : '<span class="acc-v2-muted">-</span>'}</td>
-      <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
+      <td class="col-plan">${_planCell(r)}${_imageQuotaCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
       <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-small">${_totpCellV2(r)}</td>
       <td class="col-status">${_codexCellV2(r)}</td>
@@ -5124,6 +5149,9 @@ function getOutlookQuery() {
   const el = document.getElementById('qOutlookV2');
   return (el ? el.value : '').trim();
 }
+function getPoolStatus() {
+  return document.getElementById('poolStatusV2')?.value || '';
+}
 function poolKey(r) { return `${r.source || getPoolSource() || 'all'}|${r.email || ''}`; }
 function poolLabel(src) {
   return ({outlook:'Outlook', generic_api:'通用API', imap:'通用IMAP', cloudflare_domain:'域名邮箱', icloud:'iCloud'})[src] || src || '-';
@@ -5132,8 +5160,9 @@ async function loadOutlook() {
   try {
     const source = getPoolSource();
     const q = getOutlookQuery();
+    const status = getPoolStatus();
     const p = PAGERS.outlook;
-    const res = await api(`/api/outlook?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&source=${encodeURIComponent(source)}&q=${encodeURIComponent(q)}`);
+    const res = await api(`/api/outlook?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&source=${encodeURIComponent(source)}&status=${encodeURIComponent(status)}&q=${encodeURIComponent(q)}`);
     OUTLOOK = res.items || [];
     OUTLOOK_TOTAL = Number(res.total || OUTLOOK.length || 0);
     const totalPages = Math.max(1, Math.ceil(OUTLOOK_TOTAL / p.size));
@@ -5305,6 +5334,12 @@ async function onOutlookBodyClick(e) {
   if (qV2) qV2.addEventListener('input', debounce(() => {
     PAGERS.outlook.page = 1; loadOutlook();
   }, 250));
+  const statusV2 = $('#poolStatusV2');
+  if (statusV2) statusV2.addEventListener('change', () => {
+    PAGERS.outlook.page = 1;
+    OUTLOOK_SELECTED.clear();
+    loadOutlook();
+  });
   const srcWrap = $('#poolSourceV2Wrap');
   const srcHidden = $('#poolSourceV2');
   if (srcWrap && srcHidden) {
@@ -5388,7 +5423,7 @@ function setImportSourceV2(val) {
   const registeredToggle = document.getElementById('importAsRegisteredV2');
   if (registeredToggle) {
     registeredToggle.disabled = next === 'icloud';
-    registeredToggle.checked = next !== 'icloud';
+    if (next === 'icloud') registeredToggle.checked = false;
   }
   const text = document.getElementById('importTextV2');
   if (text) text.placeholder = next === 'imap'

@@ -159,6 +159,9 @@ def _compact_account_for_list(row: dict) -> dict:
         "totp_setup_error", "totp_setup_message", "totp_setup_started_at", "totp_setup_completed_at",
         "email_change_status", "email_change_error", "email_change_new_email",
         "email_change_started_at", "email_change_completed_at",
+        # 生图额度（套餐查询副产物）。
+        "image_quota", "image_quota_reset_at", "image_quota_unknown",
+        "image_quota_checked_at", "image_quota_error",
     )
     for key in optional_keys:
         value = row.get(key)

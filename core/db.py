@@ -1317,6 +1317,17 @@ def update_account_plan_check(
                 if result.get(_k) is not None:
                     row[_k] = result.get(_k)
 
+            # 生图额度（套餐查询副产物）；结果里显式带出这些键时写入，允许 None（探测失败会置未知）。
+            for _k in (
+                "image_quota",
+                "image_quota_reset_at",
+                "image_quota_unknown",
+                "image_quota_checked_at",
+                "image_quota_error",
+            ):
+                if _k in result:
+                    row[_k] = result.get(_k)
+
             row["plus_trial_eligible"] = bool(result.get("plus_trial_eligible"))
             row["plus_trial_campaign_id"] = result.get("plus_trial_campaign_id")
             row["plus_trial_title"] = result.get("plus_trial_title")
