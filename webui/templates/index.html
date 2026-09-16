@@ -2578,6 +2578,10 @@
         <input id="importAsRegisteredV2" type="checkbox">
         <span>导入后默认视为「注册成功账号」（邮箱池标记已用，并出现在账号页，可直接批量补跑 Codex）</span>
       </label>
+      <label class="outlook-import-check">
+        <input id="importOverwriteV2" type="checkbox">
+        <span>覆盖同名邮箱（更新凭证/标签；「失败」状态会重置为可用，已用/已停用保持不变）</span>
+      </label>
       <label class="outlook-import-field">
         <span>邮箱素材</span>
         <textarea id="importTextV2" placeholder="Outlook: email----password----clientId----refreshToken&#10;通用API: email----取码地址"></textarea>
@@ -5506,8 +5510,10 @@ async function doImportOutlook() {
   if (submitBtn) submitBtn.disabled = true;
   try {
     const source = sourceEl ? sourceEl.value : 'outlook';
+    const overwriteEl = $('#importOverwriteV2');
+    const overwrite = overwriteEl ? !!overwriteEl.checked : false;
     const as_registered = source === 'icloud' ? false : (registeredEl ? !!registeredEl.checked : false);
-    const payload = {text, source, as_registered};
+    const payload = {text, source, as_registered, overwrite};
     if (source === 'imap') {
       payload.imap_server = ($('#imapServerV2')?.value || '').trim();
       payload.imap_port = Number($('#imapPortV2')?.value || 993);
@@ -5516,13 +5522,13 @@ async function doImportOutlook() {
     }
     const r = await api('/api/outlook/import', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     const mode = r.as_registered ? '已注册账号' : '邮箱池素材';
-    const msg = `按 ${mode} 导入：解析 ${r.parsed} 行，新增 ${r.inserted}，跳过 ${r.skipped}${r.as_registered ? '；可到“账号”页选择后批量补跑 Codex' : ''}`;
+    const msg = `按 ${mode} 导入：解析 ${r.parsed} 行，新增 ${r.inserted}${r.updated ? `，更新 ${r.updated}` : ''}，跳过 ${r.skipped}${r.as_registered ? '；可到“账号”页选择后批量补跑 Codex' : ''}`;
     if (resultEl) resultEl.innerHTML = `<div class="banner info">${esc(msg)}</div>`;
     if (textEl) textEl.value = '';
     setPoolSourceV2(source);
     setImportSourceV2(source);
     loadOutlook(); loadAccounts(); loadSummary();
-    showToast(`导入完成：新增 ${r.inserted}，跳过 ${r.skipped}`);
+    showToast(`导入完成：新增 ${r.inserted}${r.updated ? `，更新 ${r.updated}` : ''}，跳过 ${r.skipped}`);
     setTimeout(closeOutlookImportModal, 600);
   } catch(e) {
     if (resultEl) resultEl.innerHTML = `<div class="banner warn">${esc(e.message)}</div>`;

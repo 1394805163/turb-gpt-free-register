@@ -2233,22 +2233,39 @@ def delete_accounts(account_ids: list[int] | None = None, emails: list[str] | No
 # outlook_pool
 # ============================================================
 
-def import_outlook_accounts(records: list[dict]) -> tuple[int, int]:
+def import_outlook_accounts(records: list[dict], overwrite: bool = False) -> tuple[int, int]:
     """
     批量导入 Outlook 账号。
     records 元素：{email, password, client_id, refresh_token}
-    返回 (新增数, 跳过数)。
+    overwrite=True 时覆盖同名邮箱的凭证字段（仅覆盖非空值）；failed 状态重置为 available。
+    返回 (导入数[新增+覆盖更新], 跳过数)。
     """
     with _LOCK:
         rows = _load_outlook()
-        inserted = skipped = 0
+        imported = skipped = 0
         for raw in records:
             email = (raw.get("email") or "").strip()
             if not email:
                 skipped += 1
                 continue
-            if _find_by_email(rows, email):
-                skipped += 1
+            existing = _find_by_email(rows, email)
+            if existing is not None:
+                if not overwrite:
+                    skipped += 1
+                    continue
+                for key, value in (
+                    ("password", str(raw.get("password") or "").strip()),
+                    ("client_id", str(raw.get("client_id") or raw.get("clientId") or "").strip()),
+                    ("refresh_token", str(raw.get("refresh_token") or raw.get("refreshToken") or "").strip()),
+                ):
+                    if value:
+                        existing[key] = value
+                if str(existing.get("status") or "") == "failed":
+                    existing["status"] = "available"
+                    existing["used_at"] = None
+                existing["updated_at"] = _now()
+                existing["copy_line"] = _outlook_line(existing)
+                imported += 1
                 continue
             row = {
                 "id": _next_id(rows),
@@ -2263,9 +2280,9 @@ def import_outlook_accounts(records: list[dict]) -> tuple[int, int]:
             }
             row["copy_line"] = _outlook_line(row)
             rows.append(row)
-            inserted += 1
+            imported += 1
         _save_outlook(rows)
-        return inserted, skipped
+        return imported, skipped
 
 
 def import_registered_email_accounts(records: list[dict], source: str | None) -> tuple[int, int]:
@@ -2546,23 +2563,34 @@ def get_outlook_by_email(email: str) -> dict | None:
 # generic_api email pool
 # ============================================================
 
-def import_generic_api_emails(records: list[dict]) -> tuple[int, int]:
+def import_generic_api_emails(records: list[dict], overwrite: bool = False) -> tuple[int, int]:
     """
     批量导入通用 API 取码邮箱。
     records 元素：{email, code_url}
-    返回 (新增数, 跳过数)。
+    overwrite=True 时覆盖同名邮箱的取码地址；failed 状态重置为 available。
+    返回 (导入数[新增+覆盖更新], 跳过数)。
     """
     with _LOCK:
         rows = _load_generic_api_emails()
-        inserted = skipped = 0
+        imported = skipped = 0
         for raw in records:
             email = (raw.get("email") or "").strip()
             code_url = (raw.get("code_url") or raw.get("url") or "").strip()
             if not email or not code_url:
                 skipped += 1
                 continue
-            if _find_by_email(rows, email):
-                skipped += 1
+            existing = _find_by_email(rows, email)
+            if existing is not None:
+                if not overwrite:
+                    skipped += 1
+                    continue
+                existing["code_url"] = code_url
+                if str(existing.get("status") or "") == "failed":
+                    existing["status"] = "available"
+                    existing["used_at"] = None
+                existing["updated_at"] = _now()
+                existing["copy_line"] = _generic_api_email_line(existing)
+                imported += 1
                 continue
             row = {
                 "id": _next_id(rows),
@@ -2575,9 +2603,9 @@ def import_generic_api_emails(records: list[dict]) -> tuple[int, int]:
             }
             row["copy_line"] = _generic_api_email_line(row)
             rows.append(row)
-            inserted += 1
+            imported += 1
         _save_generic_api_emails(rows)
-        return inserted, skipped
+        return imported, skipped
 
 
 def claim_next_generic_api_email() -> dict | None:
@@ -2654,11 +2682,14 @@ def get_generic_api_email_by_email(email: str) -> dict | None:
 # Generic IMAP email pool
 # ============================================================
 
-def import_imap_emails(records: list[dict]) -> tuple[int, int]:
-    """导入 IMAP 邮箱。用户名留空时客户端使用邮箱地址登录。"""
+def import_imap_emails(records: list[dict], overwrite: bool = False) -> tuple[int, int]:
+    """导入 IMAP 邮箱。用户名留空时客户端使用邮箱地址登录。
+
+    overwrite=True 时覆盖同名邮箱的服务器/密码等字段；failed 状态重置为 available。
+    """
     with _LOCK:
         rows = _load_imap_emails()
-        inserted = skipped = 0
+        imported = skipped = 0
         for raw in records:
             email = str(raw.get("email") or "").strip()
             password = str(raw.get("imap_password") or raw.get("password") or "").strip()
@@ -2667,11 +2698,28 @@ def import_imap_emails(records: list[dict]) -> tuple[int, int]:
                 port = int(raw.get("imap_port") or raw.get("port") or 993)
             except (TypeError, ValueError):
                 port = 0
-            if not email or not password or not server or not (1 <= port <= 65535) or _find_by_email(rows, email):
+            if not email or not password or not server or not (1 <= port <= 65535):
                 skipped += 1
                 continue
             ssl_raw = raw.get("imap_ssl", raw.get("use_ssl", True))
             use_ssl = ssl_raw if isinstance(ssl_raw, bool) else str(ssl_raw).strip().lower() not in {"0", "false", "no", "off"}
+            existing = _find_by_email(rows, email)
+            if existing is not None:
+                if not overwrite:
+                    skipped += 1
+                    continue
+                existing.update({
+                    "imap_password": password, "imap_server": server, "imap_port": port,
+                    "imap_username": str(raw.get("imap_username") or raw.get("username") or "").strip(),
+                    "imap_ssl": bool(use_ssl),
+                })
+                if str(existing.get("status") or "") == "failed":
+                    existing["status"] = "available"
+                    existing["used_at"] = None
+                existing["updated_at"] = _now()
+                existing["copy_line"] = _imap_email_line(existing)
+                imported += 1
+                continue
             row = {
                 "id": _next_id(rows), "email": email,
                 "imap_password": password, "imap_server": server, "imap_port": port,
@@ -2681,9 +2729,9 @@ def import_imap_emails(records: list[dict]) -> tuple[int, int]:
             }
             row["copy_line"] = _imap_email_line(row)
             rows.append(row)
-            inserted += 1
+            imported += 1
         _save_imap_emails(rows)
-        return inserted, skipped
+        return imported, skipped
 
 
 def claim_next_imap_email() -> dict | None:

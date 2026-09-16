@@ -1685,8 +1685,9 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API、通用 IMAP 或 iCloud 隐藏邮箱池"}), 400
         text = data.get("text") or ""
         as_registered = bool(data.get("as_registered", False))
+        overwrite = bool(data.get("overwrite", False))
         if source == "icloud":
-            result = _icloud_mail_client().import_mailboxes(text)
+            result = _icloud_mail_client().import_mailboxes(text, overwrite=overwrite)
             if not result.get("parsed"):
                 return jsonify({"ok": False, "error": "未解析到有效 iCloud 隐藏邮箱；每行填写 alias@icloud.com 或 alias@icloud.com----标签"}), 400
             return jsonify(result)
@@ -1753,17 +1754,18 @@ def create_app(auth_code: str | None = None) -> Flask:
         if as_registered:
             inserted, skipped = db.import_registered_email_accounts(records, source=source)
         elif source == "generic_api":
-            inserted, skipped = db.import_generic_api_emails(records)
+            inserted, skipped = db.import_generic_api_emails(records, overwrite=overwrite)
         elif source == "imap":
-            inserted, skipped = db.import_imap_emails(records)
+            inserted, skipped = db.import_imap_emails(records, overwrite=overwrite)
         else:
-            inserted, skipped = db.import_outlook_accounts(records)
+            inserted, skipped = db.import_outlook_accounts(records, overwrite=overwrite)
         return jsonify({
             "ok": True,
             "inserted": inserted,
             "skipped": skipped,
             "parsed": len(records),
             "as_registered": as_registered,
+            "overwrite": overwrite,
         })
 
     @app.post("/api/outlook/status")

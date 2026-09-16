@@ -71,8 +71,12 @@ def _write_mailboxes(entries: list[dict[str, str]]) -> None:
     temp_path.replace(path)
 
 
-def import_mailboxes(text: str) -> dict[str, int | bool]:
-    """把隐藏邮箱别名追加到文本池，保留现有状态和标签。"""
+def import_mailboxes(text: str, overwrite: bool = False) -> dict[str, int | bool]:
+    """把隐藏邮箱别名追加到文本池，保留现有状态和标签。
+
+    ``overwrite=True`` 时覆盖同名别名：更新标签，并把 failed 状态重置为 available；
+    used / disabled / in_use 状态保持不变（避免复活已用或已停用的邮箱）。
+    """
     valid_lines = []
     for raw in str(text or "").splitlines():
         raw = raw.strip()
@@ -80,28 +84,50 @@ def import_mailboxes(text: str) -> dict[str, int | bool]:
             valid_lines.append(raw)
     incoming = ICloudMailboxPool.parse_entries(valid_lines)
     pool = _pool()
+    inserted = updated = 0
+    now = datetime.now(timezone.utc).isoformat()
     with pool.lock:
         existing = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))
-        known = {item["email"] for item in existing}
-        added = [item for item in incoming if item["email"] not in known]
-        now = datetime.now(timezone.utc).isoformat()
-        if added:
-            _write_mailboxes(existing + added)
-            state = pool._load()
-            for item in added:
-                state[item["email"]] = {
-                    "state": "available",
-                    "reason": "",
-                    "label": item.get("label") or "",
-                    "imported_at": now,
-                    "updated_at": now,
-                }
+        by_email = {item["email"]: item for item in existing}
+        state = pool._load()
+        config_dirty = state_dirty = False
+        for item in incoming:
+            email = item["email"]
+            current = by_email.get(email)
+            if current is not None:
+                if not overwrite:
+                    continue
+                label = str(item.get("label") or "").strip()
+                if label and label != str(current.get("label") or ""):
+                    current["label"] = label
+                    config_dirty = True
+                entry = dict(state.get(email) or {})
+                if str(entry.get("state") or "available").strip().lower() == "failed":
+                    entry.update({"state": "available", "reason": "", "updated_at": now})
+                    state[email] = entry
+                    state_dirty = True
+                updated += 1
+                continue
+            existing.append(item)
+            by_email[email] = item
+            state[email] = {
+                "state": "available",
+                "reason": "",
+                "label": item.get("label") or "",
+                "imported_at": now,
+                "updated_at": now,
+            }
+            config_dirty = state_dirty = True
+            inserted += 1
+        if config_dirty:
+            _write_mailboxes(existing)
+        if state_dirty:
             pool._save(state)
-    inserted = len(added)
     return {
         "ok": True,
         "inserted": inserted,
-        "skipped": max(0, len(valid_lines) - inserted),
+        "updated": updated,
+        "skipped": max(0, len(valid_lines) - inserted - updated),
         "parsed": len(valid_lines),
         "as_registered": False,
     }
