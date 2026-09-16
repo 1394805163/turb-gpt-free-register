@@ -982,8 +982,11 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     navigation_grace = min(max(5, configured_navigation_grace), max(5, int(timeout) - 2))
     session_probe_round = 0
     slow_rounds = 0
-    while time.time() < end:
-        tick_started = time.time()
+    while True:
+        now = time.time()
+        if now >= end:
+            break
+        tick_started = now
         # 登录态探测降频 + 仅在可能已登录的主域执行：每轮都发跨域 fetch 会在
         # 导航窗口期把状态机拖死（180s stall 的诱因之一）。
         session_probe_round += 1
@@ -1004,7 +1007,6 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             last_known_url = live_url
             navigation_seen_at = None
         else:
-            now = time.time()
             if navigation_seen_at is None:
                 navigation_seen_at = now
                 logger.info(
@@ -1032,7 +1034,6 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             logger.warning("%s 邮箱提交后进入 auth 服务端错误页：%s", _log_prefix(driver), str(url)[:200])
             return "auth_error"
         if _is_authorize_intermediate_url(url):
-            now = time.time()
             if authorize_seen_at is None:
                 authorize_seen_at = now
                 logger.info(
@@ -1059,7 +1060,6 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             has_blank = any(v == "" for v in values)
             has_expected = any(v.strip().lower() == expected_email for v in values)
             if has_blank and not has_expected:
-                now = time.time()
                 if cleared_seen_at is None:
                     cleared_seen_at = now
                 # URL 已带 email 查询参数时更像是提交后的中间态，给它更长观察窗口。

@@ -11,6 +11,7 @@ Flask 本地控制台。
 默认绑定 127.0.0.1，仅本地访问。
 """
 import logging
+import os
 import gzip
 import json
 import threading
@@ -93,6 +94,49 @@ def _paginate_items(items: list[dict], *, page: int, page_size: int) -> dict:
         "limit": page_size,
     }
 
+
+def _client_accepts_gzip(accept_encoding: str | None) -> bool:
+    """按 HTTP Accept-Encoding 的 q 值判断客户端是否明确接受 gzip。"""
+    for item in str(accept_encoding or "").split(","):
+        parts = [part.strip() for part in item.split(";")]
+        encoding = parts[0].lower()
+        if encoding not in {"gzip", "*"}:
+            continue
+        quality = 1.0
+        for param in parts[1:]:
+            key, separator, value = param.partition("=")
+            if key.strip().lower() != "q" or not separator:
+                continue
+            try:
+                quality = float(value.strip())
+            except ValueError:
+                quality = 0.0
+            break
+        return quality > 0
+    return False
+
+
+def _maybe_compress_json_response(response: Response, accept_encoding: str | None) -> Response:
+    """压缩较大的 JSON 响应，且不改变未声明 gzip 能力的客户端语义。"""
+    if (
+        response.direct_passthrough
+        or response.headers.get("Content-Encoding")
+        or not _client_accepts_gzip(accept_encoding)
+        or (response.mimetype or "").lower() != "application/json"
+    ):
+        return response
+    data = response.get_data()
+    if len(data) < 1024:
+        return response
+    compressed = gzip.compress(data, compresslevel=6, mtime=0)
+    if len(compressed) >= len(data):
+        return response
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(compressed))
+    vary = response.headers.get("Vary")
+    response.headers["Vary"] = "Accept-Encoding" if not vary else f"{vary}, Accept-Encoding"
+    return response
 
 def _compact_account_for_list(row: dict) -> dict:
     """账号列表轻量对象：只返回当前表格渲染和按钮判断必需字段。
@@ -268,31 +312,7 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.after_request
     def _compress_json_response(response: Response):
         """默认对 JSON API 响应启用 gzip，减少本地前端拉取大列表的传输体积。"""
-        accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
-        # 默认开启 gzip：浏览器会自动带 gzip；本地脚本未带 Accept-Encoding 时也压缩。
-        # 只有客户端明确声明 identity 且没有 gzip 时，才按明文返回。
-        gzip_allowed = "gzip" in accept_encoding
-        if (
-            response.direct_passthrough
-            or response.headers.get("Content-Encoding")
-            or not gzip_allowed
-        ):
-            return response
-        mimetype = (response.mimetype or "").lower()
-        if mimetype != "application/json":
-            return response
-        data = response.get_data()
-        if not data or len(data) < 1024:
-            return response
-        compressed = gzip.compress(data, compresslevel=6)
-        if len(compressed) >= len(data):
-            return response
-        response.set_data(compressed)
-        response.headers["Content-Encoding"] = "gzip"
-        response.headers["Content-Length"] = str(len(compressed))
-        vary = response.headers.get("Vary")
-        response.headers["Vary"] = "Accept-Encoding" if not vary else f"{vary}, Accept-Encoding"
-        return response
+        return _maybe_compress_json_response(response, request.headers.get("Accept-Encoding"))
 
     def _put_prepared_download(content: bytes, filename: str, mimetype: str = "application/zip") -> str:
         now = time.time()

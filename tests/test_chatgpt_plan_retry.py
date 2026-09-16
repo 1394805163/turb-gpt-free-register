@@ -74,6 +74,7 @@ class ChatgptPlanRetryTests(unittest.TestCase):
     def setUp(self):
         _PlanSession.created = []
 
+    @unittest.skip("2026-08-24 起套餐查询改为每次尝试轮换出口（acd53bc），同会话重试契约已废弃；由 test_plan_proxy_rotation 覆盖新契约")
     def test_403_retries_in_same_session_with_complete_frontend_headers(self):
         claims = {
             "payload": {}, "email": "one@example.com", "account_id": "acc-1",
