@@ -167,6 +167,98 @@ def _resolve_fresh_account_route(email: str) -> tuple[str | None, dict | None]:
             return None, None
 
 
+def refresh_account_session(
+    email: str,
+    *,
+    proxy: str | None = None,
+    proxy_selection: dict | None = None,
+    save: bool = True,
+) -> dict:
+    """只做 OTP 登录并把新会话写回账号（不设置密码）。
+
+    用途：补密码/重新登录会让注册期 AT 被服务端吊销（401 token_revoked），
+    重新登录一次即可换回可用会话。返回 {ok, status, email, access_token?, error?}
+    """
+    email = str(email or "").strip()
+    if not email:
+        return {"ok": False, "status": "skipped", "error": "email 为空"}
+
+    from core.cloakbrowser_driver import account_fingerprint_seed, build_cloak_driver
+    from core.email_provider import OtpWaitSession, wait_for_otp
+    from core.roxy_registration import (
+        _clear_otp_inputs,
+        _click_continue,
+        _fetch_chatgpt_session,
+        _is_mfa_challenge_page,
+        _maybe_accept,
+        _pass_mfa_challenge_if_needed,
+        _submit_email_and_wait_next,
+        _type_otp,
+        _wait_after_email_otp_submit,
+    )
+
+    if not proxy and not proxy_selection:
+        proxy, proxy_selection = _resolve_fresh_account_route(email)
+
+    driver = None
+    try:
+        driver, opened = build_cloak_driver(
+            proxy=proxy,
+            proxy_selection=proxy_selection,
+            fingerprint_seed=account_fingerprint_seed(email),
+        )
+        driver.set_page_load_timeout(90)
+        logger.info("[会话刷新] 启动：%s profile=%s", email, opened.profile_id)
+        _watchdog_timer = _start_driver_watchdog(driver)
+
+        driver.get("https://chatgpt.com/auth/login")
+        _maybe_accept(driver)
+        time.sleep(2)
+        login_otp_after = time.time()
+        _submit_email_and_wait_next(driver, email, attempts=2, timeout=120)
+        login_session = OtpWaitSession(wait_fn=wait_for_otp)
+        login_code = login_session.wait(email, after_ts=login_otp_after, max_wait=90)
+        logger.info("[会话刷新] 验证码已收到（len=%s），提交", len(str(login_code or "")))
+        _clear_otp_inputs(driver)
+        _type_otp(driver, login_code)
+        _click_continue(driver)
+        outcome = _wait_after_email_otp_submit(driver, timeout=25)
+        logger.info("[会话刷新] 验证码提交结果：%s", outcome)
+        time.sleep(2)
+        if _is_mfa_challenge_page(driver):
+            if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
+                raise RuntimeError("2FA 动态码未通过")
+            time.sleep(2)
+        info = _fetch_chatgpt_session(driver, timeout=90)
+        new_at = str((info or {}).get("accessToken") or "").strip()
+        if not new_at:
+            raise RuntimeError("登录后未拿到 accessToken")
+
+        written = False
+        if save:
+            from core import db
+
+            written = db.update_account_session_tokens(email, info)
+            logger.info("[会话刷新] 新会话写回：%s", written)
+        return {
+            "ok": True, "status": "refreshed", "email": email,
+            "access_token": new_at, "written": written,
+        }
+    except Exception as exc:
+        logger.exception("[会话刷新] 失败")
+        return {"ok": False, "status": "failed", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    finally:
+        try:
+            _watchdog_timer.cancel()
+        except Exception:
+            pass
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
 def set_account_password(
     email: str,
     *,
@@ -327,6 +419,18 @@ def set_account_password(
                 logger.info("[补密码] 已回写密码到账号记录")
             except Exception as exc:
                 logger.warning("[补密码] 回写 DB 失败：%s", str(exc)[:160])
+            # 登录 + 设置密码会重新签发会话并吊销注册期 AT（token_revoked）。
+            # 不写回新 accessToken，账号会在套餐查询/查活里假死成"AT 已过期"。
+            try:
+                from core import db as _db
+
+                fresh = _fetch_chatgpt_session(driver, timeout=60)
+                if _db.update_account_session_tokens(email, fresh):
+                    logger.info("[补密码] 已写回新会话 accessToken（旧注册期 AT 已被服务端吊销）")
+                else:
+                    logger.warning("[补密码] 新会话写回失败：未读到 accessToken")
+            except Exception as exc:
+                logger.warning("[补密码] 写回新会话失败：%s", str(exc)[:160])
         return {
             "ok": True, "status": "updated", "email": email, "password": new_password,
             "url": final_url, "settings_label": verify_label,

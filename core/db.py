@@ -1083,8 +1083,7 @@ def update_account_codex_status(email: str, codex_status: str, codex_error: str 
 def claim_account_codex_agent(acc_id: int, trigger: str = "manual") -> bool:
     """原子占用账号 Codex Agent Token 生成任务；已有未超时任务时返回 False。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         current_status = row.get("codex_agent_status")
@@ -1107,15 +1106,14 @@ def claim_account_codex_agent(acc_id: int, trigger: str = "manual") -> bool:
         row["codex_agent_error"] = None
         row["codex_agent_message"] = "已入队"
         row["updated_at"] = now
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
 def mark_account_codex_agent_running(acc_id: int) -> bool:
     """把 Codex Agent Token 生成任务标记为运行中。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None or row.get("codex_agent_status") not in {"queued", "running"}:
             return False
         row["codex_agent_status"] = "running"
@@ -1123,7 +1121,7 @@ def mark_account_codex_agent_running(acc_id: int) -> bool:
         row["codex_agent_error"] = None
         row["codex_agent_message"] = "正在生成 Codex Agent Token"
         row["updated_at"] = _now()
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1131,8 +1129,7 @@ def update_account_codex_agent(acc_id: int, result: dict | None = None) -> bool:
     """更新账号 Codex Agent Token 生成结果/进度。"""
     result = result or {}
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
@@ -1180,7 +1177,7 @@ def update_account_codex_agent(acc_id: int, result: dict | None = None) -> bool:
             if result.get(src_key) is not None:
                 row[_k] = result.get(src_key)
         row["updated_at"] = _now()
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1427,8 +1424,7 @@ def update_account_plan_check(
 def claim_account_extract(acc_id: int, trigger: str = "manual", link_type: str = "pix") -> bool:
     """原子占用账号提链任务；已有未超时任务时返回 False。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         current_status = row.get("extract_link_status")
@@ -1452,15 +1448,14 @@ def claim_account_extract(acc_id: int, trigger: str = "manual", link_type: str =
         row["extract_link_error"] = None
         row["extract_link_message"] = "已入队"
         row["updated_at"] = now
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
 def mark_account_extract_running(acc_id: int) -> bool:
     """把提链任务标记为运行中。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None or row.get("extract_link_status") not in {"queued", "running"}:
             return False
         row["extract_link_status"] = "running"
@@ -1468,7 +1463,7 @@ def mark_account_extract_running(acc_id: int) -> bool:
         row["extract_link_error"] = None
         row["extract_link_message"] = "任务运行中"
         row["updated_at"] = _now()
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1476,8 +1471,7 @@ def update_account_extract(acc_id: int, result: dict | None = None) -> bool:
     """更新账号提链任务结果/进度。"""
     result = result or {}
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
@@ -1509,7 +1503,7 @@ def update_account_extract(acc_id: int, result: dict | None = None) -> bool:
                 row["extract_link_cdk_remaining"] = payload.get("cdk_remaining")
             row["extract_link_result_json"] = json.dumps(payload, ensure_ascii=False)
         row["updated_at"] = _now()
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1841,8 +1835,7 @@ def update_account_note(acc_id: int, note: str) -> bool:
 def claim_account_email_change(acc_id: int, source: str, trigger: str = "manual") -> bool:
     """原子占用账号邮箱换绑任务。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None or row.get("email_change_status") in {"queued", "running"}:
             return False
         now = _now()
@@ -1852,19 +1845,18 @@ def claim_account_email_change(acc_id: int, source: str, trigger: str = "manual"
             "email_change_queued_at": now, "email_change_started_at": None,
             "email_change_completed_at": None, "email_change_error": None, "updated_at": now,
         })
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
 def mark_account_email_change_running(acc_id: int, new_email: str) -> bool:
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None or row.get("email_change_status") not in {"queued", "running"}:
             return False
         row.update({"email_change_status": "running", "email_change_new_email": new_email,
                     "email_change_started_at": _now(), "email_change_error": None, "updated_at": _now()})
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -1874,8 +1866,7 @@ def finish_account_email_change(
 ) -> bool:
     """写回换绑结果；成功时保留初始邮箱并将账号主邮箱切换为新邮箱。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         now = _now()
@@ -1910,7 +1901,7 @@ def finish_account_email_change(
         row["email_change_completed_at"] = now
         row["updated_at"] = now
         row["copy_line"] = _account_line(row)
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -1986,8 +1977,7 @@ def update_account_liveness(
 def claim_account_totp_setup(acc_id: int, trigger: str = "manual") -> bool:
     """原子占用账号 2FA 设置任务；已有未超时任务时返回 False。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         current_status = row.get("totp_setup_status")
@@ -2009,15 +1999,14 @@ def claim_account_totp_setup(acc_id: int, trigger: str = "manual") -> bool:
         row["totp_setup_completed_at"] = None
         row["totp_setup_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
 def mark_account_totp_setup_running(acc_id: int) -> bool:
     """把 2FA 设置任务标记为运行中。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None or row.get("totp_setup_status") not in {"queued", "running"}:
             return False
         now = _now()
@@ -2025,7 +2014,7 @@ def mark_account_totp_setup_running(acc_id: int) -> bool:
         row["totp_setup_started_at"] = now
         row["totp_setup_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -2078,8 +2067,7 @@ def recover_interrupted_totp_setups() -> int:
 def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
     """原子占用账号查活任务；已有 queued/running 时返回 False。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         if row.get("live_check_status") in {"queued", "running"}:
@@ -2100,7 +2088,7 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
         row["live_checked_at"] = None
         row["live_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -2127,8 +2115,7 @@ def recover_interrupted_live_checks() -> int:
 def mark_account_live_check_running(acc_id: int) -> bool:
     """把账号查活任务标记为运行中。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None or row.get("live_check_status") not in {"queued", "running"}:
             return False
         now = _now()
@@ -2136,7 +2123,7 @@ def mark_account_live_check_running(acc_id: int) -> bool:
         row["live_check_started_at"] = now
         row["live_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -2170,15 +2157,14 @@ def update_accounts_note(account_ids: list[int] | None, note: str) -> tuple[list
 def archive_account(acc_id: int, archived: bool = True) -> bool:
     """归档/取消归档单个已注册账号。归档不会删除 token，只影响默认账号列表查询。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         now = _now()
         row["archived"] = bool(archived)
         row["archived_at"] = now if archived else None
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -3692,6 +3678,44 @@ def update_account_chatgpt_oauth_from_file(email: str, file_path: str | Path, ex
 
 
 
+def update_account_session_tokens(email: str, session: dict | None) -> bool:
+    """把浏览器重新登录后的新会话 token 写回账号。
+
+    补密码/加 2FA 等流程会重新签发会话并吊销注册期 AT（服务端返回
+    ``token_revoked``），不写回就会让账号在上层视角里"AT 过期"假死。
+    """
+    payload = dict(session or {})
+    token = str(payload.get("accessToken") or "").strip()
+    target = str(email or "").strip().lower()
+    if not target or not token:
+        return False
+    with _LOCK:
+        row = _load_account_row(email=target)
+        if row is None:
+            return False
+        user = payload.get("user") or {}
+        account = payload.get("account") or {}
+        now = _now()
+        row["access_token"] = token
+        row["token_expired"] = False
+        if user.get("id"):
+            row["user_id"] = user.get("id")
+        if user.get("name") is not None:
+            row["user_name"] = user.get("name")
+        if account.get("planType"):
+            row["plan_type"] = account.get("planType")
+        if account.get("id"):
+            row["account_id"] = account.get("id")
+        if payload.get("expires"):
+            row["expires_at"] = payload.get("expires")
+        if payload.get("sessionToken"):
+            row["session_token"] = str(payload.get("sessionToken"))
+        row["updated_at"] = now
+        row["copy_line"] = _account_line(row)
+        _save_account_row(row)
+        return True
+
+
 def update_account_registration_password(email: str, password: str) -> bool:
     """记录/覆盖账号的 OpenAI 登录密码（补设密码或密码注册后调用）。
 
@@ -3751,8 +3775,7 @@ def recover_interrupted_account_pushes() -> int:
 def claim_account_push(acc_id: int, token_fingerprint: str) -> str:
     """原子占用推送任务，返回 claimed/idempotent/busy/not_live/missing。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return "missing"
         if str(row.get("live_check_status") or "") != "live":
@@ -3772,7 +3795,7 @@ def claim_account_push(acc_id: int, token_fingerprint: str) -> str:
         row["push_error"] = None
         row["push_next_retry_at"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return "claimed"
 
 
@@ -3787,8 +3810,7 @@ def complete_account_push(
     http_status: int | None = None,
 ) -> bool:
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         if (
@@ -3809,7 +3831,7 @@ def complete_account_push(
             row["push_token_fingerprint"] = token_fingerprint
             row["pushed_at"] = now
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -3860,8 +3882,7 @@ def record_account_push_attempt(
     token_fingerprint: str | None = None,
 ) -> bool:
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         if token_fingerprint is not None and (
@@ -3876,7 +3897,7 @@ def record_account_push_attempt(
         row["push_http_status"] = int(http_status) if http_status is not None else None
         row["push_last_attempt_at"] = _now()
         row["updated_at"] = _now()
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
