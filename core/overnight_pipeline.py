@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 import threading
 import time
 from datetime import datetime
@@ -25,6 +26,7 @@ _STATE_FILE = _ROOT / "data" / "overnight_pipeline_state.json"
 _REPORT_DIR = _ROOT / "run"
 _LOCK = threading.RLock()
 _THREAD: threading.Thread | None = None
+_THREAD_TOKEN = ""
 
 HOURLY_SUBMIT_CAP = 15
 MIN_SUBMIT_GAP_SECONDS = 120.0
@@ -76,6 +78,14 @@ def _enabled() -> bool:
         return bool(_load().get("enabled"))
 
 
+def _is_runner(token: str) -> bool:
+    """只有 state.active_runner 指向的线程才能提交/推进流水线。"""
+    try:
+        return str(_load().get("active_runner") or "") == str(token or "")
+    except Exception:
+        return False
+
+
 def _sleep_interruptible(seconds: float) -> None:
     deadline = time.monotonic() + max(0.0, float(seconds))
     while time.monotonic() < deadline:
@@ -115,8 +125,9 @@ def get_status() -> dict:
 def start(*, batches=None, target_success=None, max_attempts=None, liveness_at=None) -> dict:
     with _LOCK:
         st = _load()
-        if st.get("enabled") and st.get("status") == "running":
+        if st.get("enabled") and st.get("status") == "running" and _THREAD is not None and _THREAD.is_alive():
             return get_status()
+        runner_token = uuid.uuid4().hex
         st = {
             "enabled": True,
             "status": "running",
@@ -139,10 +150,11 @@ def start(*, batches=None, target_success=None, max_attempts=None, liveness_at=N
             "accounts": st.get("accounts") or [],
             "log": st.get("log") or [],
             "last_error": None,
+            "active_runner": runner_token,
         }
-        _log(st, "流水线启动")
+        _log(st, "流水线启动（runner=%s）" % runner_token[:8])
         _save(st)
-    _ensure_thread()
+    _ensure_thread(runner_token)
     return get_status()
 
 
@@ -163,43 +175,58 @@ def stop() -> dict:
 
 def ensure_started() -> None:
     st = _load()
-    if st.get("enabled") and st.get("status") == "running":
-        _ensure_thread()
+    if not (st.get("enabled") and st.get("status") == "running"):
+        return
+    token = str(st.get("active_runner") or "")
+    if not token:
+        token = uuid.uuid4().hex
+        st["active_runner"] = token
+        _save(st)
+    _ensure_thread(token)
 
 
-def _ensure_thread() -> None:
-    global _THREAD
+def _ensure_thread(token: str) -> None:
+    global _THREAD, _THREAD_TOKEN
     with _LOCK:
-        if _THREAD is not None and _THREAD.is_alive():
+        if (
+            _THREAD is not None
+            and _THREAD.is_alive()
+            and _THREAD_TOKEN == str(token or "")
+        ):
             return
-        _THREAD = threading.Thread(target=_worker, name="overnight-pipeline", daemon=True)
+        _THREAD = threading.Thread(
+            target=_worker, args=(str(token or ""),), name="overnight-pipeline", daemon=True,
+        )
+        _THREAD_TOKEN = str(token or "")
         _THREAD.start()
 
 
-def _worker() -> None:
-    logger.info("[流水线] 线程启动")
+def _worker(token: str) -> None:
+    logger.info("[流水线] 线程启动 runner=%s", str(token or "")[:8])
     try:
         st = _load()
-        if not st.get("enabled"):
+        if not st.get("enabled") or not _is_runner(token):
             return
         st["phase"] = "register"
         _save(st)
-        _register_phase()
+        _register_phase(token)
         st = _load()
-        if st.get("enabled"):
+        if st.get("enabled") and _is_runner(token):
             st["phase"] = "twofa"
             _save(st)
-            _twofa_liveness_phase()
+            _twofa_liveness_phase(token)
         st = _load()
-        if st.get("enabled"):
+        if st.get("enabled") and _is_runner(token):
             if not st.get("liveness_done"):
                 st["phase"] = "liveness"
                 _save(st)
-                _run_liveness()
+                _run_liveness(token)
             _finish("completed")
         else:
-            st["status"] = "stopped"
-            _save(st)
+            st = _load()
+            if _is_runner(token):
+                st["status"] = "stopped"
+                _save(st)
     except Exception as exc:
         logger.exception("[流水线] 异常")
         st = _load()
@@ -289,11 +316,11 @@ def _wait_submit_window(st: dict) -> None:
         _sleep_interruptible(min(wait, 300.0))
 
 
-def _register_phase() -> None:
-    _resume_pending_job()
+def _register_phase(token: str) -> None:
+    _resume_pending_job(token)
     while True:
         st = _load()
-        if not st.get("enabled"):
+        if not st.get("enabled") or not _is_runner(token):
             return
         if int(st.get("successes") or 0) >= int(st.get("target_success") or DEFAULT_TARGET_SUCCESS):
             _log(st, f"注册阶段完成：{st.get('successes')} 个有效账号")
@@ -331,7 +358,7 @@ def _register_phase() -> None:
             _log(st, f"批次 {bi + 1} 提交完毕，进入下一批")
             _save(st)
             continue
-        _register_one(batch)
+        _register_one(batch, token)
         st = _load()
         st["batch_progress"] = int(st.get("batch_progress") or 0) + 1
         _save(st)
@@ -423,8 +450,10 @@ def _finalize_registration_job(job_id: int, job: dict) -> None:
     _save(st)
 
 
-def _resume_pending_job() -> None:
+def _resume_pending_job(token: str) -> None:
     st = _load()
+    if not _is_runner(token):
+        return
     job_id = int(st.get("last_job_id") or 0)
     if not job_id:
         return
@@ -440,10 +469,10 @@ def _resume_pending_job() -> None:
     _finalize_registration_job(job_id, job)
 
 
-def _register_one(batch: dict) -> None:
+def _register_one(batch: dict, token: str) -> None:
     from core import registration_service as svc
     st = _load()
-    if not st.get("enabled"):
+    if not st.get("enabled") or not _is_runner(token):
         return
     jobs = svc.submit_registration(count=1, workers=1)
     job_id = int((jobs[0] or {}).get("id") or 0)
@@ -471,10 +500,10 @@ def _liveness_deadline(st: dict) -> datetime:
     return _now().replace(hour=hh, minute=mm, second=0)
 
 
-def _twofa_liveness_phase() -> None:
+def _twofa_liveness_phase(token: str) -> None:
     while True:
         st = _load()
-        if not st.get("enabled"):
+        if not st.get("enabled") or not _is_runner(token):
             return
         dead = _liveness_deadline(st)
         if not st.get("liveness_done") and _now() >= dead:
@@ -532,9 +561,11 @@ def _twofa_liveness_phase() -> None:
         _save(st)
 
 
-def _run_liveness() -> None:
+def _run_liveness(token: str = "") -> None:
     from core import db, plan_check_service, live_check_service
     st = _load()
+    if token and not _is_runner(token):
+        return
     accounts = list(st.get("accounts") or [])
     _log(st, f"开始查活（{len(accounts)} 个账号）")
     _save(st)
