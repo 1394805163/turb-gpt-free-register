@@ -1158,12 +1158,38 @@ def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, ti
 
 
 def _is_mfa_challenge_page(driver) -> bool:
-    """检测是否进入 2FA（mfa-challenge）页面。"""
+    """检测是否进入 2FA（mfa-challenge）页面。
+
+    注意：SPA 有时先换内容、URL 还没变（实测 /log-in/password 上已显示
+    "Check your authenticator app"），只看 URL 会漏判，导致提交密码后傻等。
+    因此 URL 不匹配时再按 DOM 内容判定：有可见验证码输入框 + 页面文案提到
+    authenticator / 身份验证器。
+    """
     try:
         url = str(driver.current_url or "").lower()
     except Exception:
+        url = ""
+    if "mfa-challenge" in url or "mfa_challenge" in url:
+        return True
+    try:
+        looks_mfa = driver.execute_script(r"""
+        const vis = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+        const hasCodeInput = [...document.querySelectorAll('input')].some(el => {
+          if (!vis(el)) return false;
+          const name = String(el.name || '').toLowerCase();
+          const ac = String(el.getAttribute('autocomplete') || '').toLowerCase();
+          const ml = String(el.getAttribute('maxlength') || '');
+          return name === 'code' || ac === 'one-time-code' || ml === '6';
+        });
+        if (!hasCodeInput) return false;
+        const text = (document.body.innerText || '').toLowerCase();
+        return text.includes('authenticator') || text.includes('authentication code')
+          || text.includes('验证器') || text.includes('身份验证') || text.includes('mfa');
+        """)
+        return bool(looks_mfa)
+    except Exception:
         return False
-    return "mfa-challenge" in url or "mfa_challenge" in url
 
 
 def _fill_login_password_if_present(driver, email: str, timeout: int = 25) -> bool:

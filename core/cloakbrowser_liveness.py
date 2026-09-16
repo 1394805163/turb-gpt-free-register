@@ -105,17 +105,31 @@ def run_cloak_liveness_flow(
             mfa_deadline = time.time() + 75
             last_log = 0.0
             while time.time() < mfa_deadline:
-                if _is_mfa_challenge_page(driver):
-                    logger.info("[Cloak查活] 密码提交后进入 2FA 挑战页，提交本地 TOTP")
-                    _pass_mfa_challenge_if_needed(driver, email, timeout=30)
-                    break
                 if _is_chatgpt_logged_in_page(driver):
                     logger.info("[Cloak查活] 密码登录后已检测到登录态")
+                    break
+                if _is_mfa_challenge_page(driver):
+                    logger.info("[Cloak查活] 密码提交后进入 2FA 挑战页，提交本地 TOTP")
+                    try:
+                        _pass_mfa_challenge_if_needed(driver, email, timeout=30)
+                    except Exception as exc:
+                        logger.info("[Cloak查活] 2FA 提交异常（继续观察登录态）：%s", type(exc).__name__)
+                    # TOTP 提交后等页面跳到登录态，再退出轮询（避免对着残留页面重复提交）。
+                    settle_end = time.time() + 25
+                    while time.time() < settle_end and not _is_chatgpt_logged_in_page(driver):
+                        time.sleep(1.0)
                     break
                 if time.time() - last_log >= 8:
                     last_log = time.time()
                     logger.info("[Cloak查活] 等待密码登录跳转：url=%s", str(getattr(driver, 'current_url', '') or '')[:120])
                 time.sleep(1.0)
+            # 密码（+2FA）已走完：直接读 session，不再进入邮箱取码等待。
+            if _is_chatgpt_logged_in_page(driver):
+                session_info = _fetch_chatgpt_session(
+                    driver,
+                    timeout=_setting_int("CLOAK_SESSION_TIMEOUT", 90, 30),
+                )
+                return _session_result(session_info, proxy=proxy, opened=opened)
 
         if not _is_email_verification_page(driver) and _is_chatgpt_logged_in_page(driver):
             session_info = _fetch_chatgpt_session(
@@ -134,7 +148,10 @@ def run_cloak_liveness_flow(
             if current_otp is None:
                 if _is_mfa_challenge_page(driver):
                     logger.info("[Cloak查活][OTP] 页面为 2FA 挑战页，先提交本地 TOTP 动态码")
-                    _pass_mfa_challenge_if_needed(driver, email, timeout=30)
+                    try:
+                        _pass_mfa_challenge_if_needed(driver, email, timeout=30)
+                    except Exception as exc:
+                        logger.info("[Cloak查活][OTP] 2FA 提交异常，转入取码等待：%s", type(exc).__name__)
                     if _is_chatgpt_logged_in_page(driver):
                         logger.info("[Cloak查活][OTP] 2FA 通过后已是登录态，跳过取码")
                         break
