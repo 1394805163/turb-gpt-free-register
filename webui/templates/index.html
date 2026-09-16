@@ -2274,7 +2274,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCpaV2" title="有勾选时导出勾选账号；未勾选时导出当前筛选结果中的完整 OAuth 凭据，并打包 ZIP">导出完整OAuth</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCredentialsV2" title="有勾选时导出勾选账号；未勾选时导出当前筛选结果，兼容完整 OAuth 和仅 access_token 账号">导出账号凭据</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnImportOAuthV2" title="导入账号凭据 JSON 或 ZIP；兼容完整 OAuth 和仅 access_token，且不需要勾选账号">导入账号凭据</button>
-          <input type="file" id="oauthImportFileV2" accept=".json,.zip,application/json,application/zip" hidden>
+          <input type="file" id="oauthImportFileV2" accept=".json,.zip,.txt,application/json,application/zip,text/plain" hidden>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnStopSelectedCodexV2" disabled title="停止选中账号中正在补跑的 Codex 授权">停止</button>
         </div>
         <div class="acc-v2-btn-group">
@@ -4718,6 +4718,20 @@ async function importOAuthFile(event) {
   const file = input && input.files ? input.files[0] : null;
   if (!file) return;
   input.value = '';
+  if (String(file.name || '').toLowerCase().endsWith('.txt')) {
+    try {
+      const text = await file.text();
+      const r = await api('/api/accounts/import-password-login', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text}),
+      });
+      showToast(`账密+2FA 导入已入队：${r.queued || 0} 个（协议登录验证中）`);
+      pollPwdLoginStatus();
+    } catch (error) {
+      showToast('账密导入失败: ' + error.message);
+    }
+    return;
+  }
   const body = new FormData();
   body.append('file', file);
   try {
@@ -4775,6 +4789,18 @@ async function pollPasswordFixStatus() {
   } catch (e) { /* ignore */ }
 }
 
+async function pollPwdLoginStatus() {
+  try {
+    const r = await api('/api/accounts/import-password-login/status');
+    if (r.running) {
+      showToast(`协议登录验证：${r.done}/${r.total}（当前 ${r.current || '-'}）`);
+      setTimeout(pollPwdLoginStatus, 20000);
+    } else if (r.total) {
+      showToast(`协议登录验证完成：成功 ${r.ok}，失败 ${r.failed}`);
+      await loadAccounts();
+    }
+  } catch (e) { /* ignore */ }
+}
 async function checkOnePlan(id, btn) {
   btn.disabled = true;
   const old = btn.textContent;

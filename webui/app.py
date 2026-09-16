@@ -3420,6 +3420,123 @@ def create_app(auth_code: str | None = None) -> Flask:
     def api_registration_schedule_cancel():
         return jsonify({"ok": True, **registration_scheduler.cancel_schedule()})
 
+    _pwd_login_state: dict = {
+        "running": False, "total": 0, "done": 0, "ok": 0, "failed": 0,
+        "current": "", "started_at": None, "finished_at": None, "results": [],
+    }
+    _pwd_login_lock = threading.Lock()
+
+    def _parse_password_line(raw: str):
+        text = str(raw or "").strip()
+        if not text or text.startswith("#"):
+            return None
+        for sep in ("----", "\t", "||", ","):
+            if sep in text:
+                parts = [p.strip() for p in text.split(sep)]
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    return parts[0].lower(), parts[1], (parts[2] if len(parts) > 2 else "")
+        return None
+
+    def _pwd_login_worker(items) -> None:
+        from core import db as _db
+        from core.password_login import login_with_password
+        for email, password, totp in items:
+            with _pwd_login_lock:
+                _pwd_login_state["current"] = email
+            entry = {"email": email, "ok": False}
+            try:
+                acc = _db.get_account_by_email(email) or {}
+                country = str(acc.get("proxy_exit_country") or "")
+                res = login_with_password(
+                    email, password, totp_secret=totp, country_hint=country,
+                    write_back=False, timeout=30,
+                )
+                entry["ok"] = bool(res.get("ok"))
+                if res.get("ok"):
+                    credential = {
+                        "access_token": res["access_token"],
+                        "refresh_token": res["refresh_token"],
+                        "id_token": res["id_token"],
+                        "oauth_client_id": "app_2SKx67EdpoN0G6j64rFvigXD",
+                        "source": "password_login",
+                        "expires_at": res.get("expires_at"),
+                    }
+                    if acc:
+                        _db.update_account_registration_password(email, password)
+                        if totp:
+                            _db.update_account_totp_secret(email, totp)
+                        old_at = str(acc.get("access_token") or acc.get("chatgpt_oauth_access_token") or "")
+                        entry["write"] = _db.update_account_chatgpt_oauth(email, credential, expected_access_token=old_at)
+                    else:
+                        _db.insert_account(
+                            email=email,
+                            access_token=res["access_token"],
+                            totp_secret=totp or None,
+                            chatgpt_oauth={
+                                "access_token": res["access_token"],
+                                "refresh_token": res["refresh_token"],
+                                "id_token": res["id_token"],
+                            },
+                            email_source="import_password",
+                        )
+                        _db.update_account_registration_password(email, password)
+                        entry["write"] = _db.update_account_chatgpt_oauth(email, credential, expected_access_token=res["access_token"])
+                else:
+                    entry["error"] = str(res.get("error") or "")[:200]
+            except Exception as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            with _pwd_login_lock:
+                _pwd_login_state["done"] += 1
+                _pwd_login_state["ok" if entry["ok"] else "failed"] += 1
+                _pwd_login_state["results"].append(entry)
+            time.sleep(15)
+        with _pwd_login_lock:
+            _pwd_login_state["running"] = False
+            _pwd_login_state["current"] = ""
+            _pwd_login_state["finished_at"] = _pipe_now_iso()
+
+    @app.post("/api/accounts/import-password-login")
+    def api_accounts_import_password_login():
+        """账密+2FA 导入并自动协议登录验证（纯协议，不启动浏览器）。
+        body: {"text": "email----password----totp"} 或 {"accounts": [{"email","password","totp_secret"}]}"""
+        data = request.get_json(silent=True) or {}
+        items = []
+        seen = set()
+        raw_accounts = data.get("accounts")
+        if isinstance(raw_accounts, list):
+            for row in raw_accounts:
+                if not isinstance(row, dict):
+                    continue
+                email = str(row.get("email") or "").strip().lower()
+                password = str(row.get("password") or "").strip()
+                totp = str(row.get("totp_secret") or row.get("totp") or "").strip()
+                if email and password and email not in seen:
+                    seen.add(email)
+                    items.append((email, password, totp))
+        else:
+            for line in str(data.get("text") or "").replace("\r", "\n").split("\n"):
+                parsed = _parse_password_line(line)
+                if parsed and parsed[0] not in seen:
+                    seen.add(parsed[0])
+                    items.append(parsed)
+        if not items:
+            return jsonify({"ok": False, "error": "没有解析到有效账号行（email----password----totp）"}), 400
+        with _pwd_login_lock:
+            if _pwd_login_state["running"]:
+                return jsonify({"ok": False, "error": "协议登录验证任务正在运行，请稍后再试"}), 409
+            _pwd_login_state.update({
+                "running": True, "total": len(items), "done": 0, "ok": 0, "failed": 0,
+                "current": "", "results": [], "finished_at": None,
+                "started_at": _pipe_now_iso(),
+            })
+        threading.Thread(target=_pwd_login_worker, args=(items,), name="password-login-verify", daemon=True).start()
+        return jsonify({"ok": True, "queued": len(items)})
+
+    @app.get("/api/accounts/import-password-login/status")
+    def api_accounts_import_password_login_status():
+        with _pwd_login_lock:
+            return jsonify({"ok": True, **_pwd_login_state})
+
     @app.get("/api/registration/pipeline")
     def api_registration_pipeline_status():
         return jsonify({"ok": True, **overnight_pipeline.get_status()})

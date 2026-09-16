@@ -127,6 +127,7 @@ def start(*, batches=None, target_success=None, max_attempts=None, liveness_at=N
             "batch_index": int(st.get("batch_index") or 0),
             "batch_progress": int(st.get("batch_progress") or 0),
             "applied_batch": st.get("applied_batch"),
+            "last_job_id": st.get("last_job_id"),
             "submitted_at": st.get("submitted_at") or [],
             "last_submit_at": 0,
             "attempts": int(st.get("attempts") or 0),
@@ -289,6 +290,7 @@ def _wait_submit_window(st: dict) -> None:
 
 
 def _register_phase() -> None:
+    _resume_pending_job()
     while True:
         st = _load()
         if not st.get("enabled"):
@@ -335,43 +337,32 @@ def _register_phase() -> None:
         _save(st)
 
 
-def _register_one(batch: dict) -> None:
+def _wait_job_terminal(job_id: int) -> dict | None:
     from core import db, registration_service as svc
-    st = _load()
-    if not st.get("enabled"):
-        return
-    jobs = svc.submit_registration(count=1, workers=1)
-    job_id = int((jobs[0] or {}).get("id") or 0)
-    st = _load()
-    st.setdefault("submitted_at", []).append(time.time())
-    st["last_submit_at"] = time.time()
-    st["attempts"] = int(st.get("attempts") or 0) + 1
-    _log(st, f"提交注册任务 #{job_id}（driver={batch.get('driver')} country={batch.get('country')}）")
-    _save(st)
-    if not job_id:
-        return
     deadline = time.monotonic() + REG_JOB_WAIT_SECONDS
-    job: dict = {}
     while True:
         job = db.get_job(job_id) or {}
         status = str(job.get("status") or "")
         if status in ("success", "failed", "stopped", "cancelled"):
-            break
+            return job
         if not _enabled():
             try:
                 svc.request_stop_job(job_id)
             except Exception:
                 pass
-            return
+            return None
         if time.monotonic() > deadline:
             _log(_load(), f"任务 #{job_id} 等待超时，请求停止")
             try:
                 svc.request_stop_job(job_id)
             except Exception:
                 pass
-            job = db.get_job(job_id) or job
-            break
+            return db.get_job(job_id) or job
         time.sleep(5)
+
+
+def _finalize_registration_job(job_id: int, job: dict) -> None:
+    from core import db
     email = str(job.get("email") or "").strip()
     account = db.get_account_by_email(email) if email else None
     if account is None and job.get("account_id"):
@@ -383,9 +374,17 @@ def _register_one(batch: dict) -> None:
     if account:
         token = str(account.get("chatgpt_oauth_access_token") or account.get("access_token") or "").strip()
         email = str(account.get("email") or email)
+    st = _load()
+    recorded = {str(a.get("email") or "") for a in st.get("accounts") or []}
+    if email and email in recorded:
+        if int(st.get("last_job_id") or 0) == int(job_id):
+            st["last_job_id"] = None
+            _save(st)
+        return
     if not (email and account and token):
-        st = _load()
         _log(st, f"任务 #{job_id} 未产出有效账号（status={job.get('status')} email={email or '-'}）")
+        if int(st.get("last_job_id") or 0) == int(job_id):
+            st["last_job_id"] = None
         _save(st)
         return
     password_status = "failed"
@@ -418,8 +417,49 @@ def _register_one(batch: dict) -> None:
         "twofa_status": "pending",
     })
     st["successes"] = int(st.get("successes") or 0) + 1
+    if int(st.get("last_job_id") or 0) == int(job_id):
+        st["last_job_id"] = None
     _log(st, f"账号 {email} 注册成功，补密码={password_status}")
     _save(st)
+
+
+def _resume_pending_job() -> None:
+    st = _load()
+    job_id = int(st.get("last_job_id") or 0)
+    if not job_id:
+        return
+    from core import db
+    job = db.get_job(job_id) or {}
+    status = str(job.get("status") or "")
+    if status in ("pending", "running", "stopping") and st.get("enabled"):
+        _log(st, f"检测到未完成任务 #{job_id}，继续等待")
+        _save(st)
+        job = _wait_job_terminal(job_id)
+    if job is None:
+        return
+    _finalize_registration_job(job_id, job)
+
+
+def _register_one(batch: dict) -> None:
+    from core import registration_service as svc
+    st = _load()
+    if not st.get("enabled"):
+        return
+    jobs = svc.submit_registration(count=1, workers=1)
+    job_id = int((jobs[0] or {}).get("id") or 0)
+    st = _load()
+    st.setdefault("submitted_at", []).append(time.time())
+    st["last_submit_at"] = time.time()
+    st["attempts"] = int(st.get("attempts") or 0) + 1
+    st["last_job_id"] = job_id
+    _log(st, f"提交注册任务 #{job_id}（driver={batch.get('driver')} country={batch.get('country')}）")
+    _save(st)
+    if not job_id:
+        return
+    job = _wait_job_terminal(job_id)
+    if job is None:
+        return
+    _finalize_registration_job(job_id, job)
 
 
 def _liveness_deadline(st: dict) -> datetime:
@@ -451,6 +491,24 @@ def _twofa_liveness_phase() -> None:
             continue
         target = pending[0]
         email = str(target.get("email") or "")
+        if not target.get("password_ok") and not target.get("password_retried"):
+            retry_status = "failed"
+            try:
+                from core.account_password import set_account_password
+                rr = set_account_password(email) or {}
+                retry_status = "ok" if rr.get("ok") else str(rr.get("status") or "failed")
+            except Exception as exc:
+                retry_status = f"error:{type(exc).__name__}"
+            st = _load()
+            for a in st.get("accounts") or []:
+                if a.get("email") == email:
+                    a["password_retried"] = True
+                    if retry_status == "ok":
+                        a["password_ok"] = True
+                        a["password_status"] = "ok_retry"
+            _log(st, f"补密码重试 {email}: {retry_status}")
+            _save(st)
+            continue
         status = "failed"
         secret = ""
         try:
