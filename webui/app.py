@@ -28,7 +28,7 @@ from webui import config_editor
 
 logger = logging.getLogger(__name__)
 
-_POOL_SOURCE_VALUES = frozenset(("all", "outlook", "generic_api", "imap", "cloudflare_domain"))
+_POOL_SOURCE_VALUES = frozenset(("all", "outlook", "generic_api", "imap", "cloudflare_domain", "icloud"))
 
 
 def _pool_source_arg(default: str = "outlook") -> str:
@@ -37,6 +37,21 @@ def _pool_source_arg(default: str = "outlook") -> str:
         data = request.get_json(silent=True) or {}
         src = str(data.get("source") or data.get("type") or "").strip().lower()
     return src if src in _POOL_SOURCE_VALUES else default
+
+
+def _icloud_mail_client():
+    """iCloud 隐藏邮箱池是文件存储（core.icloud_mail_client），不在 SQLite email_pool 表里。"""
+    from core import icloud_mail_client
+
+    return icloud_mail_client
+
+
+def _icloud_pool_summary() -> dict:
+    try:
+        return dict(_icloud_mail_client().mailbox_summary() or {})
+    except Exception:
+        logger.exception("读取 iCloud 邮箱池统计失败")
+        return {"total": 0, "available": 0, "in_use": 0, "used": 0, "failed": 0, "disabled": 0}
 
 
 def _with_pool_source(rows: list[dict], source: str) -> list[dict]:
@@ -310,6 +325,18 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    try:
+        from core.icloud_mail_client import _mailboxes_path as _icloud_mailboxes_path
+        from core.icloud_mail_client import sync_registered_mailboxes as _sync_icloud_mailboxes
+
+        if _icloud_mailboxes_path().is_file():
+            _icloud_sync = _sync_icloud_mailboxes(db.list_accounts(limit=1_000_000, archived="all"))
+            if _icloud_sync.get("accounts"):
+                logger.info("已同步注册账号到 iCloud 邮箱池: %s", _icloud_sync)
+        else:
+            logger.info("iCloud 邮箱池文件不存在，跳过启动回填")
+    except Exception:
+        logger.exception("启动时同步注册账号到 iCloud 邮箱池失败")
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
@@ -364,6 +391,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 db.generic_api_email_pool_summary() if src == "generic_api"
                 else db.imap_email_pool_summary() if src == "imap"
                 else db.domain_email_pool_summary() if src == "cloudflare_domain"
+                else _icloud_pool_summary() if src == "icloud"
                 else db.outlook_pool_summary()
             )
             for k in pool:
@@ -1595,6 +1623,35 @@ def create_app(auth_code: str | None = None) -> Flask:
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
+        if source == "icloud":
+            fetch_all = bool(paged or q or page_arg is not None or page_size_arg is not None)
+            rows = _with_pool_source(
+                _icloud_mail_client().list_mailboxes(
+                    status=status, limit=1_000_000 if fetch_all else max(1, int(limit or 1))
+                ),
+                "icloud",
+            )
+            if q:
+                ql = q.lower()
+                rows = [r for r in rows if ql in str(r.get("email") or "").lower() or ql in str(r.get("label") or "").lower() or ql in str(r.get("note") or "").lower()]
+            if fetch_all:
+                page = max(1, int(page_arg or 1))
+                page_size = max(1, min(500, int(page_size_arg or limit or 50)))
+                start = (page - 1) * page_size
+                return jsonify({"ok": True, "items": rows[start:start + page_size], "total": len(rows), "page": page, "page_size": page_size})
+            return jsonify(rows[: max(1, int(limit or 1))])
+        if source == "all" and (paged or q or page_arg is not None or page_size_arg is not None):
+            page = max(1, int(page_arg or 1))
+            page_size = max(1, min(500, int(page_size_arg or limit or 50)))
+            db_page = db.list_email_pool_page(source="all", status=status, q=q, limit=1_000_000, offset=0)
+            rows = list(db_page.get("items") or [])
+            rows += _with_pool_source(_icloud_mail_client().list_mailboxes(status=status, limit=1_000_000), "icloud")
+            if q:
+                ql = q.lower()
+                rows = [r for r in rows if ql in str(r.get("email") or "").lower() or ql in str(r.get("label") or "").lower() or ql in str(r.get("note") or "").lower()]
+            rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
+            start = (page - 1) * page_size
+            return jsonify({"ok": True, "items": rows[start:start + page_size], "total": len(rows), "page": page, "page_size": page_size})
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
@@ -1621,10 +1678,15 @@ def create_app(auth_code: str | None = None) -> Flask:
         """
         data = request.get_json(silent=True) or {}
         source = (data.get("source") or data.get("type") or "").strip()
-        if source not in ("outlook", "generic_api", "imap"):
-            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API 或通用 IMAP"}), 400
+        if source not in ("outlook", "generic_api", "imap", "icloud"):
+            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API、通用 IMAP 或 iCloud 隐藏邮箱池"}), 400
         text = data.get("text") or ""
         as_registered = bool(data.get("as_registered", False))
+        if source == "icloud":
+            result = _icloud_mail_client().import_mailboxes(text)
+            if not result.get("parsed"):
+                return jsonify({"ok": False, "error": "未解析到有效 iCloud 隐藏邮箱；每行填写 alias@icloud.com 或 alias@icloud.com----标签"}), 400
+            return jsonify(result)
         imap_server = str(data.get("imap_server") or "").strip()
         try:
             imap_port = int(data.get("imap_port") or 993)
@@ -1718,6 +1780,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             db.release_imap_email(email, status=status, note=data.get("note"))
         elif source == "cloudflare_domain":
             db.release_domain_email(email, status=status, note=data.get("note"))
+        elif source == "icloud":
+            _icloud_mail_client().set_mailbox_status(email, status, note=data.get("note"))
         else:
             db.release_outlook(email, status=status, note=data.get("note"))
         return jsonify({"ok": True})
@@ -1763,6 +1827,8 @@ def create_app(auth_code: str | None = None) -> Flask:
                     db.release_imap_email(email, status=status, note=note)
                 elif item_source == "cloudflare_domain":
                     db.release_domain_email(email, status=status, note=note)
+                elif item_source == "icloud":
+                    _icloud_mail_client().set_mailbox_status(email, status, note=note)
                 else:
                     db.release_outlook(email, status=status, note=note)
                 updated.append({"email": email, "source": item_source, "status": status})
@@ -1790,7 +1856,10 @@ def create_app(auth_code: str | None = None) -> Flask:
         )
         if source not in _POOL_SOURCE_VALUES:
             return jsonify({"ok": False, "error": "邮箱来源非法"}), 400
-        deleted = db.delete_email_pool(email, source=source)
+        if source == "icloud":
+            deleted = _icloud_mail_client().delete_mailbox(email)
+        else:
+            deleted = db.delete_email_pool(email, source=source)
         return jsonify({"ok": True, "deleted": deleted})
 
     @app.post("/api/outlook/delete-bulk")
@@ -1837,7 +1906,10 @@ def create_app(auth_code: str | None = None) -> Flask:
                 continue
             seen.add(key)
             try:
-                deleted_ok = db.delete_email_pool(email, source=item_source)
+                if item_source == "icloud":
+                    deleted_ok = _icloud_mail_client().delete_mailbox(email)
+                else:
+                    deleted_ok = db.delete_email_pool(email, source=item_source)
             except Exception as exc:
                 skipped.append({
                     "email": email,
@@ -1856,6 +1928,16 @@ def create_app(auth_code: str | None = None) -> Flask:
             "deleted_count": len(deleted),
             "skipped": skipped,
         })
+
+    @app.post("/api/outlook/sync-registered")
+    def api_outlook_sync_registered():
+        """按已注册账号回填 iCloud 邮箱池状态；不删除邮箱、不改账号。"""
+        try:
+            result = _icloud_mail_client().sync_registered_mailboxes(db.list_accounts(limit=1_000_000, archived="all"))
+            return jsonify({"ok": True, **result})
+        except Exception as exc:
+            logger.exception("同步注册账号邮箱池失败")
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
 
     # ----------------------------------------------------------
     # 域名邮箱池（Cloudflare 域名邮箱模式）
@@ -2631,6 +2713,13 @@ def create_app(auth_code: str | None = None) -> Flask:
                     "ok": False,
                     "error": "Remail 服务模式只能填写 code 或 purchase（配置 → 邮箱 / OTP）。",
                 }), 400
+        if "icloud" in sources:
+            icloud_user = str(getattr(_email_cfg, "ICLOUD_IMAP_USERNAME", "") or "").strip()
+            icloud_pass = str(getattr(_email_cfg, "ICLOUD_IMAP_PASSWORD", "") or "").strip()
+            if not icloud_user:
+                return jsonify({"ok": False, "error": "已选择 iCloud 邮箱来源，请填写 iCloud 主邮箱（配置 → 邮箱 / OTP）。"}), 400
+            if not icloud_pass:
+                return jsonify({"ok": False, "error": "已选择 iCloud 邮箱来源，请填写 Apple App 专用密码（配置 → 邮箱 / OTP）。"}), 400
         if "gptmail" in sources or "mailnest" in sources or "cloudmail" in sources or "remail" in sources or "cloudflare" in sources:
             # 临时邮箱在任务开始时动态生成，不需要本地邮箱池容量提示。
             warning = ""
@@ -2649,6 +2738,11 @@ def create_app(auth_code: str | None = None) -> Flask:
             warning = ""
             if pool.get("available", 0) < count:
                 warning = f"通用 IMAP 邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会失败"
+        elif sources == ["icloud"]:
+            pool = _icloud_pool_summary()
+            warning = ""
+            if pool.get("available", 0) < count:
+                warning = f"iCloud 隐藏邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会失败"
         elif len(sources) > 1:
             available = 0
             if "outlook" in sources:
@@ -2657,6 +2751,8 @@ def create_app(auth_code: str | None = None) -> Flask:
                 available += db.generic_api_email_pool_summary().get("available", 0)
             if "imap" in sources:
                 available += db.imap_email_pool_summary().get("available", 0)
+            if "icloud" in sources:
+                available += _icloud_pool_summary().get("available", 0)
             warning = ""
             if available < count:
                 warning = f"多个邮箱池合计仅 {available} 个可用，少于任务数 {count}，不足的会失败"

@@ -2437,6 +2437,7 @@
             <button type="button" class="outlook-v2-select-item" data-value="generic_api" role="option">通用 API 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="imap" role="option">通用 IMAP 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="cloudflare_domain" role="option">域名邮箱池</button>
+            <button type="button" class="outlook-v2-select-item" data-value="icloud" role="option">iCloud 隐藏邮箱池</button>
           </div>
           <input type="hidden" id="poolSourceV2" value="all">
         </div>
@@ -2447,6 +2448,7 @@
         <button type="button" class="jobs-tb-btn" id="btnDisableSelectedOutlookV2" disabled title="批量停用选中的邮箱；停用后不会被注册任务领取">停用选中</button>
         <button type="button" class="jobs-tb-btn" id="btnFailSelectedOutlookV2" disabled title="批量标记选中的邮箱为失败">标失败</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedOutlookV2" disabled title="批量删除选中的邮箱素材">删除选中</button>
+        <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnSyncRegisteredOutlookV2" title="把已注册账号对应的 iCloud 邮箱回填为已用；缺失别名会补入邮箱池">同步已注册</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="copyAllEmailsV2" title="复制当前页全部邮箱素材">复制全部邮箱素材</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnImportOutlookV2" title="导入邮箱素材">导入</button>
       </div>
@@ -2542,6 +2544,7 @@
             <button type="button" class="outlook-v2-select-item is-active" data-value="outlook" role="option">Outlook 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="generic_api" role="option">通用 API 取码邮箱</button>
             <button type="button" class="outlook-v2-select-item" data-value="imap" role="option">通用 IMAP 取码邮箱</button>
+            <button type="button" class="outlook-v2-select-item" data-value="icloud" role="option">iCloud 隐藏邮箱池</button>
           </div>
           <input type="hidden" id="importSourceV2" value="outlook">
         </div>
@@ -5101,6 +5104,7 @@ const POOL_SOURCE_LABELS = {
   generic_api: '通用 API 邮箱池',
   imap: '通用 IMAP 邮箱池',
   cloudflare_domain: '域名邮箱池',
+  icloud: 'iCloud 隐藏邮箱池',
 };
 function setPoolSourceV2(val) {
   const hidden = document.getElementById('poolSourceV2');
@@ -5122,7 +5126,7 @@ function getOutlookQuery() {
 }
 function poolKey(r) { return `${r.source || getPoolSource() || 'all'}|${r.email || ''}`; }
 function poolLabel(src) {
-  return ({outlook:'Outlook', generic_api:'通用API', imap:'通用IMAP', cloudflare_domain:'域名邮箱'})[src] || src || '-';
+  return ({outlook:'Outlook', generic_api:'通用API', imap:'通用IMAP', cloudflare_domain:'域名邮箱', icloud:'iCloud'})[src] || src || '-';
 }
 async function loadOutlook() {
   try {
@@ -5238,7 +5242,7 @@ function onPoolSourceChange(el) {
   PAGERS.outlook.page = 1;
   OUTLOOK_SELECTED.clear();
   const val = el ? el.value : getPoolSource();
-  if (val === 'outlook' || val === 'generic_api' || val === 'imap') setImportSourceV2(val);
+  if (val === 'outlook' || val === 'generic_api' || val === 'imap' || val === 'icloud') setImportSourceV2(val);
   loadOutlook();
 }
 function syncOutlookSelectAll(checked) {
@@ -5340,6 +5344,13 @@ async function onOutlookBodyClick(e) {
   bind('btnFailSelectedOutlookV2', () => bulkMarkOutlookStatus('failed'));
   bind('btnDeleteSelectedOutlookV2', deleteSelectedOutlook);
   bind('btnImportOutlookV2', openOutlookImportModal);
+  bind('btnSyncRegisteredOutlookV2', async () => {
+    try {
+      const r = await api('/api/outlook/sync-registered', { method:'POST' });
+      showToast(`同步完成：已注册 ${r.accounts ?? 0} 个，回填已用 ${r.marked_used ?? 0}，补入 ${r.inserted ?? 0}`);
+      loadOutlook(); loadSummary();
+    } catch(err) { showToast('同步失败: ' + err.message); }
+  });
   bind('copyAllEmailsV2', () => copyText(OUTLOOK.map(r=>r.copy_line).filter(Boolean).join('\n')));
   document.addEventListener('click', (e) => {
     if (e.target.closest('.outlook-table-v2 .acc-v2-more')) return;
@@ -5354,6 +5365,7 @@ const IMPORT_SOURCE_LABELS = {
   outlook: 'Outlook 邮箱池',
   generic_api: '通用 API 取码邮箱',
   imap: '通用 IMAP 取码邮箱',
+  icloud: 'iCloud 隐藏邮箱池',
 };
 function setImportSourceV2(val) {
   const hidden = document.getElementById('importSourceV2');
@@ -5373,12 +5385,19 @@ function setImportSourceV2(val) {
     imapSettings.classList.toggle('hidden', next !== 'imap');
     imapSettings.style.display = next === 'imap' ? 'grid' : 'none';
   }
+  const registeredToggle = document.getElementById('importAsRegisteredV2');
+  if (registeredToggle) {
+    registeredToggle.disabled = next === 'icloud';
+    registeredToggle.checked = next !== 'icloud';
+  }
   const text = document.getElementById('importTextV2');
   if (text) text.placeholder = next === 'imap'
     ? 'user@example.com----imapPassword\nuser2@example.com:imapPassword'
     : next === 'generic_api'
       ? 'email----取码地址'
-      : 'email----password----clientId----refreshToken';
+      : next === 'icloud'
+        ? 'alias@icloud.com\nalias2@icloud.com----标签'
+        : 'email----password----clientId----refreshToken';
 }
 function openOutlookImportModal() {
   const modal = $('#outlookImportModal');
@@ -5386,7 +5405,7 @@ function openOutlookImportModal() {
   const result = $('#importResultV2');
   if (result) result.innerHTML = '';
   const pool = getPoolSource();
-  if (pool === 'outlook' || pool === 'generic_api' || pool === 'imap') setImportSourceV2(pool);
+  if (pool === 'outlook' || pool === 'generic_api' || pool === 'imap' || pool === 'icloud') setImportSourceV2(pool);
   else setImportSourceV2('outlook');
   modal.classList.remove('hidden');
   updateModalScrollLock();
@@ -5452,7 +5471,7 @@ async function doImportOutlook() {
   if (submitBtn) submitBtn.disabled = true;
   try {
     const source = sourceEl ? sourceEl.value : 'outlook';
-    const as_registered = registeredEl ? !!registeredEl.checked : false;
+    const as_registered = source === 'icloud' ? false : (registeredEl ? !!registeredEl.checked : false);
     const payload = {text, source, as_registered};
     if (source === 'imap') {
       payload.imap_server = ($('#imapServerV2')?.value || '').trim();
