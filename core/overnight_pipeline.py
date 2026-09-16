@@ -338,7 +338,8 @@ def _register_phase(token: str) -> None:
             batch = {
                 "count": 1,
                 "driver": "protocol_page" if attempt_no % 2 else "cloak",
-                "country": ["SG", "JP", "US"][attempt_no % 3],
+                # 并集：mihomo 透明路由的实测出口国家可能与节点国别不一致（IPv6 出道）
+                "country": ["SG,US", "JP,US", "US"][attempt_no % 3],
             }
         else:
             batch = batches[bi]
