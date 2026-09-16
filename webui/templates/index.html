@@ -2263,14 +2263,18 @@
       <div class="jobs-toolbar-v2" id="accountsToolbarV2">
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">套餐/提链</span>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive(null, this, 'protocol')" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
+          <button type="button" class="jobs-tb-btn" id="btnCheckSelectedLiveClassicV2" onclick="checkSelectedLive(null, this, 'classic')" title="传统查活：按当前注册驱动走完整登录流程（浏览器 OTP / 协议 OTP）">查活·传统</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
         </div>
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">Codex</span>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnRetrySelectedCodexV2" disabled title="给选中的账号批量补跑 Codex 授权">补跑</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCpaV2" disabled title="从 CPA auth-files 下载选中账号的 Codex JSON，并打包 ZIP">下载CPA</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCpaV2" title="有勾选时导出勾选账号；未勾选时导出当前筛选结果中的完整 OAuth 凭据，并打包 ZIP">导出完整OAuth</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCredentialsV2" title="有勾选时导出勾选账号；未勾选时导出当前筛选结果，兼容完整 OAuth 和仅 access_token 账号">导出账号凭据</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnImportOAuthV2" title="导入账号凭据 JSON 或 ZIP；兼容完整 OAuth 和仅 access_token，且不需要勾选账号">导入账号凭据</button>
+          <input type="file" id="oauthImportFileV2" accept=".json,.zip,application/json,application/zip" hidden>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnStopSelectedCodexV2" disabled title="停止选中账号中正在补跑的 Codex 授权">停止</button>
         </div>
         <div class="acc-v2-btn-group">
@@ -2278,6 +2282,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnSetupSelectedTotpV2" disabled title="给选中的账号批量开启 2FA，并在完成后写回 TOTP 密钥">批量开2FA</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnChangeSelectedEmailsV2" disabled title="为选中的账号从指定邮箱来源领取新邮箱并换绑">批量换邮箱</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnNoteSelectedAccountsV2" disabled title="给选中的账号统一设置备注，留空可清空备注">备注</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnSetPasswordV2" disabled title="给选中账号补设密码（无头浏览器逐个执行，约 1.5-2 分钟/个）">补密码</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLinesV2" disabled title="复制选中账号的完整整行，每个账号一行">复制行</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedTokensV2" disabled title="复制选中账号的 Token，每个账号一行">复制Token</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedEmailsV2" disabled title="复制选中账号的邮箱，每个账号一行">复制邮箱</button>
@@ -2631,6 +2636,7 @@ let SHOW_PLUS_ACCOUNTS_ONLY = false;
 let SHOW_PLUS_TRIAL_ACCOUNTS_ONLY = false;
 let SHOW_FREE_ACCOUNTS_ONLY = false;
 const ACCOUNT_SELECTED = new Set();
+const ACCOUNT_CACHE = new Map();
 const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
 let JOBS_TOTAL = 0;
@@ -3327,6 +3333,119 @@ async function loadAccounts() {
   } catch(e) { showToast('加载账号失败: ' + e.message); }
   finally { accountsLoading = false; }
 }
+function getAccountById(id) {
+  return ACCOUNT_CACHE.get(Number(id)) || ACCOUNTS.find(row => Number(row.id) === Number(id)) || null;
+}
+
+function hasCompleteOAuthCredential(account) {
+  if (!account) return false;
+  // 紧凑列表不会下发敏感凭据；OAuth 状态已成功时不应回退到历史 Codex 状态。
+  if (String(account.oauth_status || '').trim().toLowerCase() === 'success') return true;
+  const source = String(account.email_source || '').trim().toLowerCase();
+  const mailboxSources = new Set(['outlook', 'generic_api', 'cloudmail', 'mailnest', 'cloudflare', 'cloudflare_domain']);
+  const refreshToken = String(
+    account.chatgpt_refresh_token
+    || (!mailboxSources.has(source) ? account.refresh_token : '')
+    || ''
+  ).trim();
+  return Boolean(
+    String(account.chatgpt_oauth_access_token || account.access_token || '').trim()
+    && refreshToken
+    && String(account.chatgpt_id_token || account.id_token || '').trim()
+  );
+}
+
+function accountSelectionQuery(page, pageSize) {
+  const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
+  const plan = getAccountsPlanFilter();
+  const codex = getAccountsCodexFilter();
+  const totp = getAccountsTotpFilter();
+  const q = getAccountsQuery();
+  const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
+  const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
+  return `/api/accounts?paged=1&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`;
+}
+
+async function fetchAllAccountRowsForSelection() {
+  const pageSize = 500;
+  const rows = [];
+  let page = 1;
+  let total = 0;
+  do {
+    const res = await api(accountSelectionQuery(page, pageSize));
+    const items = Array.isArray(res.items) ? res.items : [];
+    items.forEach(row => {
+      ACCOUNT_CACHE.set(Number(row.id), row);
+      rows.push(row);
+    });
+    total = Number(res.total || rows.length);
+    page += 1;
+    if (!items.length) break;
+  } while (rows.length < total);
+  return rows;
+}
+
+async function resolveAccountSelectionIds() {
+  if (ACCOUNT_SELECTED.size) return Array.from(ACCOUNT_SELECTED).map(Number);
+  const rows = await fetchAllAccountRowsForSelection();
+  return rows.map(row => Number(row.id)).filter(Number.isFinite);
+}
+
+async function fetchAllJobRowsForSelection() {
+  const pageSize = 500;
+  const rows = [];
+  let page = 1;
+  let total = 0;
+  do {
+    const res = await api(`/api/jobs?paged=1&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`);
+    const items = Array.isArray(res.items) ? res.items : [];
+    rows.push(...items);
+    total = Number(res.total || rows.length);
+    page += 1;
+    if (!items.length) break;
+  } while (rows.length < total);
+  return rows;
+}
+
+async function fetchAllOutlookRowsForSelection() {
+  const source = getPoolSource();
+  const q = getOutlookQuery();
+  const status = getPoolStatus();
+  const pageSize = 500;
+  const rows = [];
+  let page = 1;
+  let total = 0;
+  do {
+    const res = await api(`/api/outlook?paged=1&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&source=${encodeURIComponent(source)}&status=${encodeURIComponent(status)}&q=${encodeURIComponent(q)}`);
+    const items = Array.isArray(res.items) ? res.items : [];
+    rows.push(...items);
+    total = Number(res.total || rows.length);
+    page += 1;
+    if (!items.length) break;
+  } while (rows.length < total);
+  return rows;
+}
+
+async function fetchAllCodexRowsForSelection() {
+  const pageSize = 500;
+  const q = getCodexQuery();
+  const archived = CODEX_SHOW_ARCHIVED ? 'only' : '0';
+  const dateFrom = document.getElementById('dateFromCodexV2')?.value || '';
+  const dateTo = document.getElementById('dateToCodexV2')?.value || '';
+  const rows = [];
+  let page = 1;
+  let total = 0;
+  do {
+    const res = await api(`/api/codex?paged=1&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}&q=${encodeURIComponent(q)}&archived=${encodeURIComponent(archived)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const items = Array.isArray(res.accounts) ? res.accounts : (Array.isArray(res.items) ? res.items : []);
+    rows.push(...items);
+    total = Number(res.total || rows.length);
+    page += 1;
+    if (!items.length) break;
+  } while (rows.length < total);
+  return rows;
+}
+
 async function pollAccountPlanStatuses() {
   if (planStatusLoading || accountsLoading) return;
   planStatusLoading = true;
@@ -3703,8 +3822,8 @@ function updateAccountSelectionUi(pageRows = null) {
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
   const v2Ids = [
     'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
-    'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
-    'btnSetupSelectedTotpV2', 'btnChangeSelectedEmailsV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
+    'btnRetrySelectedCodexV2', 'btnStopSelectedCodexV2',
+    'btnSetupSelectedTotpV2', 'btnChangeSelectedEmailsV2', 'btnNoteSelectedAccountsV2', 'btnSetPasswordV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
   ];
   v2Ids.forEach(id => {
@@ -4546,6 +4665,116 @@ async function downloadSelectedCpa() {
   }
 }
 
+async function downloadSelectedOAuth() {
+  let ids;
+  try { ids = await resolveAccountSelectionIds(); }
+  catch (error) { showToast('读取当前筛选账号失败: ' + error.message); return; }
+  if (ids.length === 0) { showToast('当前筛选结果没有账号'); return; }
+  const selectedAccounts = ids.map(getAccountById).filter(Boolean);
+  const exportIds = selectedAccounts.filter(hasCompleteOAuthCredential).map(a => Number(a.id));
+  if (!exportIds.length) { showToast('当前筛选结果没有已完成 OAuth 的凭据'); return; }
+  const skipped = ids.length - exportIds.length;
+  const scope = ACCOUNT_SELECTED.size ? '已勾选' : '当前筛选结果';
+  let msg = `确定导出${scope}中的 ${exportIds.length} 个账号的完整 OAuth 凭据吗？\n\n每个账号会生成一个 Codex JSON 并打包 ZIP。`;
+  if (skipped) msg += `\n\n${skipped} 个未完成 OAuth 的账号会跳过。`;
+  if (!confirm(msg)) return;
+  const btn = $('#btnDownloadSelectedCpaV2');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '下载中…';
+  try {
+    // 先由服务端准备 ZIP，再用同源 GET 顶层下载。
+    // 这样比隐藏 iframe / blob URL 更像普通用户点击下载，Chrome 不容易挂起或标记“不安全下载”。
+    const r = await api('/api/accounts/download-oauth-bulk', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({account_ids: exportIds, prepare: true}),
+    });
+    if (!r.download_url) throw new Error('服务端未返回下载地址');
+    const a = document.createElement('a');
+    a.href = r.download_url;
+    a.download = r.filename || '';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 1000);
+    showToast(`已生成 OAuth ZIP，开始下载${r.error_count ? `（${r.error_count} 个失败见 manifest）` : ''}`);
+  } catch(err) {
+    showToast('导出 OAuth 失败: ' + err.message);
+  } finally {
+    setTimeout(() => {
+      btn.textContent = old;
+      updateAccountSelectionUi();
+    }, 1200);
+  }
+}
+
+function openOAuthImportPicker() {
+  const input = $('#oauthImportFileV2');
+  if (input) input.click();
+}
+async function importOAuthFile(event) {
+  const input = event.target;
+  const file = input && input.files ? input.files[0] : null;
+  if (!file) return;
+  input.value = '';
+  const body = new FormData();
+  body.append('file', file);
+  try {
+    const response = await fetch('/api/accounts/import-oauth', {method: 'POST', body});
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    showToast(`OAuth导入完成：新增 ${payload.inserted || 0}，更新 ${payload.updated || 0}，跳过 ${payload.skipped || 0}`);
+    await Promise.all([loadAccounts(), loadOutlook(), loadSummary()]);
+  } catch (error) {
+    showToast('OAuth导入失败: ' + error.message);
+  }
+}
+async function downloadSelectedCredentials() {
+  let ids;
+  try { ids = await resolveAccountSelectionIds(); }
+  catch (error) { showToast('读取当前筛选账号失败: ' + error.message); return; }
+  if (!ids.length) { showToast('当前筛选结果没有账号'); return; }
+  const btn = $('#btnDownloadSelectedCredentialsV2');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/accounts/download-credentials-bulk', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({account_ids: ids, prepare: true}),
+    });
+    if (!r.download_url) throw new Error('服务端未返回下载地址');
+    const a = document.createElement('a'); a.href = r.download_url; a.download = r.filename || ''; document.body.appendChild(a); a.click(); a.remove();
+    showToast(`账号凭据导出完成：${r.added_count || 0} 个${r.error_count ? `，失败 ${r.error_count} 个` : ''}`);
+  } catch (error) { showToast('导出账号凭据失败: ' + error.message); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+async function setSelectedPasswords() {
+  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+  if (!ids.length) { showToast('请先勾选账号'); return; }
+  if (!confirm(`确定为勾选的 ${ids.length} 个账号补设密码吗？\n\n无头浏览器逐个执行，约 1.5-2 分钟/个；已有密码的账号自动跳过。`)) return;
+  try {
+    const r = await api('/api/accounts/set-password', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({account_ids: ids, skip_existing: true}),
+    });
+    showToast(`补密码任务已入队：${r.queued || 0} 个`);
+    pollPasswordFixStatus();
+  } catch (e) { showToast('补密码失败: ' + e.message); }
+}
+async function pollPasswordFixStatus() {
+  try {
+    const r = await api('/api/accounts/set-password/status');
+    if (r.running) {
+      showToast(`补密码进行中：${r.done}/${r.total}（当前 ${r.current || '-'}）`);
+      setTimeout(pollPasswordFixStatus, 15000);
+    } else if (r.total) {
+      showToast(`补密码完成：成功 ${r.ok}，失败 ${r.failed}，跳过 ${r.skipped}`);
+      await loadAccounts();
+    }
+  } catch (e) { /* ignore */ }
+}
+
 async function checkOnePlan(id, btn) {
   btn.disabled = true;
   const old = btn.textContent;
@@ -4810,10 +5039,11 @@ async function checkSelectedPlans() {
   }
 }
 
-async function checkSelectedLive(idsArg = null, btnArg = null) {
+async function checkSelectedLive(idsArg = null, btnArg = null, mode = 'protocol') {
   const ids = idsArg || Array.from(ACCOUNT_SELECTED);
   if (ids.length === 0) { showToast('请先选择账号'); return; }
   const workers = getCodexBulkWorkers();
+  const methodLabel = mode === 'classic' ? '传统登录' : '协议(密码+2FA优先)';
   const msg = idsArg ? `确定查活这个账号并刷新最新 AT/accessToken 吗？` : `确定查活选中的 ${ids.length} 个账号吗？
 
 会重新登录邮箱 OTP；登录成功且未封号则标记正常，并刷新最新 AT/accessToken。
@@ -4821,7 +5051,7 @@ async function checkSelectedLive(idsArg = null, btnArg = null) {
 并发线程数：${workers}`;
   if (!confirm(msg)) return;
   const firstAcc = ACCOUNTS.find(a => Number(a.id) === Number(ids[0]));
-  const btn = btnArg || $('#btnCheckSelectedLiveV2');
+  const btn = btnArg || $(mode === 'classic' ? '#btnCheckSelectedLiveClassicV2' : '#btnCheckSelectedLiveV2');
   const old = btn ? btn.textContent : '';
   if (btn) {
     btn.disabled = true;
@@ -4831,7 +5061,7 @@ async function checkSelectedLive(idsArg = null, btnArg = null) {
     const r = await api('/api/accounts/check-live-bulk', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({account_ids: ids, workers}),
+      body: JSON.stringify({account_ids: ids, workers, method: mode === 'classic' ? 'classic' : 'protocol'}),
     });
     const skipped = (r.skipped || []).length;
     showToast(`查活已入队 ${r.started_count || 0} 个，忙碌 ${r.busy_count || 0} 个，失败 ${r.failed_count || 0}${skipped ? `，跳过 ${skipped}` : ''}`);
@@ -5107,11 +5337,16 @@ $('#emailChangeModalV2').addEventListener('click', e => { if (e.target.id === 'e
   bind('btnCheckSelectedPlansV2', checkSelectedPlans);
   bind('btnExtractSelectedLinksV2', extractSelectedLinks);
   bind('btnRetrySelectedCodexV2', retrySelectedCodex);
-  bind('btnDownloadSelectedCpaV2', downloadSelectedCpa);
+  bind('btnDownloadSelectedCpaV2', downloadSelectedOAuth);
+  bind('btnDownloadSelectedCredentialsV2', downloadSelectedCredentials);
+  bind('btnImportOAuthV2', openOAuthImportPicker);
+  const oauthInput = document.getElementById('oauthImportFileV2');
+  if (oauthInput) oauthInput.addEventListener('change', importOAuthFile);
   bind('btnStopSelectedCodexV2', stopSelectedCodex);
   bind('btnSetupSelectedTotpV2', setupSelectedTotp);
   bind('btnChangeSelectedEmailsV2', () => openEmailChangeModal(Array.from(ACCOUNT_SELECTED)));
   bind('btnNoteSelectedAccountsV2', noteSelectedAccounts);
+  bind('btnSetPasswordV2', setSelectedPasswords);
   bind('btnCopySelectedLinesV2', copySelectedAccountLines);
   bind('btnCopySelectedTokensV2', copySelectedAccountTokens);
   bind('btnCopySelectedEmailsV2', copySelectedAccountEmails);
@@ -6153,6 +6388,7 @@ function renderConfigSectionHead(name, meta = '') {
 function registrationDriverChoices() {
   return [
     { value: 'protocol', label: '纯协议注册' },
+    { value: 'protocol_page', label: '页面会话协议' },
     { value: 'roxy', label: 'RoxyBrowser' },
     { value: 'cloak', label: '本地指纹浏览器' },
     { value: 'browser_use', label: 'browser_use' },

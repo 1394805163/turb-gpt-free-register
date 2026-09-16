@@ -132,7 +132,7 @@ def _resolve_live_check_route(proxy: str | None, *, country_hint: str = "") -> d
     return resolve_plan_check_route(explicit_proxy=proxy)
 
 
-def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, trigger: str) -> dict:
+def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, trigger: str, method: str = "") -> dict:
     try:
         with _LOCK:
             _RUNNING.add(int(account_id))
@@ -172,6 +172,7 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
             proxy_selection=route.get("proxy_selection"),
             email_source=email_source,
             fingerprint_state=fingerprint_state,
+            method=method or None,
         )
         # 认证链早期 403 通常是该出口被 CF 拦截，不代表账号死亡。
         # auto/proxy 模式下如果用了代理，额外直连兜底一次，便于和套餐查询的 auto 语义保持接近。
@@ -196,6 +197,7 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
                 clear_log=False,
                 email_source=email_source,
                 fingerprint_state={},
+                method=method or None,
             )
         db.update_account_liveness(account_id, result)
         if result.get("ok"):
@@ -251,17 +253,18 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
         _QUEUE_SLOTS.release()
 
 
-def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: str) -> dict:
+def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: str, method: str = "") -> dict:
     with pipeline_slot("live_check"):
         return _run_live_check_inner(
             account_id=account_id,
             email=email,
             proxy=proxy,
             trigger=trigger,
+            method=method,
         )
 
 
-def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "manual", proxy: str | None = None) -> dict:
+def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "manual", proxy: str | None = None, method: str | None = None) -> dict:
     account_id = int(account_id)
     email = str(email or "").strip()
     if not email:
@@ -272,7 +275,7 @@ def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "m
         _QUEUE_SLOTS.release()
         return {"accepted": False, "busy": True, "error": "该账号正在查活"}
 
-    _append_log(email, f"[查活] 已入队 account_id={account_id} trigger={trigger}", clear=True)
+    _append_log(email, f"[查活] 已入队 account_id={account_id} trigger={trigger} method={str(method or 'auto')}", clear=True)
     try:
         _EXECUTOR.submit(
             _run_live_check,
@@ -280,6 +283,7 @@ def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "m
             email=email,
             proxy=proxy,
             trigger=str(trigger or "manual"),
+            method=str(method or ""),
         )
     except Exception as exc:
         _QUEUE_SLOTS.release()

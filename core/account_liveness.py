@@ -668,9 +668,14 @@ def check_account_liveness(
     proxy_selection: dict | None = None,
     email_source: str | None = None,
     fingerprint_state: dict | None = None,
+    method: str | None = None,
 ) -> dict:
     """
     重新登录账号并刷新最新 accessToken。
+
+    method:
+      - None / "classic"：传统流程（driver=cloak 时走浏览器登录）
+      - "protocol"：强制协议链路（账号+密码+2FA 优先，无浏览器）
 
     返回：
       {
@@ -713,6 +718,9 @@ def check_account_liveness(
         logger.info("[查活] 开始重新登录：%s", redact_email(email))
         from config import roxybrowser as registration_cfg
         registration_driver = str(getattr(registration_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+        force_protocol = str(method or "").strip().lower() in {"protocol", "protocol_password", "password"}
+        if force_protocol:
+            logger.info("[查活] 指定协议查活（账号+密码+2FA 优先，无浏览器）")
         # 快速路径（默认关，config: LIVE_CHECK_FAST_REFRESH）：协议 RT 刷新成功即判定 live，
         # 失败自动落回下面的浏览器/协议登录流程，行为与现状完全一致。
         if bool(getattr(registration_cfg, "LIVE_CHECK_FAST_REFRESH", False)):
@@ -734,7 +742,7 @@ def check_account_liveness(
                 }
             logger.info("[查活] 快速路径失败，落回登录流程：%s", str(fast.get("error"))[:160])
 
-        if registration_driver in {"cloak", "cloakbrowser"}:
+        if registration_driver in {"cloak", "cloakbrowser"} and not force_protocol:
             from core.cloakbrowser_liveness import run_cloak_liveness_flow
 
             logger.info("[查活] 使用 CloakBrowser 页面登录，跳过旧版 chatgpt.com/api/auth/providers 预检")
@@ -743,87 +751,91 @@ def check_account_liveness(
                 proxy=proxy,
                 proxy_selection=proxy_selection,
             )
-        logger.info("[查活] 流程：Providers → CSRF → Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
-        session, authorize_url = _network_preflight_with_retry(
-            email,
-            proxy,
-            rotate_transparent_route=rotate_transparent_route,
-        )
-
-        otp_after_ts = time.time()
-        final_url = follow_authorize(session, authorize_url)
-        dead_code = detect_account_unusable_text(final_url)
-        if dead_code:
-            return {"ok": False, "status": "confirmed_dead", "checked_at": checked_at, "error": dead_code}
-
-        validate_result = _validate_with_retry(session, email, otp_after_ts)
-        page = validate_result.get("page") if isinstance(validate_result, dict) else {}
-        page = page if isinstance(page, dict) else {}
-        page_type = str(page.get("type") or "")
-        if page_type == "mfa_challenge":
-            validate_result = _pass_mfa_challenge(session, email, validate_result)
-            page = validate_result.get("page") if isinstance(validate_result, dict) else {}
-            page = page if isinstance(page, dict) else {}
-            page_type = str(page.get("type") or "")
-        continue_url = (
-            validate_result.get("continue_url")
-            or validate_result.get("external_url")
-            or validate_result.get("url")
-            or page.get("continue_url")
-            or page.get("external_url")
-            or page.get("url")
-        )
-        if not continue_url:
-            raise RuntimeError(f"OTP 登录成功但没有 OAuth continue_url: {validate_result}")
-        if "about-you" in str(continue_url) or page_type in {"about_you", "about-you"}:
-            raise RuntimeError(f"该邮箱登录后进入资料页，疑似不是完整已注册账号: page_type={page_type}, continue_url={continue_url}")
-
-        follow_oauth_callback(session, str(continue_url), referer="https://auth.openai.com/email-verification")
-        session_info = fetch_session(session)
-        logger.info("[查活] 开始重新登录：%s", email)
-        existing_access_token = _stored_access_token(email)
-        has_totp = bool(_account_totp_secret(email))
-        if existing_access_token and not has_totp:
-            # 2FA 设置流程已经验证：先用已有 AT 预热 ChatGPT 登录态，再走
-            # reauth → 邮箱 OTP → callback。该链路不依赖容易被 CF 拦截的
-            # /api/auth/providers。已开启 TOTP 的账号保留密码 → MFA 路径，
-            # 避免把 MFA challenge 误当成邮箱 OTP 页面。
-            logger.info("[查活] 流程：登录态预热 → CSRF → Reauth Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
-            session = _new_fingerprint_pinned_session(email, proxy, fingerprint_state)
-            logger.info(
-                "[查活] 会话创建完成：proxy=%s device_id=%s（复用2FA稳定链路）",
-                session.proxy or "直连/配置随机",
-                session.device_id,
-            )
-            logger.info("[查活] 指纹摘要：%s", session.fingerprint_summary_text())
-            _warm_authenticated_session(session, existing_access_token)
-            human_delay("navigate")
-            session_info = _login_via_reauth(
-                session,
-                email,
-                time.time(),
-                email_source=email_source,
-            )
-        else:
-            # 兼容没有本地 AT 或已开启 TOTP 的记录。providers 不是 signin 的
-            # 前置依赖，备用链只执行 CSRF → Signin，避免在 providers 403 时提前终止。
-            logger.info("[查活] 流程：CSRF → Signin → Authorize → 密码/邮箱 OTP → MFA(如有) → OAuth callback → Session/AT")
+        has_password_now = bool(_account_registration_password(email))
+        if not has_password_now:
+            logger.info("[查活] 流程：Providers → CSRF → Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
             session, authorize_url = _network_preflight_with_retry(
-                email, proxy, fingerprint_state=fingerprint_state,
+                email,
+                proxy,
+                rotate_transparent_route=rotate_transparent_route,
             )
-
+    
             otp_after_ts = time.time()
             final_url = follow_authorize(session, authorize_url)
             dead_code = detect_account_unusable_text(final_url)
             if dead_code:
-                return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": dead_code}
-
-            session_info = _login_via_password_or_otp(
-                session,
-                email,
-                otp_after_ts,
-                email_source=email_source,
+                return {"ok": False, "status": "confirmed_dead", "checked_at": checked_at, "error": dead_code}
+    
+            validate_result = _validate_with_retry(session, email, otp_after_ts)
+            page = validate_result.get("page") if isinstance(validate_result, dict) else {}
+            page = page if isinstance(page, dict) else {}
+            page_type = str(page.get("type") or "")
+            if page_type == "mfa_challenge":
+                validate_result = _pass_mfa_challenge(session, email, validate_result)
+                page = validate_result.get("page") if isinstance(validate_result, dict) else {}
+                page = page if isinstance(page, dict) else {}
+                page_type = str(page.get("type") or "")
+            continue_url = (
+                validate_result.get("continue_url")
+                or validate_result.get("external_url")
+                or validate_result.get("url")
+                or page.get("continue_url")
+                or page.get("external_url")
+                or page.get("url")
             )
+            if not continue_url:
+                raise RuntimeError(f"OTP 登录成功但没有 OAuth continue_url: {validate_result}")
+            if "about-you" in str(continue_url) or page_type in {"about_you", "about-you"}:
+                raise RuntimeError(f"该邮箱登录后进入资料页，疑似不是完整已注册账号: page_type={page_type}, continue_url={continue_url}")
+    
+            follow_oauth_callback(session, str(continue_url), referer="https://auth.openai.com/email-verification")
+            session_info = fetch_session(session)
+        else:
+            logger.info("[查活] 检测到账号密码：跳过直连 OTP 段，走密码/2FA 登录链")
+            logger.info("[查活] 开始重新登录：%s", email)
+            existing_access_token = _stored_access_token(email)
+            has_totp = bool(_account_totp_secret(email))
+            if existing_access_token and not has_totp:
+                # 2FA 设置流程已经验证：先用已有 AT 预热 ChatGPT 登录态，再走
+                # reauth → 邮箱 OTP → callback。该链路不依赖容易被 CF 拦截的
+                # /api/auth/providers。已开启 TOTP 的账号保留密码 → MFA 路径，
+                # 避免把 MFA challenge 误当成邮箱 OTP 页面。
+                logger.info("[查活] 流程：登录态预热 → CSRF → Reauth Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
+                session = _new_fingerprint_pinned_session(email, proxy, fingerprint_state)
+                logger.info(
+                    "[查活] 会话创建完成：proxy=%s device_id=%s（复用2FA稳定链路）",
+                    session.proxy or "直连/配置随机",
+                    session.device_id,
+                )
+                logger.info("[查活] 指纹摘要：%s", session.fingerprint_summary_text())
+                _warm_authenticated_session(session, existing_access_token)
+                human_delay("navigate")
+                session_info = _login_via_reauth(
+                    session,
+                    email,
+                    time.time(),
+                    email_source=email_source,
+                )
+            else:
+                # 兼容没有本地 AT 或已开启 TOTP 的记录。providers 不是 signin 的
+                # 前置依赖，备用链只执行 CSRF → Signin，避免在 providers 403 时提前终止。
+                logger.info("[查活] 流程：CSRF → Signin → Authorize → 密码/邮箱 OTP → MFA(如有) → OAuth callback → Session/AT")
+                session, authorize_url = _network_preflight_with_retry(
+                    email, proxy, fingerprint_state=fingerprint_state,
+                )
+    
+                otp_after_ts = time.time()
+                final_url = follow_authorize(session, authorize_url)
+                dead_code = detect_account_unusable_text(final_url)
+                if dead_code:
+                    return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": dead_code}
+    
+                session_info = _login_via_password_or_otp(
+                    session,
+                    email,
+                    otp_after_ts,
+                    email_source=email_source,
+                )
         access_token = str(session_info.get("accessToken") or "")
         if not access_token:
             raise RuntimeError("重新登录后未拿到 accessToken")
@@ -835,7 +847,7 @@ def check_account_liveness(
         return {
             "ok": True,
             "status": "live",
-            "method": "otp",
+            "method": "protocol" if force_protocol else "otp",
             "checked_at": checked_at,
             "access_token": access_token,
             "session": session_info,
