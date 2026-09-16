@@ -36,6 +36,15 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
                 return_value={"accepted": False, "error": "fixture"},
             )
         )
+        # iCloud 池是文件存储：必须一起隔离，否则测试夹具邮箱会写进真实池
+        # （历史上 access-only@icloud.com 就是这么进池的）。
+        from config import email as email_config
+        from core import icloud_mail_client
+
+        self.icloud_file = root / "icloud_mailboxes.txt"
+        self.icloud_state = root / "icloud_mailboxes.json"
+        self.stack.enter_context(patch.object(email_config, "ICLOUD_MAILBOXES_FILE", str(self.icloud_file)))
+        self.stack.enter_context(patch.object(icloud_mail_client, "_STATE_FILE", self.icloud_state))
         self.root = root
 
     def _write_mailbox_pool(self) -> None:
