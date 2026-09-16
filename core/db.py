@@ -690,6 +690,47 @@ def _save_accounts(rows: list[dict]) -> None:
     _save_collection("accounts", rows)
 
 
+def _load_account_row(*, acc_id: int | None = None, email: str | None = None) -> dict | None:
+    """O(1) 单行读取（替代热路径上 _load_accounts 的整表加载 + 全量 json.loads）。"""
+    _ensure_sqlite()
+    target_email = str(email or "").strip()
+    with closing(_sqlite_conn()) as conn:
+        row = None
+        if acc_id is not None:
+            row = conn.execute("SELECT payload FROM accounts WHERE id=?", (int(acc_id),)).fetchone()
+        elif target_email:
+            row = conn.execute("SELECT payload FROM accounts WHERE email=? LIMIT 1", (target_email,)).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT payload FROM accounts WHERE lower(email)=? ORDER BY id DESC LIMIT 1",
+                    (target_email.lower(),),
+                ).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def _save_account_row(row: dict) -> None:
+    """O(1) 单行写回（替代 _save_accounts 的整表 DELETE + 全量重插）。"""
+    _ensure_sqlite()
+    data = dict(row)
+    data["copy_line"] = _account_line(data)
+    rid = int(data.get("id") or 0)
+    if not rid:
+        return
+    with closing(_sqlite_conn()) as conn:
+        with conn:
+            conn.execute(
+                "UPDATE accounts SET email=?, status=?, archived=?, updated_at=?, payload=? WHERE id=?",
+                (
+                    str(data.get("email") or ""),
+                    str(data.get("status") or ""),
+                    int(bool(data.get("archived"))),
+                    str(data.get("updated_at") or ""),
+                    json.dumps(data, ensure_ascii=False),
+                    rid,
+                ),
+            )
+
+
 def _load_jobs() -> list[dict]:
     return _load_collection("jobs")
 
@@ -1002,8 +1043,7 @@ def update_account_codex_status(email: str, codex_status: str, codex_error: str 
     返回是否找到该账号。
     """
     with _LOCK:
-        accounts = _load_accounts()
-        row = _find_by_email(accounts, email)
+        row = _load_account_row(email=email)
         if row is None:
             return False
         row["codex_status"] = codex_status
@@ -1015,7 +1055,7 @@ def update_account_codex_status(email: str, codex_status: str, codex_error: str 
             row["live_check_error"] = codex_error or "Codex 授权判定账号已废号"
             row["live_checked_at"] = _now()
         row["updated_at"] = _now()
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1165,13 +1205,7 @@ def claim_account_plan_check(
     避免把"基于旧 token 的查询"落到刚刷新凭证的账号上（合并后上游调用方会传）。
     """
     with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
+        row = _load_account_row(acc_id=acc_id, email=email)
         if row is None:
             return False
         if expected_token_fingerprint:
@@ -1197,7 +1231,7 @@ def claim_account_plan_check(
         row["plan_check_completed_at"] = None
         row["plan_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1211,8 +1245,7 @@ def mark_account_plan_check_running(
     避免用旧 token 的结果覆盖新凭证。
     """
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None or row.get("plan_check_status") not in {"queued", "running"}:
             return False
         if expected_token_fingerprint:
@@ -1222,7 +1255,7 @@ def mark_account_plan_check_running(
         row["plan_check_started_at"] = _now()
         row["plan_check_error"] = None
         row["updated_at"] = _now()
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1259,13 +1292,7 @@ def update_account_plan_check(
     """
     result = result or {}
     with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
+        row = _load_account_row(acc_id=acc_id, email=email)
         if row is None:
             return False
         if expected_token_fingerprint:
@@ -1345,7 +1372,7 @@ def update_account_plan_check(
         row["token_expires_at"] = result.get("token_expires_at")
         row["plan_check_result_json"] = json.dumps(result, ensure_ascii=False)
         row["updated_at"] = _now()
-        _save_accounts(accounts)
+        _save_account_row(row)
         return True
 
 
@@ -1739,28 +1766,27 @@ def list_accounts_page(
 
 def get_account(acc_id: int) -> dict | None:
     with _LOCK:
-        row = next((r for r in _load_accounts() if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         return _decorate_account(row) if row else None
 
 
 def get_account_by_email(email: str) -> dict | None:
     with _LOCK:
-        row = _find_by_email(_load_accounts(), email)
+        row = _load_account_row(email=email)
         return _decorate_account(row) if row else None
 
 
 def update_account_note(acc_id: int, note: str) -> bool:
     """更新单个已注册账号备注。note 为空字符串时表示清空备注。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         now = _now()
         row["note"] = str(note or "")
         row["note_updated_at"] = now
         row["updated_at"] = now
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -1867,8 +1893,7 @@ def update_account_liveness(
     """写回账号查活结果；成功时同步刷新最新 access_token 和账号基础信息。"""
     result = result or {}
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         if expected_token_fingerprint:
@@ -1906,7 +1931,7 @@ def update_account_liveness(
             row["live_check_error"] = None
 
         row["copy_line"] = _account_line(row)
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -1960,8 +1985,7 @@ def update_account_totp_secret(acc_id: int, result: dict | None = None) -> bool:
     """更新账号 2FA/TOTP 设置结果。"""
     result = result or {}
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        row = _load_account_row(acc_id=acc_id)
         if row is None:
             return False
         status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
@@ -1979,7 +2003,7 @@ def update_account_totp_secret(acc_id: int, result: dict | None = None) -> bool:
             row["totp_setup_message"] = result.get("message")
         row["copy_line"] = _account_line(row)
         row["updated_at"] = _now()
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
@@ -2077,23 +2101,21 @@ def update_accounts_note(account_ids: list[int] | None, note: str) -> tuple[list
     updated: list[dict] = []
     skipped: list[dict] = []
     with _LOCK:
-        rows = _load_accounts()
         seen_ids: set[int] = set()
         now = _now()
         text = str(note or "")
-        for row in rows:
-            row_id = int(row.get("id") or 0)
-            if row_id not in ids:
+        for row_id in sorted(ids):
+            row = _load_account_row(acc_id=row_id)
+            if row is None:
                 continue
             row["note"] = text
             row["note_updated_at"] = now
             row["updated_at"] = now
+            _save_account_row(row)
             updated.append({"id": row_id, "email": row.get("email"), "note": text, "note_updated_at": now})
             seen_ids.add(row_id)
         for item in ids - seen_ids:
             skipped.append({"id": item, "reason": "账号不存在"})
-        if updated:
-            _save_accounts(rows)
     return updated, skipped
 
 
@@ -3515,8 +3537,7 @@ def update_account_chatgpt_oauth(email: str, credential: dict, expected_access_t
     if not target_email:
         return {"updated": False, "reason": "email 为空"}
     with _LOCK:
-        accounts = _load_accounts()
-        row = _find_by_email(accounts, target_email)
+        row = _load_account_row(email=target_email)
         if row is None:
             return {"updated": False, "reason": "账号不存在", "email": target_email}
         if expected_access_token is not None and _token_fingerprint(row.get("access_token") or "") != _token_fingerprint(expected_access_token):
@@ -3555,7 +3576,7 @@ def update_account_chatgpt_oauth(email: str, credential: dict, expected_access_t
             reason="OAuth 凭据已更新，等待使用新 access_token 重新查活",
         )
         row["updated_at"] = now
-        _save_accounts(accounts)
+        _save_account_row(row)
         return {"updated": True, "account_id": int(row.get("id") or 0), "email": target_email}
 
 
@@ -3585,8 +3606,7 @@ def update_account_registration_password(email: str, password: str) -> bool:
     if not target or not str(password or "").strip():
         return False
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if str(r.get("email") or "").strip().lower() == target), None)
+        row = _load_account_row(email=target)
         if row is None:
             return False
         extra = row.get("extra_json")
@@ -3606,7 +3626,7 @@ def update_account_registration_password(email: str, password: str) -> bool:
         row["password"] = str(password)
         row["password_updated_at"] = _now()
         row["updated_at"] = _now()
-        _save_accounts(rows)
+        _save_account_row(row)
         return True
 
 
