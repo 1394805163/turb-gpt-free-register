@@ -4091,10 +4091,13 @@ def import_account_credentials(records: list[dict], source: str | None = None) -
             continue
         existing = get_account_by_email(email)
         if existing:
+            # 已有账号保留自己的邮箱来源（导入记录里的来源标记只是导入器元信息，
+            # 之前会把 icloud 账号刷成 access_token_import）。
             insert_account(
                 email=email,
                 access_token=token,
-                email_source=raw.get("email_source") or source or existing.get("email_source"),
+                email_source=str(existing.get("email_source") or "").strip()
+                or str(raw.get("email_source") or source or "").strip(),
                 extra={"account_migration_imported": True},
             )
             result["updated"] += 1

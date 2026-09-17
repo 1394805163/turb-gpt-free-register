@@ -3812,7 +3812,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         looks_like_token = token.startswith("eyJ") or token.startswith("rt.") or token.count(".") >= 2
         if not looks_like_token:
             return None
-        return {"email": email, "access_token": token, "email_source": "access_token_import"}
+        return {"email": email, "access_token": token}
 
     @app.post("/api/accounts/import-password-login")
     def api_accounts_import_password_login():
