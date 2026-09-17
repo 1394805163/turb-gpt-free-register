@@ -167,7 +167,37 @@ def login_with_password(
         authorize_url = f"{AUTH_BASE}/api/accounts/authorize?{urlencode(params)}"
         headers = session.get_auth_navigate_headers(referer=f"{PLATFORM_BASE}/")
         headers["sec-fetch-site"] = "cross-site"
-        resp = session.get(authorize_url, headers=headers, allow_redirects=True)
+        # Cloudflare 对 authorize 偶发挑战（Just a moment...）：同一会话先取一次
+        # auth 首页预热 cookie，再对 403 退避重试；不要一次 403 就判账号失败。
+        resp = None
+        for attempt in range(3):
+            if attempt == 0:
+                try:
+                    session.get(f"{AUTH_BASE}/", headers=headers, allow_redirects=True)
+                except Exception as exc:
+                    logger.info("[password-login] authorize 预热失败（继续）：%s", str(exc)[:100])
+            try:
+                resp = session.get(authorize_url, headers=headers, allow_redirects=True)
+            except RuntimeError as exc:  # 熔断冷却：重置后重试
+                if attempt == 2:
+                    raise
+                logger.info("[password-login] authorize 熔断重试 %s：%s", attempt + 1, str(exc)[:80])
+                try:
+                    session.reset_circuit_breaker()
+                except Exception:
+                    pass
+                time.sleep(2.5 + attempt * 2.5)
+                continue
+            if getattr(resp, "status_code", 0) in (200, 302):
+                break
+            if attempt == 2:
+                break
+            logger.info("[password-login] authorize HTTP %s，退避重试 %s", getattr(resp, "status_code", "?"), attempt + 1)
+            try:
+                session.reset_circuit_breaker()
+            except Exception:
+                pass
+            time.sleep(2.5 + attempt * 2.5)
         final_url = str(getattr(resp, "url", "") or "")
         if getattr(resp, "status_code", 0) not in (200, 302):
             _mark("authorize", False, f"status={resp.status_code}")

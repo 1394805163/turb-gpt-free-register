@@ -218,6 +218,21 @@ def _coerce_env_value(raw: str, default, vtype: str | None = None):
         return int(str(raw).strip())
     if vtype == "float":
         return float(str(raw).strip())
+    if vtype == "list_str_delimited":
+        # 逗号/分号/空白分隔的短列表，例如 MIHOMO_REGISTRATION_ALLOWED_COUNTRIES="US,JP,TW,SG"。
+        # 之前该类型没有实现，值会以原始字符串落地，下游 set("US,JP") 得到字符集合，
+        # 出口国家策略因此长期误判（US 被当成不在允许地区）。
+        text = str(raw).strip()
+        if text.startswith("[") or text.startswith("("):
+            try:
+                import ast
+                val = ast.literal_eval(text)
+                if isinstance(val, (list, tuple, set)):
+                    return [str(x).strip().strip('\"\'') for x in val if str(x).strip()]
+            except Exception:
+                pass
+        parts = [p for p in re.split(r"[,\s;]+", text) if p]
+        return [p.strip().strip('\"\'') for p in parts]
     if vtype == "list_str_multiline":
         text = str(raw)
         # 兼容旧值：PROXY_POOL='["http://..."]'
