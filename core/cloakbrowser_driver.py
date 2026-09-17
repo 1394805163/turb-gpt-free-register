@@ -748,17 +748,39 @@ def build_cloak_driver(
     if locale_opts.get("accept_language"):
         context_kwargs["extra_http_headers"] = {"Accept-Language": locale_opts["accept_language"]}
 
-    if user_data_dir:
-        context = launch_persistent_context(user_data_dir, **opts)
-        page = context.new_page()
-        browser = getattr(context, "browser", None) or context
-        # persistent context 的 locale/timezone 已通过 launch_persistent_context 参数传入。
-    else:
-        browser = launch(**opts)
-        context = browser.new_context(**context_kwargs)
-        page = context.new_page()
+    # 跨进程席位锁：WebUI 与外部工具（收口脚本、探针）不能同时开浏览器，
+    # 否则免费档 1 并发额度会互相顶掉。进程被杀时操作系统会自动释放锁。
+    from core.browser_seat import acquire as _seat_acquire, release as _seat_release
+
+    if not _seat_acquire(label=f"proxy={_proxy_log_label(proxy_url)} seed={seed or '-'}"):
+        raise RuntimeError("浏览器席位等待超时（另一个进程正在使用 CloakBrowser）")
+
+    try:
+        if user_data_dir:
+            context = launch_persistent_context(user_data_dir, **opts)
+            page = context.new_page()
+            browser = getattr(context, "browser", None) or context
+            # persistent context 的 locale/timezone 已通过 launch_persistent_context 参数传入。
+        else:
+            browser = launch(**opts)
+            context = browser.new_context(**context_kwargs)
+            page = context.new_page()
+    except Exception:
+        _seat_release()
+        raise
 
     driver = CloakSeleniumDriver(browser=browser, context=context, page=page)
+
+    # quit() 时释放席位（原 quit 可能抛错，也要保证释放）
+    _orig_quit = driver.quit
+
+    def _quit_and_release_seat() -> None:
+        try:
+            _orig_quit()
+        finally:
+            _seat_release()
+
+    driver.quit = _quit_and_release_seat
     # Roxy/Cloak 共用部分页面操作函数；给共享函数一个显式日志前缀，
     # 避免 Cloak 注册流程里出现 `[Roxy注册]`。
     driver._registration_log_prefix = "[Cloak注册]"

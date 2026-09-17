@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 import time
 
@@ -90,16 +91,72 @@ def _has_code_input(driver) -> bool:
 
 
 def _click_password_add(driver) -> dict:
-    return driver.execute_script(r"""
-    const el = document.querySelector('[data-testid="password-setting"]');
-    if (!el) return {found: false};
-    el.scrollIntoView({block: 'center'});
-    el.click();
-    return {found: true, text: (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 80)};
-    """) or {}
+    """点击 Password Add：优先真实鼠标点击（CDP 坐标点击），失败回退页面内 click()。"""
+    try:
+        from core.roxy_registration import _find_any, _human_click
+
+        el = _find_any(driver, ['[data-testid="password-setting"]'], timeout=8)
+        if el is not None:
+            text = ""
+            try:
+                text = str(el.text or "").replace("\n", " ").strip()[:80]
+            except Exception:
+                pass
+            before = str(getattr(driver, "current_url", "") or "")
+            _human_click(driver, el, label="password_add")
+            time.sleep(2.0)
+            after = str(getattr(driver, "current_url", "") or "")
+            if after != before or "password" in after.lower():
+                return {"found": True, "text": text or "Password Add", "mode": "human_click"}
+            logger.warning("[补密码] 真实点击 Password Add 后页面未变化，回退脚本点击")
+            try:
+                el.click()
+                time.sleep(1.5)
+            except Exception:
+                pass
+            return {"found": True, "text": text or "Password Add", "mode": "human_click+js_fallback"}
+    except Exception as exc:
+        logger.info("[补密码] 真实点击 Password Add 失败，回退脚本点击：%s", str(exc)[:140])
+    _js = "const el = document.querySelector('[data-testid=\"password-setting\"]');"
+    _js += "if (!el) return {found: false};"
+    _js += "el.scrollIntoView({block: 'center'}); el.click();"
+    _js += "return {found: true, text: (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 80), mode: 'js_click'};"
+    return driver.execute_script(_js) or {}
 
 
 def _fill_password_inputs(driver, password: str) -> dict:
+    """填写新密码：优先逐字符真实键盘输入，失败回退 JS setter。"""
+    try:
+        from core.roxy_registration import _human_type_text
+
+        handles = driver.find_elements("css selector", 'input[type="password"], input[autocomplete="new-password"]')
+        visible = []
+        for item in handles:
+            try:
+                if item.is_displayed():
+                    visible.append(item)
+            except Exception:
+                continue
+        if visible:
+            for item in visible:
+                try:
+                    item.clear()
+                except Exception:
+                    pass
+                _human_type_text(driver, item, password, clear=True)
+            # 真实键入后校验：React 受控输入偶发没吃到键值，必须回退 JS setter，
+            # 否则提交时按钮仍是 disabled，表现为"提交后仍停留在新密码页"。
+            try:
+                values = [str(it.get_attribute("value") or "") for it in visible]
+            except Exception:
+                values = []
+            if values and all(v == password for v in values):
+                return {"ok": True, "count": len(visible), "mode": "human_type"}
+            logger.warning("[补密码] 真实键入未生效（values=%s），回退 JS setter", [len(v) for v in values])
+    except Exception as exc:
+        logger.info("[补密码] 真实键入密码失败，回退 JS setter：%s", str(exc)[:140])
+    except Exception as exc:
+        logger.info("[补密码] 真实键入密码失败，回退 JS setter：%s", str(exc)[:140])
     return driver.execute_script(r"""
     const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const inputs = [...document.querySelectorAll('input[type="password"], input[name*="password" i], input[autocomplete="new-password"]')].filter(vis);
@@ -117,6 +174,39 @@ def _fill_password_inputs(driver, password: str) -> dict:
 
 
 def _click_submit(driver) -> dict:
+    """提交新密码：优先真实鼠标点击，失败回退页面内 click()。"""
+    try:
+        from core.roxy_registration import _human_click
+
+        buttons = driver.find_elements("css selector", 'button, input[type="submit"], [role="button"]')
+        hit = None
+        for item in buttons:
+            try:
+                if not item.is_displayed() or not item.is_enabled():
+                    continue
+                label = str(item.text or item.get_attribute("value") or "").strip()
+            except Exception:
+                continue
+            if re.search(r"continue|save|submit|set password|update|继续|保存|确定|提交", label, re.I):
+                hit = item
+                break
+        if hit is not None:
+            text = str(hit.text or hit.get_attribute("value") or "").strip()
+            marker = NEW_PASSWORD_MARKER
+            _human_click(driver, hit, label="password_submit")
+            time.sleep(2.5)
+            url_now = str(getattr(driver, "current_url", "") or "")
+            if marker not in url_now:
+                return {"ok": True, "text": text, "mode": "human_click"}
+            logger.warning("[补密码] 真实点击提交后仍在密码页，回退脚本点击")
+            try:
+                hit.click()
+                time.sleep(1.5)
+            except Exception:
+                pass
+            return {"ok": True, "text": text, "mode": "human_click+js_fallback"}
+    except Exception as exc:
+        logger.info("[补密码] 真实点击提交失败，回退脚本点击：%s", str(exc)[:140])
     return driver.execute_script(r"""
     const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     const enabled = el => !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';

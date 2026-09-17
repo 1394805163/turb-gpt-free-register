@@ -69,8 +69,7 @@ def main() -> int:
     args = ap.parse_args()
 
     from core import db
-    from core.account_password import set_account_password
-    from core.account_2fa import set_account_2fa
+    from core.account_provision import provision_account
 
     targets = []
     for row in db._load_accounts():
@@ -99,29 +98,82 @@ def main() -> int:
         entry = {"id": item["id"], "email": email}
         print(f"[{idx}/{len(targets)}] {email} pw={item['need_pw']} 2fa={item['need_2fa']}", flush=True)
 
-        if item["need_pw"]:
-            res = _run_with_license_backoff(lambda: set_account_password(email), label=f"补密码 {email}")
-            entry["password"] = {k: v for k, v in res.items() if k != "password"}
-            if res.get("ok"):
+        # 快筛：有密码的号先跑一次纯协议登录（5 秒，不占浏览器席位）。
+        # 能提前发现"账号已被删除/停用"，也能顺手刷新 AT/RT。
+        acc_row = db.get_account_by_email(email) or {}
+        if str(acc_row.get("password") or "").strip() and not str(acc_row.get("chatgpt_refresh_token") or "").strip():
+            try:
+                from core.password_login import login_with_password
+
+                probe = login_with_password(
+                    email,
+                    str(acc_row.get("password") or ""),
+                    totp_secret=str(acc_row.get("totp_secret") or ""),
+                    write_back=True,
+                    timeout=20,
+                )
+            except Exception as exc:
+                probe = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if not probe.get("ok"):
+                detail = json.dumps(probe.get("detail") or {}, ensure_ascii=False)
+                if "deleted or deactivated" in detail or "account_deactivated" in detail:
+                    print("    账号已删除/停用，跳过并对齐状态", flush=True)
+                    try:
+                        from core import db as _db
+
+                        _db.update_account_liveness(
+                            int(item["id"]),
+                            {
+                                "ok": False,
+                                "status": "deactivated",
+                                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                                "error": "account_deactivated（协议登录确认）",
+                            },
+                        )
+                    except Exception:
+                        pass
+                    _sync_state(email, twofa_status="skipped_dead", password_status="skipped_dead")
+                    report["items"].append(entry)
+                    continue
+            else:
+                print("    协议预检通过（AT/RT 已刷新）", flush=True)
+
+        if item["need_pw"] or item["need_2fa"]:
+            res = _run_with_license_backoff(
+                lambda: provision_account(
+                    email,
+                    do_password=item["need_pw"],
+                    do_2fa=item["need_2fa"],
+                ),
+                label=f"收口 {email}",
+                wait_seconds=30.0,
+            )
+            entry["password_status"] = res.get("password_status")
+            entry["twofa_status"] = res.get("twofa_status")
+            entry["access_token_written"] = res.get("access_token_written")
+            entry["error"] = res.get("error")
+            if res.get("password_status") == "ok":
                 ok_pw += 1
                 _sync_state(email, password_ok=True, password_status="ok_tool", password=str(res.get("password") or ""))
-                print("    密码 OK", flush=True)
-            else:
-                status = str(res.get("status") or "failed")
-                _sync_state(email, password_status=f"failed_tool:{status}")
-                print(f"    密码 FAIL {status} | {str(res.get('error'))[:80]}", flush=True)
-
-        if item["need_2fa"]:
-            res = _run_with_license_backoff(lambda: set_account_2fa(email), label=f"补2FA {email}")
-            entry["twofa"] = {k: v for k, v in res.items() if k != "totp_secret"}
-            if res.get("ok"):
+            elif res.get("password_status") not in (None, "skipped", "existing"):
+                _sync_state(email, password_status=f"failed_tool:{res.get('password_status')}")
+            if res.get("twofa_status") == "ok":
                 ok_2fa += 1
                 _sync_state(email, twofa_ok=True, twofa_status="ok_tool")
-                print("    2FA OK", flush=True)
-            else:
-                status = str(res.get("status") or "failed")
-                _sync_state(email, twofa_status=f"failed_tool:{status}")
-                print(f"    2FA FAIL {status} | {str(res.get('error'))[:80]}", flush=True)
+            elif res.get("twofa_status") not in (None, "skipped", "existing"):
+                _sync_state(email, twofa_status=f"failed_tool:{res.get('twofa_status')}")
+            print(
+                "    " + " | ".join(
+                    [
+                        f"密码={res.get('password_status')}",
+                        f"2FA={res.get('twofa_status')}",
+                        f"AT写回={res.get('access_token_written')}",
+                        f"状态={res.get('status') or '-'}",
+                        f"错误={str(res.get('error') or '-')[:60]}",
+                    ]
+                ),
+                flush=True,
+            )
 
         report["items"].append(entry)
         time.sleep(args.sleep + random.uniform(0, 2.0))
