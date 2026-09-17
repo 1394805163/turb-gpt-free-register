@@ -660,6 +660,64 @@ def _validate_with_retry(
     raise last_exc if last_exc else RuntimeError("OTP 验证失败")
 
 
+def _protocol_fast_path(email: str) -> dict | None:
+    """协议查活快路径：优先 RT 刷新，其次密码+2FA 协议登录。
+
+    两条路都不开浏览器、不取邮箱验证码，成功即拿到最新 AT/RT 并写回数据库；
+    都失败时返回 None，调用方落回原有邮箱 OTP 链路。
+    """
+    from core import db
+
+    acc = db.get_account_by_email(email) or {}
+    rt = str(acc.get("chatgpt_refresh_token") or "").strip()
+    cid = str(acc.get("chatgpt_oauth_client_id") or "").strip()
+    if rt and cid:
+        try:
+            from core.oauth_refresh import refresh_account_credentials
+
+            res = refresh_account_credentials(email, write_back=True)
+        except Exception as exc:
+            res = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        if res.get("ok"):
+            logger.info(
+                "[查活] 快路径成功：RT 刷新 AT（ms=%s rt_rotated=%s）",
+                res.get("ms"), res.get("rt_rotated"),
+            )
+            return {
+                "ok": True,
+                "status": "live",
+                "method": "rt_refresh",
+                "access_token": str(res.get("access_token") or ""),
+                "refresh_token": str(res.get("refresh_token") or ""),
+                "session": {},
+                "checked_at": _now(),
+            }
+        logger.info("[查活] RT 刷新失败，尝试密码+2FA 协议登录：%s", str(res.get("error"))[:140])
+
+    password = str(acc.get("password") or "").strip()
+    totp = str(acc.get("totp_secret") or "").strip()
+    if password:
+        try:
+            from core.password_login import login_with_password
+
+            res = login_with_password(email, password, totp_secret=totp, write_back=True, timeout=30)
+        except Exception as exc:
+            res = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        if res.get("ok"):
+            logger.info("[查活] 快路径成功：密码+2FA 协议登录（ms=%s）", res.get("elapsed_ms"))
+            return {
+                "ok": True,
+                "status": "live",
+                "method": "password_login",
+                "access_token": str(res.get("access_token") or ""),
+                "refresh_token": str(res.get("refresh_token") or ""),
+                "session": {},
+                "checked_at": _now(),
+            }
+        logger.info("[查活] 密码+2FA 登录失败，落回邮箱 OTP 链路：%s", str(res.get("error"))[:140])
+    return None
+
+
 def check_account_liveness(
     email: str,
     proxy: str | None = None,
@@ -722,6 +780,9 @@ def check_account_liveness(
         force_protocol = str(method or "").strip().lower() in {"protocol", "protocol_password", "password"}
         if force_protocol:
             logger.info("[查活] 指定协议查活（账号+密码+2FA 优先，无浏览器）")
+            fast_result = _protocol_fast_path(email)
+            if fast_result is not None:
+                return fast_result
         # 快速路径（默认关，config: LIVE_CHECK_FAST_REFRESH）：协议 RT 刷新成功即判定 live，
         # 失败自动落回下面的浏览器/协议登录流程，行为与现状完全一致。
         if bool(getattr(registration_cfg, "LIVE_CHECK_FAST_REFRESH", False)):

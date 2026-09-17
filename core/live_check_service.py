@@ -152,7 +152,23 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
             _append_log(email, "[查活] 账号已删除或查活状态已被重置，取消执行")
             return {"ok": False, "status": "failed", "error": "账号已删除或查活状态已被重置"}
         country_hint = _young_account_country_hint(account_id)
-        route = _resolve_live_check_route(proxy, country_hint=country_hint)
+        try:
+            route = _resolve_live_check_route(proxy, country_hint=country_hint)
+        except Exception as exc:
+            # 协议查活（RT 刷新 / 密码+2FA）只是一次 HTTPS 调用，不依赖出口国家；
+            # 预检超时（3s 打 auth.openai.com）不该让整个查活失败。
+            if str(method or "").strip().lower() in {"protocol", "protocol_password", "password"}:
+                _append_log(email, f"[查活] 路由预检失败，协议查活改用默认出口继续：{str(exc)[:120]}")
+                route = {
+                    "proxy": None,
+                    "proxy_mode": "direct",
+                    "network_route": "direct",
+                    "proxy_used": "",
+                    "proxy_selection": None,
+                    "proxy_fallback_reason": f"preflight_failed: {type(exc).__name__}",
+                }
+            else:
+                raise
         selected_proxy = route.get("proxy")
         # 查活必须沿用账号注册时记录的邮箱来源。不能只调用
         # resolve_email_source(email)：Remail 等临时邮箱的上下文只在领取进程
@@ -214,6 +230,24 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
         db.update_account_liveness(account_id, result)
         if result.get("ok"):
             _append_log(email, "[查活] 完成：账号正常，已刷新最新 AT/accessToken")
+            # 查活顺带刷新套餐/额度：用刚拿到的新 AT 入队一次套餐查询（网络层，不占浏览器）
+            try:
+                from core.plan_check_service import enqueue_account_plan_check
+
+                plan_queued = enqueue_account_plan_check(
+                    account_id=account_id,
+                    email=email,
+                    access_token=str(result.get("access_token") or ""),
+                    trigger="after_liveness",
+                    proxy=None,
+                    timezone_offset_min="-",
+                )
+                if plan_queued.get("accepted"):
+                    _append_log(email, "[套餐] 查活完成，已入队刷新套餐/额度")
+                elif not plan_queued.get("busy"):
+                    _append_log(email, f"[套餐] 入队跳过：{plan_queued.get('error') or plan_queued.get('status') or 'unknown'}")
+            except Exception as exc:
+                _append_log(email, f"[套餐] 入队异常：{type(exc).__name__}")
             try:
                 from core.chatgpt2api_push import enqueue_account_push
                 pushed = enqueue_account_push(
