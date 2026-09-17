@@ -177,6 +177,17 @@ def _ensure_sqlite() -> None:
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_archived ON {table}(archived, id DESC)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_email ON {table}(email COLLATE NOCASE)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_created ON {table}(created_at DESC)")
+        # 邮箱就是账号的唯一键（应用层一直靠“按邮箱 upsert”维持）。这里补一条
+        # DB 级唯一索引兜底：写重了直接报错，而不是静默产生两行或覆盖别人的凭据。
+        # 历史库若已有重复邮箱，只告警不阻塞启动（需人工合并后才会自动建上）。
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_email_unique "
+                "ON accounts (email COLLATE NOCASE) WHERE email <> ''"
+            )
+        except sqlite3.IntegrityError:
+            logger.warning("[DB] accounts 存在重复邮箱，唯一索引未创建；请先合并重复账号")
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_email_pool_source_status ON email_pool(source, status, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_archived ON codex_accounts(archived, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_email ON codex_accounts(email COLLATE NOCASE)")
