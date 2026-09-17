@@ -4091,14 +4091,24 @@ def import_account_credentials(records: list[dict], source: str | None = None) -
             continue
         existing = get_account_by_email(email)
         if existing:
-            # 已有账号保留自己的邮箱来源（导入记录里的来源标记只是导入器元信息，
-            # 之前会把 icloud 账号刷成 access_token_import）。
+            # 已有账号：保留邮箱来源，并且**合并** extra_json——之前 insert_account 会
+            # 用 {"account_migration_imported": True} 整块覆盖，把注册期的
+            # registration_password / cloak_profile_seed / proxy_exit_country 全冲掉。
+            merged_extra = existing.get("extra_json")
+            if isinstance(merged_extra, str) and merged_extra.strip():
+                try:
+                    merged_extra = json.loads(merged_extra)
+                except Exception:
+                    merged_extra = {}
+            if not isinstance(merged_extra, dict):
+                merged_extra = {}
+            merged_extra["account_migration_imported"] = True
             insert_account(
                 email=email,
                 access_token=token,
                 email_source=str(existing.get("email_source") or "").strip()
                 or str(raw.get("email_source") or source or "").strip(),
-                extra={"account_migration_imported": True},
+                extra=merged_extra,
             )
             result["updated"] += 1
         else:

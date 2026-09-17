@@ -47,6 +47,36 @@ class SingleJsonRoundTripTests(unittest.TestCase):
                 self.assertGreaterEqual(int(result.get("password_imported") or 0), 1)
                 self.assertGreaterEqual(int(result.get("twofa_imported") or 0), 1)
 
+    def test_import_keeps_existing_extra_json(self):
+        """纯 AT 导入不能冲掉注册期 extra（密码种子/画像/出口国家都在这）。"""
+        with tempfile.TemporaryDirectory() as td:
+            with patch.multiple(db, **_db_storage_patches(Path(td))):
+                db.insert_account(
+                    email="keepx@example.com",
+                    access_token="AT-1",
+                    extra={"registration_password": "Pw-Keep", "cloak_profile_seed": "seed-1"},
+                )
+                db.import_account_credentials([{
+                    "email": "keepx@example.com",
+                    "access_token": "AT-2",
+                }])
+                acc = db.get_account_by_email("keepx@example.com") or {}
+                extra = acc.get("extra_json")
+                if isinstance(extra, str):
+                    import json as _json
+                    extra = _json.loads(extra)
+                self.assertEqual(str((extra or {}).get("registration_password") or ""), "Pw-Keep")
+                self.assertEqual(str((extra or {}).get("cloak_profile_seed") or ""), "seed-1")
+                self.assertTrue((extra or {}).get("account_migration_imported"))
+
+    def test_compact_list_falls_back_to_top_level_password(self):
+        from webui.app import _compact_account_for_list
+
+        row = {"id": 1, "email": "pw@example.com", "access_token": "AT", "password": "Top-Pw"}
+        self.assertEqual(_compact_account_for_list(row).get("password"), "Top-Pw")
+        row2 = {"id": 2, "email": "nopw@example.com", "access_token": "AT"}
+        self.assertNotIn("password", _compact_account_for_list(row2))
+
     def test_import_never_overwrites_existing_password(self):
         with tempfile.TemporaryDirectory() as td:
             with patch.multiple(db, **_db_storage_patches(Path(td))):

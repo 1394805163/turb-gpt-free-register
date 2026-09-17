@@ -167,6 +167,7 @@ def _compact_account_for_list(row: dict) -> dict:
     password = str(
         extra.get("registration_password")
         or row.get("registration_password")
+        or row.get("password")
         or ""
     ).strip()
     if password:
