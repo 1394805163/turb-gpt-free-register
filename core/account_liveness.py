@@ -685,10 +685,53 @@ def _protocol_fast_path(email: str) -> dict | None:
     # 本地需要新凭据时改用"密码+2FA 协议登录"换一条独立会话（~5 秒），
     # 之后自动回推，两边各用各的 RT，互不打扰。
     handed_off = str(acc.get("push_status") or "") in {"pushed", "success"}
-    has_login = bool(str(acc.get("password") or "").strip()) and bool(str(acc.get("totp_secret") or "").strip())
-    if handed_off and has_login:
-        logger.info("[查活] 账号已推送下游，跳过本地 RT 刷新，改用密码+2FA 协议登录换独立会话")
-        rt = ""
+    if handed_off:
+        # 已推给下游的账号：**下游自带 AT/RT 续期**，只要账号不死它就一直续。
+        # 本地不再消耗那条 RT（两边抢一个一次性 RT 才会 refresh_token_reused），
+        # 只用现有 AT 做一次轻量校验：AT 还没过期（~10 天）就能判存活 + 刷新额度；
+        # 真过期了也交给下游续，本地不抢 RT。
+        at = str(acc.get("access_token") or "").strip()
+        claims = {}
+        if at:
+            try:
+                from core.chatgpt_plan import token_claims
+                claims = token_claims(at) or {}
+            except Exception:
+                claims = {}
+        if at and not claims.get("token_expired"):
+            try:
+                from core.chatgpt_plan import check_account_plan
+
+                plan_res = check_account_plan(at, timezone_offset_min="-")
+            except Exception as exc:
+                plan_res = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+            if plan_res.get("ok"):
+                logger.info("[查活] 账号已托管下游：用现有 AT 校验通过（不消耗 RT）")
+                return {
+                    "ok": True,
+                    "status": "live",
+                    "method": "downstream_managed",
+                    "access_token": at,
+                    "session": {},
+                    "checked_at": _now(),
+                }
+            logger.info("[查活] 账号已托管下游：AT 校验未通过（%s），交给下游续期，本地不碰 RT",
+                        str(plan_res.get("error") or plan_res.get("http_status") or "")[:80])
+            return {
+                "ok": False,
+                "status": "temporary_error",
+                "method": "downstream_managed",
+                "checked_at": _now(),
+                "error": "已托管下游：本地 AT 失效，等下游刷新（本地不消耗 RT）",
+            }
+        logger.info("[查活] 账号已托管下游：本地 AT 已过期，交给下游续期（本地不碰 RT）")
+        return {
+            "ok": False,
+            "status": "temporary_error",
+            "method": "downstream_managed",
+            "checked_at": _now(),
+            "error": "已托管下游：本地 AT 已过期，等下游刷新（本地不消耗 RT）",
+        }
     if rt and cid:
         try:
             from core.oauth_refresh import refresh_account_credentials
