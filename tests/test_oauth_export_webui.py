@@ -95,13 +95,19 @@ class OAuthExportWebUiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertIn("完整 OAuth", response.get_json()["error"])
 
-    def test_account_toolbar_uses_oauth_export_label_instead_of_legacy_cpa_label(self):
+    def test_account_toolbar_has_single_json_export_button(self):
+        """导出按钮已合并成一个「导出 JSON」+ 格式选择（完整/sub2api/CPA/纯 AT）。"""
         from pathlib import Path
 
         template = (Path(__file__).resolve().parent.parent / "webui/templates/index.html").read_text(encoding="utf-8")
-        self.assertIn('id="btnDownloadSelectedCpaV2"', template)
-        self.assertIn("导出完整OAuth", template)
-        self.assertNotIn('id="btnDownloadSelectedCpaV2" disabled title="从 CPA auth-files 下载选中账号的 Codex JSON，并打包 ZIP">下载CPA', template)
+        self.assertIn('id="btnExportJsonV2"', template)
+        self.assertIn("导出 JSON", template)
+        # 老的两个导出按钮已合并下线
+        self.assertNotIn('id="btnDownloadSelectedCpaV2"', template)
+        self.assertNotIn('id="btnDownloadSelectedCredentialsV2"', template)
+        # 四种格式都要在 UI 里可选
+        for fmt in ("multi_account_v1", "sub2api", "cpa", "access_token"):
+            self.assertIn(f'value="{fmt}"', template)
 
     def test_frontend_complete_oauth_check_requires_actual_credential_fields(self):
         from pathlib import Path

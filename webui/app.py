@@ -1665,6 +1665,15 @@ def create_app(auth_code: str | None = None) -> Flask:
                 for item in value:
                     rows.extend(extract(item))
                 return rows
+            if isinstance(value, str):
+                # sub2api 的 codex-session 导入把每条凭据塞成 JSON 字符串
+                text = value.strip()
+                if text.startswith("{") or text.startswith("["):
+                    try:
+                        return extract(_json.loads(text))
+                    except Exception:
+                        return []
+                return []
             if not isinstance(value, dict):
                 return []
             # 兼容不同导出器的顶层包装：credentials/accounts/items/records/data。
@@ -1676,7 +1685,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             if credential_keys.intersection(value):
                 return [value]
             for key in (
-                "credentials", "accounts", "items", "records", "data",
+                "credentials", "accounts", "items", "records", "data", "contents",
                 "credential", "auth_json", "authJson", "auth", "auth_file", "authFile", "file",
             ):
                 nested = value.get(key)
@@ -1808,33 +1817,113 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         if not accounts:
             return jsonify({"ok": False, "error": "没有可导出的账号", "errors": errors}), 404
-        payload = {
-            "exported_at": _dt.now().isoformat(timespec="seconds"),
-            "source": "register_manager",
-            "format": "multi_account_v1",
-            "count": len(accounts),
-            "with_password": sum(1 for a in accounts if a.get("password")),
-            "with_twofa": sum(1 for a in accounts if a.get("totp_secret")),
-            "with_refresh_token": sum(1 for a in accounts if a.get("refresh_token")),
-            "errors": errors,
-            "accounts": accounts,
-        }
-        body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-        filename = f"accounts-export-{_dt.now().strftime('%Y%m%d-%H%M%S')}.json"
+
+        fmt = str(data.get("format") or "multi_account_v1").strip().lower()
+        ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+        exported_at = _dt.now().isoformat(timespec="seconds")
+        mimetype = "application/json"
+
+        if fmt in {"access_token", "at", "access-token", "pure_at"}:
+            # 纯 AT 格式：每行 email----access_token，下游最常见、最省事的形态
+            lines = [f"{a['email']}----{a['access_token']}" for a in accounts if a.get("access_token")]
+            body = "\n".join(lines) + "\n"
+            filename = f"accounts-at-{ts}.txt"
+            mimetype = "text/plain; charset=utf-8"
+        elif fmt in {"sub2api", "sub2"}:
+            # sub2api accounts[] 形态：{"accounts":[{name,platform,type,credentials,extra}],"proxies":[]}
+            entries = []
+            for a in accounts:
+                entries.append({
+                    "name": a["email"],
+                    "platform": "openai",
+                    "type": "codex",
+                    "credentials": {
+                        "email": a["email"],
+                        "access_token": a["access_token"],
+                        "refresh_token": a["refresh_token"],
+                        "id_token": a["id_token"],
+                        "account_id": a["account_id"],
+                        "chatgpt_account_id": a["account_id"],
+                        "plan_type": a["plan_type"] or "free",
+                        "expired": a["expired"],
+                        "oauth_client_id": a["oauth_client_id"],
+                        "session_token": a["session_token"],
+                    },
+                    "extra": {
+                        "email": a["email"],
+                        "account_id": a["account_id"],
+                        "source": "register_manager",
+                        "live_check_status": a.get("live_check_status") or "",
+                    },
+                })
+            payload = {
+                "exported_at": exported_at,
+                "source": "register_manager",
+                "format": "sub2api_accounts",
+                "count": len(entries),
+                "proxies": [],
+                "errors": errors,
+                "accounts": entries,
+            }
+            body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            filename = f"sub2api-accounts-{ts}.json"
+        elif fmt in {"cpa", "codex", "cpajson"}:
+            # CPA / Codex CLI 形态：单个 codex 凭据对象数组（等同 codex-*.json 的合集）
+            entries = []
+            for a in accounts:
+                entries.append({
+                    "type": "codex",
+                    "email": a["email"],
+                    "access_token": a["access_token"],
+                    "refresh_token": a["refresh_token"],
+                    "id_token": a["id_token"],
+                    "expired": a["expired"],
+                    "account_id": a["account_id"],
+                    "disabled": bool(a.get("disabled")),
+                    "last_refresh": exported_at,
+                    "oauth_client_id": a["oauth_client_id"],
+                    "oauth_status": "success" if a.get("refresh_token") else "access_only",
+                    "session_token": a["session_token"],
+                })
+            payload = {
+                "exported_at": exported_at,
+                "source": "register_manager",
+                "format": "cpa_codex",
+                "count": len(entries),
+                "errors": errors,
+                "accounts": entries,
+            }
+            body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            filename = f"cpa-codex-{ts}.json"
+        else:
+            payload = {
+                "exported_at": exported_at,
+                "source": "register_manager",
+                "format": "multi_account_v1",
+                "count": len(accounts),
+                "with_password": sum(1 for a in accounts if a.get("password")),
+                "with_twofa": sum(1 for a in accounts if a.get("totp_secret")),
+                "with_refresh_token": sum(1 for a in accounts if a.get("refresh_token")),
+                "errors": errors,
+                "accounts": accounts,
+            }
+            body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            filename = f"accounts-export-{ts}.json"
         if data.get("prepare"):
-            download_id = _put_prepared_download(body.encode("utf-8"), filename, "application/json")
+            download_id = _put_prepared_download(body.encode("utf-8"), filename, mimetype)
             return jsonify({
                 "ok": True,
                 "prepared": True,
                 "download_id": download_id,
                 "download_url": f"/api/downloads/{download_id}",
                 "filename": filename,
+                "format": fmt,
                 "added_count": len(accounts),
                 "error_count": len(errors),
             })
         return Response(
             body,
-            mimetype="application/json",
+            mimetype=mimetype,
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "no-store",
@@ -3705,6 +3794,26 @@ def create_app(auth_code: str | None = None) -> Flask:
             _pwd_login_state["current"] = ""
             _pwd_login_state["finished_at"] = _pipe_now_iso()
 
+    def _parse_access_token_line(line: str) -> dict | None:
+        """识别「email----access_token」这类纯 AT 行；不是就返回 None。"""
+        text = str(line or "").strip()
+        if not text or text.startswith("#") or "@" not in text:
+            return None
+        parts = None
+        for sep in ("----", "||", "\t", ",", " "):
+            if sep in text:
+                parts = [p.strip() for p in text.split(sep) if p.strip()]
+                break
+        if not parts or len(parts) != 2:
+            return None
+        email, token = parts[0], parts[1]
+        if "@" not in email or len(token) < 80:
+            return None
+        looks_like_token = token.startswith("eyJ") or token.startswith("rt.") or token.count(".") >= 2
+        if not looks_like_token:
+            return None
+        return {"email": email, "access_token": token, "email_source": "access_token_import"}
+
     @app.post("/api/accounts/import-password-login")
     def api_accounts_import_password_login():
         """账密+2FA 导入并自动协议登录验证（纯协议，不启动浏览器）。
@@ -3724,11 +3833,36 @@ def create_app(auth_code: str | None = None) -> Flask:
                     seen.add(email)
                     items.append((email, password, totp))
         else:
+            at_records: list[dict] = []
             for line in str(data.get("text") or "").replace("\r", "\n").split("\n"):
+                # 先判纯 AT 行：第二段是长 token（JWT / RT）时不能当密码走协议登录
+                at = _parse_access_token_line(line)
+                if at:
+                    email_key = at["email"].lower()
+                    if email_key not in seen:
+                        seen.add(email_key)
+                        at_records.append(at)
+                    continue
                 parsed = _parse_password_line(line)
-                if parsed and parsed[0] not in seen:
-                    seen.add(parsed[0])
-                    items.append(parsed)
+                if parsed:
+                    if parsed[0] not in seen:
+                        seen.add(parsed[0])
+                        items.append(parsed)
+                    continue
+            if at_records:
+                try:
+                    from core import db as _db
+
+                    at_result = _db.import_account_credentials(at_records, source="access_token_import")
+                    if not items:
+                        return jsonify({
+                            "ok": True,
+                            "queued": 0,
+                            "access_token_imported": at_result.get("inserted", 0) + at_result.get("updated", 0),
+                            "detail": at_result,
+                        })
+                except Exception as exc:
+                    return jsonify({"ok": False, "error": f"纯 AT 导入失败: {type(exc).__name__}: {exc}"}), 500
         if not items:
             return jsonify({"ok": False, "error": "没有解析到有效账号行（email----password----totp）"}), 400
         with _pwd_login_lock:
