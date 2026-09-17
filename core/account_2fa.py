@@ -96,6 +96,12 @@ def set_account_2fa(
     if not proxy and not proxy_selection:
         proxy, proxy_selection = _resolve_fresh_account_route(email)
 
+    from core.pipeline_concurrency import pipeline_slot
+
+    # 浏览器闸门：与注册/查活共用 CloakBrowser 免费档的唯一并发席位，
+    # 避免流水线与查活队列同时启动浏览器触发 session limit。
+    _gate = pipeline_slot("live_check")
+    _gate.__enter__()
     driver = None
     try:
         driver, opened = build_cloak_driver(
@@ -198,6 +204,11 @@ def set_account_2fa(
                 logger.warning("[补2FA] 回写 DB 失败：%s", str(exc)[:160])
         return {"ok": True, "status": "enabled", "email": email, "totp_secret": secret, "mfa": mfa_status}
     except Exception as exc:
+        from core.cloakbrowser_driver import is_license_busy_error
+
+        if is_license_busy_error(exc):
+            logger.warning("[补2FA] CloakBrowser 席位居满，稍后重试：%s", str(exc)[:120])
+            return {"ok": False, "status": "license_busy", "email": email, "error": str(exc)[:200]}
         logger.exception("[补2FA] 失败")
         return {"ok": False, "status": "failed", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
     finally:
@@ -210,3 +221,7 @@ def set_account_2fa(
                 driver.quit()
             except Exception:
                 pass
+        try:
+            _gate.__exit__(None, None, None)
+        except Exception:
+            pass

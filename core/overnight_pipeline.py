@@ -512,7 +512,11 @@ def _twofa_liveness_phase(token: str) -> None:
             _save(st)
             _run_liveness()
             continue
-        pending = [a for a in (st.get("accounts") or []) if not a.get("twofa_ok")]
+        # 单个账号 2FA 失败不能卡住整队：每个账号最多尝试 2 次后跳过。
+        pending = [
+            a for a in (st.get("accounts") or [])
+            if not a.get("twofa_ok") and int(a.get("twofa_attempts") or 0) < 2
+        ]
         if not pending:
             if st.get("liveness_done"):
                 return
@@ -538,6 +542,8 @@ def _twofa_liveness_phase(token: str) -> None:
                         a["password_status"] = "ok_retry"
             _log(st, f"补密码重试 {email}: {retry_status}")
             _save(st)
+            if retry_status == "license_busy":
+                _sleep_interruptible(90)
             continue
         status = "failed"
         secret = ""
@@ -551,11 +557,16 @@ def _twofa_liveness_phase(token: str) -> None:
                 status = str(result.get("status") or "failed")
         except Exception as exc:
             status = f"error:{type(exc).__name__}"
+        if status == "license_busy":
+            _log(st, f"2FA {email}: 浏览器席位居满，退避重试（不计失败）")
+            _sleep_interruptible(90)
+            continue
         st = _load()
         for a in st.get("accounts") or []:
             if a.get("email") == email:
                 a["twofa_ok"] = status in ("ok", "updated", "existing")
                 a["twofa_status"] = status
+                a["twofa_attempts"] = int(a.get("twofa_attempts") or 0) + 1
                 if secret:
                     a["totp_secret"] = secret
         _log(st, f"2FA {email}: {status}")

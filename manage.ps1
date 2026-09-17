@@ -223,7 +223,7 @@ function Stop-WebUi {
         Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
     }
     if ($tree.Count -gt 0) { Write-Step "Stopped $($tree.Count) child process(es)." }
-    Stop-Process -Id $servicePid -Force
+    Stop-Process -Id $servicePid -Force -ErrorAction SilentlyContinue
     Wait-Process -Id $servicePid -Timeout 10 -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
     Write-Step "WebUI stopped."

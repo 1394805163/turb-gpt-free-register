@@ -514,6 +514,12 @@ def _detect_openai_route_geo(proxy_url: str | None = None) -> dict:
         return {}
 
 
+def is_license_busy_error(exc: BaseException) -> bool:
+    """CloakBrowser 并发席位被占用（免费档 1 并发）时的可退避错误。"""
+    text = f"{type(exc).__name__}: {exc}"
+    return "session limit reached" in text or "CloakBrowserLicenseError" in text
+
+
 def _assert_mihomo_us_exit(selection: dict | None, geo: dict | None) -> None:
     data = selection if isinstance(selection, dict) else {}
     if str(data.get("mode") or "") != "mihomo_us":

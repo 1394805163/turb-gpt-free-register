@@ -155,9 +155,16 @@ def _resolve_fresh_account_route(email: str) -> tuple[str | None, dict | None]:
         try:
             from config import proxy as proxy_cfg
 
+            # 账号注册地之外再并入全局允许地区（US/JP/TW/SG 之类）：
+            # 后置流程（补密码/补2FA/查活）只要求落在允许地区内，
+            # 单一国家选不出节点时不该把整条流程判死。
             allowed_union = {hint} | {
                 str(code).strip().upper()
                 for code in (getattr(proxy_cfg, "REGISTRATION_PROXY_ALLOWED_COUNTRIES", []) or [])
+                if str(code).strip()
+            } | {
+                str(code).strip().upper()
+                for code in (getattr(proxy_cfg, "MIHOMO_REGISTRATION_ALLOWED_COUNTRIES", []) or [])
                 if str(code).strip()
             }
             selection = proxy_cfg.pick_registration_proxy(allowed_countries_override=allowed_union)
@@ -200,6 +207,12 @@ def refresh_account_session(
     if not proxy and not proxy_selection:
         proxy, proxy_selection = _resolve_fresh_account_route(email)
 
+    from core.pipeline_concurrency import pipeline_slot
+
+    # 浏览器闸门：与注册/查活共用 CloakBrowser 免费档的唯一并发席位，
+    # 避免补密码/补2FA 与注册流水线同时开浏览器触发 session limit。
+    _gate = pipeline_slot("live_check")
+    _gate.__enter__()
     driver = None
     try:
         driver, opened = build_cloak_driver(
@@ -245,6 +258,11 @@ def refresh_account_session(
             "access_token": new_at, "written": written,
         }
     except Exception as exc:
+        from core.cloakbrowser_driver import is_license_busy_error
+
+        if is_license_busy_error(exc):
+            logger.warning("[会话刷新] CloakBrowser 席位居满，稍后重试：%s", str(exc)[:120])
+            return {"ok": False, "status": "license_busy", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
         logger.exception("[会话刷新] 失败")
         return {"ok": False, "status": "failed", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
     finally:
@@ -257,6 +275,10 @@ def refresh_account_session(
                 driver.quit()
             except Exception:
                 pass
+        try:
+            _gate.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 def set_account_password(
@@ -297,6 +319,12 @@ def set_account_password(
     if not proxy and not proxy_selection:
         proxy, proxy_selection = _resolve_fresh_account_route(email)
 
+    from core.pipeline_concurrency import pipeline_slot
+
+    # 浏览器闸门：与注册/查活共用 CloakBrowser 免费档的唯一并发席位，
+    # 避免补密码/补2FA 与注册流水线同时开浏览器触发 session limit。
+    _gate = pipeline_slot("live_check")
+    _gate.__enter__()
     driver = None
     try:
         driver, opened = build_cloak_driver(
@@ -436,6 +464,11 @@ def set_account_password(
             "url": final_url, "settings_label": verify_label,
         }
     except Exception as exc:
+        from core.cloakbrowser_driver import is_license_busy_error
+
+        if is_license_busy_error(exc):
+            logger.warning("[补密码] CloakBrowser 席位居满，稍后重试：%s", str(exc)[:120])
+            return {"ok": False, "status": "license_busy", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
         logger.exception("[补密码] 失败")
         return {"ok": False, "status": "failed", "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
     finally:
@@ -448,3 +481,7 @@ def set_account_password(
                 driver.quit()
             except Exception:
                 pass
+        try:
+            _gate.__exit__(None, None, None)
+        except Exception:
+            pass
