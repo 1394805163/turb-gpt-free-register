@@ -660,6 +660,14 @@ def _validate_with_retry(
     raise last_exc if last_exc else RuntimeError("OTP 验证失败")
 
 
+_DEAD_MARKERS = (
+    "deleted or deactivated",
+    "account_deactivated",
+    "deactivated",
+    "invalid_grant",
+)
+
+
 def _protocol_fast_path(email: str) -> dict | None:
     """协议查活快路径：优先 RT 刷新，其次密码+2FA 协议登录。
 
@@ -671,6 +679,7 @@ def _protocol_fast_path(email: str) -> dict | None:
     acc = db.get_account_by_email(email) or {}
     rt = str(acc.get("chatgpt_refresh_token") or "").strip()
     cid = str(acc.get("chatgpt_oauth_client_id") or "").strip()
+    rt_error = ""
     if rt and cid:
         try:
             from core.oauth_refresh import refresh_account_credentials
@@ -692,7 +701,13 @@ def _protocol_fast_path(email: str) -> dict | None:
                 "session": {},
                 "checked_at": _now(),
             }
-        logger.info("[查活] RT 刷新失败，尝试密码+2FA 协议登录：%s", str(res.get("error"))[:140])
+        rt_error = f"{res.get('status') or ''} {res.get('error') or ''} {str(res.get('detail') or '')}".strip()
+        logger.info("[查活] RT 刷新失败，尝试密码+2FA 协议登录：%s", rt_error[:140])
+
+    # 账密/RT 都判死时直接给终态，避免继续走"等邮箱验证码"的慢链路（死号永远等不到码）。
+    dead_text = " ".join(str(item or "") for item in (rt_error,))
+    if any(marker in dead_text.lower() for marker in _DEAD_MARKERS):
+        return {"ok": False, "status": "deactivated", "checked_at": _now(), "error": f"账号已停用/删除（RT 刷新确认）：{dead_text[:120]}"}
 
     password = str(acc.get("password") or "").strip()
     totp = str(acc.get("totp_secret") or "").strip()
@@ -714,7 +729,10 @@ def _protocol_fast_path(email: str) -> dict | None:
                 "session": {},
                 "checked_at": _now(),
             }
-        logger.info("[查活] 密码+2FA 登录失败，落回邮箱 OTP 链路：%s", str(res.get("error"))[:140])
+        pwd_error = f"{res.get('status') or ''} {res.get('error') or ''} {str(res.get('detail') or '')}".strip()
+        if any(marker in pwd_error.lower() for marker in _DEAD_MARKERS):
+            return {"ok": False, "status": "deactivated", "checked_at": _now(), "error": f"账号已停用/删除（协议登录确认）：{pwd_error[:120]}"}
+        logger.info("[查活] 密码+2FA 登录失败，落回邮箱 OTP 链路：%s", pwd_error[:140])
     return None
 
 
