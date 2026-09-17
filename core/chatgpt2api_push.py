@@ -182,12 +182,12 @@ def push_account(
         "Accept": "application/json",
     }
     body = {
-        # 远端 AccountCreateRequest 要求 tokens；accounts 用于保留 CPA OAuth
-        # 三件套和 email 等账号元数据。当前服务端要求 tokens；保留旧 AT
-        # 时允许新 token 形成新记录，避免在覆盖前丢失旧凭据。
-        "tokens": [token],
+        # 只发 accounts（结构化账号）：远端按邮箱 upsert，重复推送只更新不新增。
+        # 早先同时发 tokens=[access_token] 时，v3.2.3 会按 token 新建一条记录，
+        # 凭据一刷新就会在同一邮箱下堆出重复账号。
         "accounts": [_account_payload(account)],
-        "refresh_after_import": False,
+        "sync_after_import": False,
+        "refresh": False,
     }
     last_error = "push_failed"
     last_http_status = None
