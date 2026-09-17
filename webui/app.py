@@ -1721,6 +1721,126 @@ def create_app(auth_code: str | None = None) -> Flask:
         result = db.import_account_credentials(records, source=(request.form.get("source") if uploaded else None))
         return jsonify({"ok": True, **result})
 
+    @app.post("/api/accounts/export-json-bulk")
+    def api_accounts_export_json_bulk():
+        """导出**单个完整 JSON**（邮箱 + 密码 + 2FA + OAuth 凭据），不再打包 ZIP。
+
+        结构：{"format": "multi_account_v1", "accounts": [...]}
+        每个账号同时兼容 sub2api / CPA 的 codex 凭据字段，下游可直接按邮箱取用；
+        也要能被本机 /api/accounts/import-oauth 原样导回（含密码与 2FA）。
+        """
+        from datetime import datetime as _dt
+
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 2000:
+            return jsonify({"ok": False, "error": "单次最多导出 2000 个账号"}), 400
+
+        def first(*values) -> str:
+            for value in values:
+                text = str(value or "").strip()
+                if text:
+                    return text
+            return ""
+
+        accounts: list[dict] = []
+        errors: list[dict] = []
+        seen: set[int] = set()
+        for raw_id in ids:
+            try:
+                account_id = int(raw_id)
+            except (TypeError, ValueError):
+                errors.append({"id": raw_id, "error": "ID 非法"})
+                continue
+            if account_id in seen:
+                continue
+            seen.add(account_id)
+            account = db.get_account(account_id)
+            if not account:
+                errors.append({"id": account_id, "error": "账号不存在"})
+                continue
+            email = first(account.get("email"))
+            if not email:
+                errors.append({"id": account_id, "error": "缺少 email"})
+                continue
+            access_token = first(
+                account.get("chatgpt_oauth_access_token"), account.get("access_token")
+            )
+            refresh_token = first(account.get("chatgpt_refresh_token"))
+            id_token = first(account.get("chatgpt_id_token"), account.get("id_token"))
+            complete = bool(access_token and refresh_token and id_token)
+            accounts.append({
+                # ---- sub2api / CPA 兼容字段 ----
+                "type": "codex" if complete else "account_migration",
+                "email": email,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "expired": first(
+                    account.get("chatgpt_token_expires_at"),
+                    account.get("token_expires_at"),
+                    account.get("expires_at"),
+                ),
+                "account_id": first(
+                    account.get("chatgpt_account_id"), account.get("account_id")
+                ),
+                "oauth_client_id": first(
+                    account.get("chatgpt_oauth_client_id"), account.get("oauth_client_id")
+                ),
+                "session_token": first(account.get("session_token")),
+                "disabled": bool(
+                    account.get("archived")
+                    or str(account.get("codex_status") or "").lower() in {"deactivated", "disabled"}
+                    or str(account.get("live_check_status") or "").lower()
+                    in {"confirmed_dead", "deactivated"}
+                ),
+                # ---- 本机扩展字段（导入时原样写回）----
+                "credential_kind": "complete" if complete else "access_only",
+                "password": first(account.get("password")),
+                "totp_secret": first(account.get("totp_secret")),
+                "plan_type": first(account.get("plan_type"), account.get("current_plan_type")),
+                "email_source": first(account.get("email_source")),
+                "live_check_status": first(account.get("live_check_status")),
+                "note": str(account.get("note") or ""),
+            })
+
+        if not accounts:
+            return jsonify({"ok": False, "error": "没有可导出的账号", "errors": errors}), 404
+        payload = {
+            "exported_at": _dt.now().isoformat(timespec="seconds"),
+            "source": "register_manager",
+            "format": "multi_account_v1",
+            "count": len(accounts),
+            "with_password": sum(1 for a in accounts if a.get("password")),
+            "with_twofa": sum(1 for a in accounts if a.get("totp_secret")),
+            "with_refresh_token": sum(1 for a in accounts if a.get("refresh_token")),
+            "errors": errors,
+            "accounts": accounts,
+        }
+        body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        filename = f"accounts-export-{_dt.now().strftime('%Y%m%d-%H%M%S')}.json"
+        if data.get("prepare"):
+            download_id = _put_prepared_download(body.encode("utf-8"), filename, "application/json")
+            return jsonify({
+                "ok": True,
+                "prepared": True,
+                "download_id": download_id,
+                "download_url": f"/api/downloads/{download_id}",
+                "filename": filename,
+                "added_count": len(accounts),
+                "error_count": len(errors),
+            })
+        return Response(
+            body,
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.post("/api/accounts/download-credentials-bulk")
     def api_accounts_download_credentials_bulk():
         """导出账号迁移包；完整 OAuth 和只有 access_token 的账号均可导出。"""

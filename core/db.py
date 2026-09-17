@@ -4121,6 +4121,35 @@ def import_account_credentials(records: list[dict], source: str | None = None) -
         for key, value in {"complete": len(oauth_records), "access_only": access_only_count}.items()
         if value
     }
+    # 导出的单文件 JSON 会带上密码 / 2FA，导入时一并写回，避免"导回来少了凭据"。
+    # 只补空字段，绝不覆盖本地已有值（本地可能已经补过密码或开过 2FA）。
+    password_imported = 0
+    twofa_imported = 0
+    for raw in records or []:
+        if not isinstance(raw, dict):
+            continue
+        email = str(raw.get("email") or "").strip()
+        if not email:
+            continue
+        acc = get_account_by_email(email)
+        if not acc:
+            continue
+        acc_id = int(acc.get("id") or 0)
+        password = str(raw.get("password") or raw.get("registration_password") or "").strip()
+        totp = str(raw.get("totp_secret") or raw.get("totpSecret") or "").strip()
+        if password and not str(acc.get("password") or "").strip():
+            if update_account_registration_password(email, password):
+                password_imported += 1
+        if totp and not str(acc.get("totp_secret") or "").strip() and acc_id:
+            if update_account_totp_secret(
+                acc_id,
+                {"ok": True, "status": "success", "totp_secret": totp, "message": "导入写入"},
+            ):
+                twofa_imported += 1
+    if password_imported:
+        result["password_imported"] = password_imported
+    if twofa_imported:
+        result["twofa_imported"] = twofa_imported
     result["items"] = [item for item in _load_accounts() if item.get("access_token")]
     return result
 
