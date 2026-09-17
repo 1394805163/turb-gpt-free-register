@@ -90,6 +90,13 @@ def main() -> int:
         # 刚验证过的凭据本身就是存活的证据，这里直接落 live，避免为了过闸门再刷一次
         # （多刷一次会再次轮换 RT，把下游刚拿到的凭据又弄脏）。
         fresh_row = db.get_account(acc_id) or {}
+        if entry.get("refresh") == "failed":
+            entry["push"] = "skipped_no_credential"
+            entry["push_ok"] = False
+            report["items"].append(entry)
+            print(f"[{idx}/{len(rows)}] {acc_id} {email[:34]:<34} 凭据=failed（跳过推送）", flush=True)
+            time.sleep(args.sleep)
+            continue
         if fresh_row.get("access_token"):
             db.update_account_liveness(
                 acc_id,

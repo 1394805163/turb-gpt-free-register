@@ -127,6 +127,14 @@ def push_account(
     account = db.get_account(account_id)
     if not account:
         return {"ok": False, "status": "missing", "error": "账号不存在"}
+    # 没有 refresh_token 的账号（例如注册后就被删的死号）不要推给下游：
+    # 下游靠 RT 续期，AT 过期后只会变成一条报错记录。
+    if not str(account.get("chatgpt_refresh_token") or "").strip():
+        return {
+            "ok": False,
+            "status": "no_refresh_token",
+            "error": "账号没有 refresh_token（下游无法续期），已跳过推送",
+        }
     token = str(account.get("access_token") or "").strip()
     fingerprint = token_fingerprint(token)
     if (
