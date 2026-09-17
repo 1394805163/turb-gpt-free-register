@@ -680,6 +680,15 @@ def _protocol_fast_path(email: str) -> dict | None:
     rt = str(acc.get("chatgpt_refresh_token") or "").strip()
     cid = str(acc.get("chatgpt_oauth_client_id") or "").strip()
     rt_error = ""
+    # 已下发给下游的账号：RT 已经交给下游在用，本地**不要**再拿它去刷，
+    # 否则两边抢同一个一次性 RT（谁后用谁报 refresh_token_reused）。
+    # 本地需要新凭据时改用"密码+2FA 协议登录"换一条独立会话（~5 秒），
+    # 之后自动回推，两边各用各的 RT，互不打扰。
+    handed_off = str(acc.get("push_status") or "") in {"pushed", "success"}
+    has_login = bool(str(acc.get("password") or "").strip()) and bool(str(acc.get("totp_secret") or "").strip())
+    if handed_off and has_login:
+        logger.info("[查活] 账号已推送下游，跳过本地 RT 刷新，改用密码+2FA 协议登录换独立会话")
+        rt = ""
     if rt and cid:
         try:
             from core.oauth_refresh import refresh_account_credentials
