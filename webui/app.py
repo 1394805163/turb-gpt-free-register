@@ -1757,6 +1757,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         accounts: list[dict] = []
         errors: list[dict] = []
+        exported_ids: list[int] = []
         seen: set[int] = set()
         for raw_id in ids:
             try:
@@ -1781,6 +1782,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             refresh_token = first(account.get("chatgpt_refresh_token"))
             id_token = first(account.get("chatgpt_id_token"), account.get("id_token"))
             complete = bool(access_token and refresh_token and id_token)
+            exported_ids.append(account_id)
             accounts.append({
                 # ---- sub2api / CPA 兼容字段 ----
                 "type": "codex" if complete else "account_migration",
@@ -1818,6 +1820,13 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         if not accounts:
             return jsonify({"ok": False, "error": "没有可导出的账号", "errors": errors}), 404
+
+        # 标记已导出：UI 上显示“已导出”徽章并累计次数（避免重复导出/重复推送给下游）。
+        if exported_ids:
+            try:
+                db.mark_accounts_exported(exported_ids)
+            except Exception as exc:
+                logger.warning("[export-json] 标记已导出失败: %s", str(exc)[:160])
 
         fmt = str(data.get("format") or "multi_account_v1").strip().lower()
         ts = _dt.now().strftime("%Y%m%d-%H%M%S")
@@ -3747,11 +3756,34 @@ def create_app(auth_code: str | None = None) -> Flask:
             try:
                 acc = _db.get_account_by_email(email) or {}
                 country = str(acc.get("proxy_exit_country") or "")
+                # ① 先落库：邮箱+密码+2FA 立即入库，协议验证失败也不丢数据（先导入后验证）。
+                if acc:
+                    _db.update_account_registration_password(email, password)
+                    if totp:
+                        _db.update_account_totp_secret_by_email(email, totp)
+                else:
+                    _db.insert_account(
+                        email=email,
+                        access_token="",
+                        totp_secret=totp or None,
+                        email_source="import_password",
+                        codex_status="skipped",
+                        codex_error="导入账号未执行 Codex 授权",
+                    )
+                    _db.update_account_registration_password(email, password)
+                # Codex 授权未跑过的导入账号标为“已跳过”，UI Codex 列有明确状态可筛选。
+                current_codex = str((_db.get_account_by_email(email) or {}).get("codex_status") or "").strip()
+                if not current_codex:
+                    try:
+                        _db.update_account_codex_status(email, "skipped", "导入账号未执行 Codex 授权")
+                    except Exception:
+                        pass
+                entry["stored"] = True
+                # ② 再协议验证：换取 AT/RT/ID Token 并 CAS 写回。
                 res = login_with_password(
                     email, password, totp_secret=totp, country_hint=country,
                     write_back=False, timeout=30,
                 )
-                entry["ok"] = bool(res.get("ok"))
                 if res.get("ok"):
                     credential = {
                         "access_token": res["access_token"],
@@ -3761,26 +3793,12 @@ def create_app(auth_code: str | None = None) -> Flask:
                         "source": "password_login",
                         "expires_at": res.get("expires_at"),
                     }
-                    if acc:
-                        _db.update_account_registration_password(email, password)
-                        if totp:
-                            _db.update_account_totp_secret(email, totp)
-                        old_at = str(acc.get("access_token") or acc.get("chatgpt_oauth_access_token") or "")
-                        entry["write"] = _db.update_account_chatgpt_oauth(email, credential, expected_access_token=old_at)
-                    else:
-                        _db.insert_account(
-                            email=email,
-                            access_token=res["access_token"],
-                            totp_secret=totp or None,
-                            chatgpt_oauth={
-                                "access_token": res["access_token"],
-                                "refresh_token": res["refresh_token"],
-                                "id_token": res["id_token"],
-                            },
-                            email_source="import_password",
-                        )
-                        _db.update_account_registration_password(email, password)
-                        entry["write"] = _db.update_account_chatgpt_oauth(email, credential, expected_access_token=res["access_token"])
+                    current = _db.get_account_by_email(email) or {}
+                    old_at = str(current.get("access_token") or current.get("chatgpt_oauth_access_token") or "")
+                    entry["write"] = _db.update_account_chatgpt_oauth(email, credential, expected_access_token=old_at)
+                    entry["ok"] = bool((entry.get("write") or {}).get("updated"))
+                    if not entry["ok"]:
+                        entry["error"] = str((entry.get("write") or {}).get("reason") or "凭据写回失败")[:200]
                 else:
                     entry["error"] = str(res.get("error") or "")[:200]
             except Exception as exc:
@@ -3789,7 +3807,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 _pwd_login_state["done"] += 1
                 _pwd_login_state["ok" if entry["ok"] else "failed"] += 1
                 _pwd_login_state["results"].append(entry)
-            time.sleep(15)
+            time.sleep(3)
         with _pwd_login_lock:
             _pwd_login_state["running"] = False
             _pwd_login_state["current"] = ""

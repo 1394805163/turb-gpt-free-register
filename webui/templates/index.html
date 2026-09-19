@@ -3506,6 +3506,11 @@ function _codexCell(r) {
   if (s === 'deactivated') return `<span class="pill status-failed" title="授权记录显示账号异常，建议通过查活确认账号状态">失败</span>`;
   return `<span class="muted">-</span>`;
 }
+function _exportedTitle(r) {
+  const t = r.exported_at || '';
+  const n = Number(r.export_count || 0);
+  return n > 1 ? `导出时间: ${t} · 共 ${n} 次` : `导出时间: ${t}`;
+}
 function _codexCellV2(r) {
   const s = r.codex_status || '';
   const err = r.codex_error || '';
@@ -3786,7 +3791,7 @@ function renderAccounts() {
       <td class="col-check"><input type="checkbox" class="account-row-check" data-account-id="${esc(r.id)}" ${ACCOUNT_SELECTED.has(Number(r.id)) ? 'checked' : ''}></td>
       <td class="col-id">#${esc(r.id)}</td>
       <td class="col-email" title="${esc(r.email || '-')}${r.original_email ? `\n原邮箱: ${esc(r.original_email)}` : ''}\n${esc(r.user_name || '-')}">
-        <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
+        <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}${r.exported_at ? ` <span class="pill status-used" title="${esc(_exportedTitle(r))}">已导出</span>` : ''}</div>
         ${r.original_email ? `<div class="acc-v2-email-history">原邮箱: ${esc(r.original_email)}</div>` : ''}
         <div class="acc-v2-email-user">${esc(r.user_name || '-')}</div>
         ${['queued','running'].includes(r.email_change_status) ? '<div class="acc-v2-email-status">换绑中</div>' : (r.email_change_status === 'failed' ? `<div class="acc-v2-email-status" title="${esc(r.email_change_error || '')}">换绑失败: ${esc(r.email_change_error || '-')}</div>` : '')}

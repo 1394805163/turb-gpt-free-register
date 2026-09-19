@@ -106,6 +106,7 @@ def login_with_password(
     totp_secret: str = "",
     proxy: str | None = None,
     country_hint: str = "",
+    fingerprint_seed: str = "",
     write_back: bool = False,
     timeout: int = 30,
 ) -> dict:
@@ -115,6 +116,7 @@ def login_with_password(
         totp_secret: 账号 2FA 密钥（base32）；账号启用 2FA 时必填。
         proxy: 显式代理；None 时按 country_hint 解析或走默认池。
         country_hint: 出口国家（如 "SG"/"US"），用于锁定与账号一致的登录出口。
+        fingerprint_seed: 账号级稳定画像种子；缺省时按邮箱推导（account_fingerprint_seed）。
         write_back: True 时经 CAS 写回注册机 DB（update_account_chatgpt_oauth）。
     """
     target = str(email or "").strip()
@@ -139,7 +141,16 @@ def login_with_password(
     from core.session import BrowserSession
     from config.codex import CODEX_AUTH0_CLIENT
 
-    session = BrowserSession(proxy=resolved_proxy)
+    # 账号级稳定画像：真实用户长期用同一台设备，每次登录随机换 device_id/画像
+    # 反而是明显的风控信号（与注册/查活/2FA 流程保持同一份指纹）。
+    seed = str(fingerprint_seed or "").strip()
+    if not seed:
+        try:
+            from core.cloakbrowser_driver import account_fingerprint_seed
+            seed = account_fingerprint_seed(target)
+        except Exception:
+            seed = ""
+    session = BrowserSession(proxy=resolved_proxy, fingerprint_seed=seed or None)
     t0 = time.time()
     try:
         code_verifier, code_challenge = _generate_pkce()

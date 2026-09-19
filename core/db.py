@@ -3762,6 +3762,52 @@ def update_account_registration_password(email: str, password: str) -> bool:
 
 
 
+def mark_accounts_exported(acc_ids: list[int]) -> int:
+    """批量标记账号已导出（记录最后导出时间与累计次数），供 UI 显示"已导出"徽章。
+
+    导出端点在生成文件成功后调用；单个账号写失败不影响其他账号。
+    """
+    marked = 0
+    now = _now()
+    with _LOCK:
+        for raw in acc_ids or []:
+            try:
+                acc_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            row = _load_account_row(acc_id=acc_id)
+            if row is None:
+                continue
+            row["exported_at"] = now
+            row["export_count"] = int(row.get("export_count") or 0) + 1
+            row["updated_at"] = now
+            _save_account_row(row)
+            marked += 1
+    return marked
+
+
+def update_account_totp_secret_by_email(email: str, secret: str) -> bool:
+    """按邮箱写入 TOTP 密钥（账密+2FA 导入用；不触碰 2FA 任务状态字段）。
+
+    与 update_account_registration_password 对称：导入场景直接把主人提供的
+    2FA 密钥落库，无需先拿到 acc_id。
+    """
+    target = str(email or "").strip().lower()
+    secret = str(secret or "").strip()
+    if not target or not secret:
+        return False
+    with _LOCK:
+        row = _load_account_row(email=target)
+        if row is None:
+            return False
+        row["totp_secret"] = secret
+        row["totp_setup_status"] = "success"
+        row["totp_setup_ok"] = True
+        row["updated_at"] = _now()
+        _save_account_row(row)
+        return True
+
+
 def recover_interrupted_account_pushes() -> int:
     """进程启动时把中断的推送任务恢复为可重试状态。"""
     with _LOCK:
