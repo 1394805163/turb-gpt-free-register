@@ -25,8 +25,13 @@ def refresh_account_credentials(
     *,
     write_back: bool = True,
     timeout: int = 60,
+    force: bool = False,
 ) -> dict:
     """用账号的 refresh_token 换新凭据；write_back 时经 CAS 写回 DB。
+
+    已托管下游（push_status=pushed）或已导出（exported_at）的账号默认拒绝刷新：
+    两边抢同一个一次性 RT 只会 refresh_token_reused（谁后用谁报错）。
+    需要收回本地管理或在“修复并回推”流程里强制刷新时传 force=True。
 
     返回 {ok, status?, ms?, access_token?, refresh_token?, id_token?, rt_rotated?, error?}
     """
@@ -37,6 +42,17 @@ def refresh_account_credentials(
     from core import db
 
     acc = db.get_account_by_email(target) or {}
+    if not force:
+        handed_off = (
+            str(acc.get("push_status") or "") in {"pushed", "success"}
+            or bool(str(acc.get("exported_at") or "").strip())
+        )
+        if handed_off:
+            return {
+                "ok": False,
+                "status": "downstream_managed",
+                "error": "账号已托管下游/已导出：本地不消耗 RT（如确需刷新请传 force=True）",
+            }
     rt = str(acc.get("chatgpt_refresh_token") or "").strip()
     cid = str(acc.get("chatgpt_oauth_client_id") or "").strip()
     at_old = str(acc.get("chatgpt_oauth_access_token") or acc.get("access_token") or "").strip()

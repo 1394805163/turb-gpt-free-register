@@ -684,7 +684,10 @@ def _protocol_fast_path(email: str) -> dict | None:
     # 否则两边抢同一个一次性 RT（谁后用谁报 refresh_token_reused）。
     # 本地需要新凭据时改用"密码+2FA 协议登录"换一条独立会话（~5 秒），
     # 之后自动回推，两边各用各的 RT，互不打扰。
-    handed_off = str(acc.get("push_status") or "") in {"pushed", "success"}
+    handed_off = (
+        str(acc.get("push_status") or "") in {"pushed", "success"}
+        or bool(str(acc.get("exported_at") or "").strip())
+    )
     if handed_off:
         # 已推给下游的账号：**下游自带 AT/RT 续期**，只要账号不死它就一直续。
         # 本地不再消耗那条 RT（两边抢一个一次性 RT 才会 refresh_token_reused），

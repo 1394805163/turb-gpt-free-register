@@ -65,7 +65,7 @@ def main() -> int:
         email = str(row.get("email") or "")
         entry = {"id": acc_id, "email": email}
         # 1) RT 刷新
-        res = refresh_account_credentials(email, write_back=True)
+        res = refresh_account_credentials(email, write_back=True, force=True)
         if res.get("ok"):
             stats["rt_ok"] += 1
             entry["refresh"] = "rt"
