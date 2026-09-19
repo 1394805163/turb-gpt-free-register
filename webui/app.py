@@ -3807,7 +3807,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 _pwd_login_state["done"] += 1
                 _pwd_login_state["ok" if entry["ok"] else "failed"] += 1
                 _pwd_login_state["results"].append(entry)
-            time.sleep(3)
+            time.sleep(1)
         with _pwd_login_lock:
             _pwd_login_state["running"] = False
             _pwd_login_state["current"] = ""

@@ -2319,7 +2319,7 @@
               <th class="col-plan">套餐</th>
               <th class="col-note">备注</th>
               <th class="col-small">2FA</th>
-              <th class="col-status">Codex</th>
+              <th class="col-status">状态</th>
               <th class="col-time">创建时间</th>
               <th class="col-actions">操作</th>
             </tr>
@@ -3511,17 +3511,21 @@ function _exportedTitle(r) {
   const n = Number(r.export_count || 0);
   return n > 1 ? `导出时间: ${t} · 共 ${n} 次` : `导出时间: ${t}`;
 }
-function _codexCellV2(r) {
+function _statusCellV2(r) {
+  // 状态列：优先显示“已导出”，其余给有信息量的 Codex 状态；“已跳过”不再重复占位（筛选仍可用）。
+  const parts = [];
+  if (r.exported_at) parts.push(`<span class="pill status-used" title="${esc(_exportedTitle(r))}">已导出</span>`);
+  if (r.push_status === 'pushed') parts.push(`<span class="pill status-success" title="已推送到下游">已推送</span>`);
+  else if (r.push_status === 'push_failed') parts.push(`<span class="pill status-failed" title="${esc(r.push_error || '推送失败')}">推送失败</span>`);
   const s = r.codex_status || '';
   const err = r.codex_error || '';
   const titleAttr = err ? ` title="${esc(err)}"` : '';
-  if (s === 'success') return `<span class="acc-v2-codex is-ok"${titleAttr}>已通过</span>`;
-  if (s === 'retrying') return `<span class="acc-v2-codex is-run"${titleAttr}>补跑中</span>`;
-  if (s === 'stopped') return `<span class="acc-v2-codex is-mute"${titleAttr}>已停止</span>`;
-  if (s === 'failed') return `<span class="acc-v2-codex is-fail"${titleAttr}>失败</span>`;
-  if (s === 'skipped') return `<span class="acc-v2-codex is-skip"${titleAttr}>已跳过</span>`;
-  if (s === 'deactivated') return `<span class="acc-v2-codex is-fail" title="授权记录显示账号异常，建议通过查活确认账号状态">失败</span>`;
-  return `<span class="acc-v2-muted">-</span>`;
+  if (s === 'success') parts.push(`<span class="acc-v2-codex is-ok"${titleAttr}>已通过</span>`);
+  else if (s === 'retrying') parts.push(`<span class="acc-v2-codex is-run"${titleAttr}>补跑中</span>`);
+  else if (s === 'stopped') parts.push(`<span class="acc-v2-codex is-mute"${titleAttr}>已停止</span>`);
+  else if (s === 'failed') parts.push(`<span class="acc-v2-codex is-fail"${titleAttr}>失败</span>`);
+  else if (s === 'deactivated') parts.push(`<span class="acc-v2-codex is-fail" title="授权记录显示账号异常，建议通过查活确认账号状态">失败</span>`);
+  return parts.length ? parts.join(' ') : `<span class="acc-v2-muted">-</span>`;
 }
 function _totpCellV2(r) {
   const enabled = !!r.totp_enabled;
@@ -3791,7 +3795,7 @@ function renderAccounts() {
       <td class="col-check"><input type="checkbox" class="account-row-check" data-account-id="${esc(r.id)}" ${ACCOUNT_SELECTED.has(Number(r.id)) ? 'checked' : ''}></td>
       <td class="col-id">#${esc(r.id)}</td>
       <td class="col-email" title="${esc(r.email || '-')}${r.original_email ? `\n原邮箱: ${esc(r.original_email)}` : ''}\n${esc(r.user_name || '-')}">
-        <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}${r.exported_at ? ` <span class="pill status-used" title="${esc(_exportedTitle(r))}">已导出</span>` : ''}</div>
+        <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
         ${r.original_email ? `<div class="acc-v2-email-history">原邮箱: ${esc(r.original_email)}</div>` : ''}
         <div class="acc-v2-email-user">${esc(r.user_name || '-')}</div>
         ${['queued','running'].includes(r.email_change_status) ? '<div class="acc-v2-email-status">换绑中</div>' : (r.email_change_status === 'failed' ? `<div class="acc-v2-email-status" title="${esc(r.email_change_error || '')}">换绑失败: ${esc(r.email_change_error || '-')}</div>` : '')}
@@ -3802,7 +3806,7 @@ function renderAccounts() {
       <td class="col-plan">${_planCell(r)}${_imageQuotaCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
       <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-small">${_totpCellV2(r)}</td>
-      <td class="col-status">${_codexCellV2(r)}</td>
+      <td class="col-status">${_statusCellV2(r)}</td>
       <td class="col-time" title="${esc(r.created_at || '-')}">${esc(r.created_at || '-')}</td>
       <td class="col-actions">
         <div class="acc-v2-actions">
