@@ -2151,6 +2151,7 @@
         <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedJobsV2" disabled title="删除选中的非运行中任务，并同时删除对应日志">删除选中</button>
         <button type="button" class="jobs-tb-btn" id="btnCancelPendingV2" title="把所有排队任务标记为已取消">取消全部排队</button>
         <button type="button" class="jobs-tb-btn" id="btnRefreshJobsV2" title="手动刷新任务列表">刷新</button>
+        <button type="button" class="jobs-tb-btn" id="btnLiveLogV2" title="打开最近运行中任务的实时日志（每 5 秒自动刷新）">实时日志</button>
         <label class="jobs-tb-field">注册数量
           <span class="el-input-number">
             <input id="regCountV2" type="number" min="1" max="200" value="1" inputmode="numeric">
@@ -2987,6 +2988,8 @@ function bindJobsBodyEvents(bodyEl) {
   if (cancelV2) cancelV2.addEventListener('click', () => cancelAllPendingJobs(cancelV2));
   const refreshV2 = $('#btnRefreshJobsV2');
   if (refreshV2) refreshV2.addEventListener('click', refreshJobs);
+  const liveLogV2 = $('#btnLiveLogV2');
+  if (liveLogV2) liveLogV2.addEventListener('click', openLatestJobLog);
 
   function stepInputNumber(inputId, delta) {
     const el = document.getElementById(inputId);
@@ -3279,6 +3282,17 @@ function openLog(jobId) {
   pollLog();
   clearInterval(logTimer);
   logTimer = setInterval(pollLog, 5000);
+}
+async function openLatestJobLog() {
+  try {
+    const res = await api('/api/jobs?limit=30');
+    const items = (res && res.items) || res || [];
+    const candidate = items.find(j => ['running', 'stopping', 'queued'].includes(String(j.status))) || items[0];
+    if (!candidate) { showToast('暂无任务'); return; }
+    openLog(Number(candidate.id));
+  } catch (err) {
+    showToast('打开日志失败: ' + err.message);
+  }
 }
 async function pollLog() {
   if (activeLogJob == null) return;
