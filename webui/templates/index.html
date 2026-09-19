@@ -3516,15 +3516,16 @@ function _exportedTitle(r) {
 function _statusCellV2(r) {
   // 状态列：下游状态优先（含额度）；其次推送/导出；Codex 关键状态跟随；“已跳过”不占位（筛选仍可用）。
   const parts = [];
+  if (r.push_status === 'push_failed') {
+    parts.push(`<span class="pill status-failed" title="${esc(r.push_error || '推送失败')}">推送失败</span>`);
+  } else if (r.exported_at || r.push_status === 'pushed') {
+    parts.push(`<span class="pill status-used" title="${esc(_exportedTitle(r))}">已导出到下游</span>`);
+  }
   if (r.downstream_status) {
     const normal = (r.downstream_status_category === 'normal');
     const quota = r.downstream_quota_label ? ` · ${esc(r.downstream_quota_label)}` : '';
     const tip = `下游状态: ${r.downstream_status}${r.downstream_status_reason ? '（' + r.downstream_status_reason + '）' : ''}\n额度: ${r.downstream_quota_label || '-'}\nAT: ${r.downstream_at_status || '-'} / RT: ${r.downstream_rt_status || '-'}\n同步: ${r.downstream_synced_at || '-'}`;
     parts.push(`<span class="pill ${normal ? 'status-success' : 'status-failed'}" title="${esc(tip)}">下游:${esc(r.downstream_status)}${quota}</span>`);
-  } else if (r.push_status === 'push_failed') {
-    parts.push(`<span class="pill status-failed" title="${esc(r.push_error || '推送失败')}">推送失败</span>`);
-  } else if (r.exported_at || r.push_status === 'pushed') {
-    parts.push(`<span class="pill status-used" title="${esc(_exportedTitle(r))}">已导出到下游</span>`);
   }
   const s = r.codex_status || '';
   const err = r.codex_error || '';
