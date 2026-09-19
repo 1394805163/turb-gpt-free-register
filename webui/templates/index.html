@@ -2278,6 +2278,7 @@
             <option value="access_token">纯 AT 文本</option>
           </select>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportJsonV2" title="导出为单个完整 JSON（邮箱 + 密码 + 2FA + OAuth 凭据），无需解压；未勾选时导出当前筛选结果">导出 JSON</button>
+          <button type="button" class="jobs-tb-btn" id="btnSyncDownstreamV2" title="从下游 chatgpt2api 只读同步状态与额度（不触碰任何凭据）">同步下游</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnImportOAuthV2" title="导入账号凭据 JSON 或 ZIP；兼容完整 OAuth 和仅 access_token，且不需要勾选账号">导入账号凭据</button>
           <input type="file" id="oauthImportFileV2" accept=".json,.zip,.txt,application/json,application/zip,text/plain" hidden>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnStopSelectedCodexV2" disabled title="停止选中账号中正在补跑的 Codex 授权">停止</button>
@@ -3509,14 +3510,22 @@ function _codexCell(r) {
 function _exportedTitle(r) {
   const t = r.exported_at || '';
   const n = Number(r.export_count || 0);
+  if (!t && r.push_status === 'pushed') return '已推送到下游';
   return n > 1 ? `导出时间: ${t} · 共 ${n} 次` : `导出时间: ${t}`;
 }
 function _statusCellV2(r) {
-  // 状态列：优先显示“已导出”，其余给有信息量的 Codex 状态；“已跳过”不再重复占位（筛选仍可用）。
+  // 状态列：下游状态优先（含额度）；其次推送/导出；Codex 关键状态跟随；“已跳过”不占位（筛选仍可用）。
   const parts = [];
-  if (r.exported_at) parts.push(`<span class="pill status-used" title="${esc(_exportedTitle(r))}">已导出</span>`);
-  if (r.push_status === 'pushed') parts.push(`<span class="pill status-success" title="已推送到下游">已推送</span>`);
-  else if (r.push_status === 'push_failed') parts.push(`<span class="pill status-failed" title="${esc(r.push_error || '推送失败')}">推送失败</span>`);
+  if (r.downstream_status) {
+    const normal = (r.downstream_status_category === 'normal');
+    const quota = r.downstream_quota_label ? ` · ${esc(r.downstream_quota_label)}` : '';
+    const tip = `下游状态: ${r.downstream_status}${r.downstream_status_reason ? '（' + r.downstream_status_reason + '）' : ''}\n额度: ${r.downstream_quota_label || '-'}\nAT: ${r.downstream_at_status || '-'} / RT: ${r.downstream_rt_status || '-'}\n同步: ${r.downstream_synced_at || '-'}`;
+    parts.push(`<span class="pill ${normal ? 'status-success' : 'status-failed'}" title="${esc(tip)}">下游:${esc(r.downstream_status)}${quota}</span>`);
+  } else if (r.push_status === 'push_failed') {
+    parts.push(`<span class="pill status-failed" title="${esc(r.push_error || '推送失败')}">推送失败</span>`);
+  } else if (r.exported_at || r.push_status === 'pushed') {
+    parts.push(`<span class="pill status-used" title="${esc(_exportedTitle(r))}">已导出到下游</span>`);
+  }
   const s = r.codex_status || '';
   const err = r.codex_error || '';
   const titleAttr = err ? ` title="${esc(err)}"` : '';
@@ -4758,6 +4767,20 @@ async function importOAuthFile(event) {
     showToast('OAuth导入失败: ' + error.message);
   }
 }
+async function syncDownstreamStatus() {
+  const btn = $('#btnSyncDownstreamV2');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '同步中…'; }
+  try {
+    const r = await api('/api/accounts/sync-downstream', { method: 'POST' });
+    showToast(`下游同步完成：匹配 ${r.matched || 0} 个账号${r.missed ? `（本地缺档 ${r.missed}）` : ''}`);
+    await loadAccounts();
+  } catch (err) {
+    showToast('下游同步失败: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+  }
+}
 async function exportAccountsJson() {
   let ids;
   try { ids = await resolveAccountSelectionIds(); }
@@ -5424,6 +5447,7 @@ $('#emailChangeModalV2').addEventListener('click', e => { if (e.target.id === 'e
   bind('btnExtractSelectedLinksV2', extractSelectedLinks);
   bind('btnRetrySelectedCodexV2', retrySelectedCodex);
   bind('btnExportJsonV2', exportAccountsJson);
+  bind('btnSyncDownstreamV2', syncDownstreamStatus);
   bind('btnImportOAuthV2', openOAuthImportPicker);
   const oauthInput = document.getElementById('oauthImportFileV2');
   if (oauthInput) oauthInput.addEventListener('change', importOAuthFile);

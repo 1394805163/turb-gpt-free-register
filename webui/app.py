@@ -209,6 +209,11 @@ def _compact_account_for_list(row: dict) -> dict:
         # 生图额度（套餐查询副产物）。
         "image_quota", "image_quota_reset_at", "image_quota_unknown",
         "image_quota_checked_at", "image_quota_error",
+        # 下游托管 / 导出 / 推送状态（状态列徽章展示）。
+        "exported_at", "export_count", "push_status", "push_error",
+        "downstream_status", "downstream_status_category", "downstream_status_reason",
+        "downstream_quota_label", "downstream_quota_remaining",
+        "downstream_at_status", "downstream_rt_status", "downstream_synced_at",
     )
     for key in optional_keys:
         value = row.get(key)
@@ -1939,6 +1944,16 @@ def create_app(auth_code: str | None = None) -> Flask:
                 "Cache-Control": "no-store",
             },
         )
+
+    @app.post("/api/accounts/sync-downstream")
+    def api_accounts_sync_downstream():
+        """从下游 chatgpt2api 只读同步账号状态与额度（零凭据触碰）。"""
+        try:
+            from core.downstream_status import sync_downstream_status
+            result = sync_downstream_status()
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}), 502
+        return jsonify({"ok": True, **result})
 
     @app.post("/api/accounts/download-credentials-bulk")
     def api_accounts_download_credentials_bulk():
