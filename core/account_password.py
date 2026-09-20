@@ -90,40 +90,111 @@ def _has_code_input(driver) -> bool:
         return False
 
 
+_FIND_PASSWORD_BUTTON_JS = r"""
+const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+const ACTION = /^(add|change|update|set|remove|添加|更改|设置|移除)$/i;
+const CLICKABLE = 'button,[role=button],a';
+// 1) 独立按钮：文案本身就是 "Add Password" / "Change password"
+for (const b of [...document.querySelectorAll(CLICKABLE)].filter(vis)) {
+  const t = norm(b.innerText || b.getAttribute('aria-label') || '');
+  if (/^(add|set|change|update)\s*password$/i.test(t)) return b;
+}
+// 2) 2026-09 版设置页把整行做成一个可点元素，innerText 形如
+//    "Password Manage the password you use to log in Add"（没有独立的 Add 按钮）
+for (const b of [...document.querySelectorAll(CLICKABLE)].filter(vis)) {
+  const t = norm(b.innerText || b.getAttribute('aria-label') || '');
+  if (t.length > 160) continue;            // 排除整页/整栏容器
+  if (!/^(password|密码)/i.test(t)) continue;
+  const inner = [...b.querySelectorAll('button,[role=button]')].filter(vis)
+    .find(x => ACTION.test(norm(x.innerText || x.getAttribute('aria-label') || '')));
+  return inner || b;
+}
+// 3) 兜底：文案恰为 Password 的行标签 + 同一行右侧的 Add/Change 按钮
+const labels = [...document.querySelectorAll('div,span,h2,h3,h4,p')]
+  .filter(el => vis(el) && /^(password|密码)$/i.test(norm(el.innerText || '')))
+  .map(el => { const r = el.getBoundingClientRect(); return {x: r.left, y: r.top + r.height / 2}; })
+  .filter(o => o.y > 0 && o.x >= 0);
+if (!labels.length) return null;
+let best = null, bestScore = 1e9;
+for (const b of [...document.querySelectorAll('button,[role=button]')].filter(vis)) {
+  const t = norm(b.innerText || b.getAttribute('aria-label') || '');
+  if (!ACTION.test(t)) continue;
+  const r = b.getBoundingClientRect();
+  const cy = r.top + r.height / 2;
+  for (const p of labels) {
+    if (r.left < p.x) continue;
+    const dy = Math.abs(cy - p.y);
+    if (dy > 40) continue;
+    if (dy < bestScore) { bestScore = dy; best = b; }
+  }
+}
+return best;
+"""
+
+
+def _find_password_button(driver, timeout: float = 90.0):
+    """定位 Security 页密码行按钮，返回 (element, mode)。
+
+    2026-09 起 ChatGPT 设置页整页只剩一个 data-testid，老的
+    [data-testid="password-setting"] 已不存在；优先按老 testid 快速命中，
+    找不到再按文案定位（支持 Add/Change Password 按钮或 Password 行内的按钮）。
+    """
+    from core.roxy_registration import _find_any
+
+    try:
+        el = _find_any(driver, ['[data-testid="password-setting"]'], timeout=5)
+        if el is not None:
+            return el, "testid"
+    except Exception:
+        pass
+
+    end = time.time() + max(5.0, float(timeout))
+    while time.time() < end:
+        try:
+            el = driver.execute_script(_FIND_PASSWORD_BUTTON_JS)
+        except Exception as exc:
+            logger.info("[补密码] 文案定位异常：%s", str(exc)[:140])
+            el = None
+        if el is not None:
+            return el, "text_row"
+        time.sleep(1.5)
+    return None, ""
+
+
 def _click_password_add(driver) -> dict:
     """点击 Password Add：优先真实鼠标点击（CDP 坐标点击），失败回退页面内 click()。"""
-    try:
-        from core.roxy_registration import _find_any, _human_click
+    from core.roxy_registration import _human_click
 
-        # 设置页偶尔极慢（实测某账号 "Password Add" 约 70 秒才渲染）；
-        # 正常账号秒出不受影响，这里放宽到 60 秒上限，避免把慢号误判失败。
-        el = _find_any(driver, ['[data-testid="password-setting"]'], timeout=60)
-        if el is not None:
-            text = ""
-            try:
-                text = str(el.text or "").replace("\n", " ").strip()[:80]
-            except Exception:
-                pass
-            before = str(getattr(driver, "current_url", "") or "")
-            _human_click(driver, el, label="password_add")
-            time.sleep(2.0)
-            after = str(getattr(driver, "current_url", "") or "")
-            if after != before or "password" in after.lower():
-                return {"found": True, "text": text or "Password Add", "mode": "human_click"}
-            logger.warning("[补密码] 真实点击 Password Add 后页面未变化，回退脚本点击")
-            try:
-                el.click()
-                time.sleep(1.5)
-            except Exception:
-                pass
-            return {"found": True, "text": text or "Password Add", "mode": "human_click+js_fallback"}
+    el, mode = _find_password_button(driver, timeout=90)
+    if el is None:
+        return {"found": False, "mode": mode}
+    try:
+        text = str(el.text or "").replace("\n", " ").strip()[:80]
+    except Exception:
+        text = ""
+    before = str(getattr(driver, "current_url", "") or "")
+    try:
+        _human_click(driver, el, label="password_add")
+        time.sleep(2.0)
     except Exception as exc:
         logger.info("[补密码] 真实点击 Password Add 失败，回退脚本点击：%s", str(exc)[:140])
-    _js = "const el = document.querySelector('[data-testid=\"password-setting\"]');"
-    _js += "if (!el) return {found: false};"
-    _js += "el.scrollIntoView({block: 'center'}); el.click();"
-    _js += "return {found: true, text: (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 80), mode: 'js_click'};"
-    return driver.execute_script(_js) or {}
+        try:
+            el.click()
+            time.sleep(1.5)
+        except Exception:
+            return {"found": False, "mode": mode}
+        return {"found": True, "text": text, "mode": mode + "+js_fallback"}
+    after = str(getattr(driver, "current_url", "") or "")
+    if after != before or "password" in after.lower():
+        return {"found": True, "text": text, "mode": mode + "+human_click"}
+    logger.warning("[补密码] 真实点击 Password Add 后页面未变化，回退脚本点击")
+    try:
+        el.click()
+        time.sleep(1.5)
+    except Exception:
+        pass
+    return {"found": True, "text": text, "mode": mode + "+human_click+js_fallback"}
 
 
 def _fill_password_inputs(driver, password: str) -> dict:
