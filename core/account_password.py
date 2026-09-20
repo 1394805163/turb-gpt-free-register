@@ -95,7 +95,9 @@ def _click_password_add(driver) -> dict:
     try:
         from core.roxy_registration import _find_any, _human_click
 
-        el = _find_any(driver, ['[data-testid="password-setting"]'], timeout=8)
+        # 设置页偶尔极慢（实测某账号 "Password Add" 约 70 秒才渲染）；
+        # 正常账号秒出不受影响，这里放宽到 60 秒上限，避免把慢号误判失败。
+        el = _find_any(driver, ['[data-testid="password-setting"]'], timeout=60)
         if el is not None:
             text = ""
             try:
