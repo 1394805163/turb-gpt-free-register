@@ -393,6 +393,16 @@ def set_account_password(
     from core.roxy_registration import _registration_password
 
     new_password = str(password or "").strip() or _registration_password()
+    # 事故复盘(2026-09-20):旧次序是"设置成功后才写库"，一旦后续步骤失败，
+    # 随机密码值就丢失（服务端可能已生效、本地却不知道密码）。改为生成后立即登记：
+    # 设置成功是正式值；失败也保留此值，便于人工核验或重试。
+    if save:
+        try:
+            from core import db as _db_register
+            _db_register.update_account_registration_password(email, new_password)
+            logger.info("[补密码] 密码值已先行登记（防丢失）")
+        except Exception as _reg_exc:
+            logger.warning("[补密码] 密码值先行登记失败（继续设置）：%s", str(_reg_exc)[:140])
 
     from core.cloakbrowser_driver import account_fingerprint_seed, build_cloak_driver
     from core.email_provider import OtpWaitSession, wait_for_otp
