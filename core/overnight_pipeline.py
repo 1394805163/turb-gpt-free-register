@@ -33,11 +33,12 @@ MIN_SUBMIT_GAP_SECONDS = 120.0
 REG_JOB_WAIT_SECONDS = 1800.0
 LIVENESS_POLL_SECONDS = 900.0
 
+# 默认批次：每批带 US 兜底（实测美国出口容错度最高），避免单国节点不可用时整批报废。
 DEFAULT_BATCHES = [
-    {"count": 15, "driver": "cloak", "country": "SG"},
-    {"count": 15, "driver": "protocol_page", "country": "JP"},
+    {"count": 10, "driver": "cloak", "country": "SG,US"},
+    {"count": 10, "driver": "cloak", "country": "JP,US"},
     {"count": 10, "driver": "cloak", "country": "US"},
-    {"count": 10, "driver": "protocol_page", "country": "SG"},
+    {"count": 10, "driver": "cloak", "country": "SG,US"},
 ]
 DEFAULT_TARGET_SUCCESS = 50
 DEFAULT_MAX_ATTEMPTS = 60
@@ -118,6 +119,7 @@ def get_status() -> dict:
         "liveness_done": bool(st.get("liveness_done")),
         "last_error": st.get("last_error"),
         "report_file": st.get("report_file"),
+            "waste_emails": st.get("waste_emails"),
         "log_tail": (st.get("log") or [])[-8:],
     }
 
@@ -237,12 +239,48 @@ def _worker(token: str) -> None:
         _save(st)
 
 
+def _collect_waste_emails(state: dict) -> dict:
+    """汇总本批“废弃邮箱”清单：账号侧失败 + 邮箱池本批禁用，便于复盘与 UI 展示。"""
+    account_failures: list[dict] = []
+    for a in state.get("accounts") or []:
+        email = str(a.get("email") or "")
+        if not email:
+            continue
+        pw_ok = bool(a.get("password_ok")) or a.get("password_status") in ("ok", "existing", "ok_retry")
+        if not pw_ok or not a.get("twofa_ok"):
+            account_failures.append({
+                "email": email,
+                "password_status": a.get("password_status"),
+                "password_error": str(a.get("password_error") or "")[:200],
+                "twofa_status": a.get("twofa_status"),
+            })
+    pool_disabled: list[dict] = []
+    try:
+        from core import icloud_mail_client
+        for row in icloud_mail_client.list_mailboxes(status="disabled", limit=500) or []:
+            pool_disabled.append({
+                "email": str(row.get("email") or ""),
+                "note": str(row.get("note") or "")[:160],
+                "updated_at": str(row.get("updated_at") or "")[:19],
+            })
+    except Exception as exc:
+        logger.warning("[流水线] 读取邮箱池禁用清单失败: %s", exc)
+    return {"account_failures": account_failures, "pool_disabled": pool_disabled}
+
+
 def _finish(status: str) -> None:
     st = _load()
     st["status"] = status
     st["enabled"] = False
     st["phase"] = "done"
     st["finished_at"] = _now().isoformat()
+    try:
+        st["waste_emails"] = _collect_waste_emails(st)
+        n_fail = len((st.get("waste_emails") or {}).get("account_failures") or [])
+        n_dis = len((st.get("waste_emails") or {}).get("pool_disabled") or [])
+        _log(st, f"废弃邮箱清单已生成：账号侧失败 {n_fail} 个 / 邮箱池禁用 {n_dis} 个")
+    except Exception as exc:
+        logger.warning("[流水线] 汇总废弃邮箱失败: %s", exc)
     _write_report(st)
     _save(st)
     logger.info("[流水线] 结束：%s", status)
@@ -261,6 +299,7 @@ def _write_report(state: dict) -> None:
             "target_success": state.get("target_success"),
             "accounts": state.get("accounts"),
             "liveness": state.get("liveness"),
+            "waste_emails": state.get("waste_emails"),
             "log_tail": (state.get("log") or [])[-50:],
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -277,7 +316,9 @@ def _apply_batch_config(batch: dict) -> None:
         from config.env_loader import write_env_values, load_env
         updates = {"REGISTRATION_DRIVER": driver}
         if country:
-            updates["REGISTRATION_PROXY_ALLOWED_COUNTRIES"] = country
+            # 写入批次独立字段：只影响注册链路的节点选择，
+            # 不再覆盖用户全局的 REGISTRATION_PROXY_ALLOWED_COUNTRIES。
+            updates["REGISTRATION_BATCH_ALLOWED_COUNTRIES"] = country
         write_env_values(updates)
         load_env(override=True)
         import config as _config_pkg
@@ -417,6 +458,7 @@ def _finalize_registration_job(job_id: int, job: dict) -> None:
         return
     password_status = "failed"
     password_value = ""
+    password_error = ""
     try:
         existing = str(account.get("password") or "").strip()
         if existing:
@@ -430,8 +472,10 @@ def _finalize_registration_job(job_id: int, job: dict) -> None:
                 password_value = str(result.get("password") or "")
             else:
                 password_status = str(result.get("status") or "failed")
+                password_error = str(result.get("error") or "")[:200]
     except Exception as exc:
         password_status = f"error:{type(exc).__name__}"
+        password_error = str(exc)[:200]
     st = _load()
     st.setdefault("accounts", []).append({
         "email": email,
@@ -440,6 +484,7 @@ def _finalize_registration_job(job_id: int, job: dict) -> None:
         "registered_at": _now().isoformat(),
         "password_ok": password_status in ("ok", "existing"),
         "password_status": password_status,
+        "password_error": password_error,
         "password": password_value,
         "twofa_ok": False,
         "twofa_status": "pending",

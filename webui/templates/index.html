@@ -327,6 +327,13 @@
     }
     #regWarnV2:empty { display: none; }
     #regWarnV2 { margin: 0 16px 8px; }
+    .jobs-pipeline-bar { display:none; align-items:center; gap:10px; padding:10px 16px; margin:0 0 4px; background:#f6f8ff; border:1px solid #e3e9ff; border-radius:8px; font-size:13px; color:#43506b; }
+    .jobs-pipeline-label { font-weight:600; color:#2b3a67; white-space:nowrap; }
+    .jobs-pipeline-bar .jobs-tb-btn { min-height:28px; padding:4px 12px; font-size:12px; }
+    .jobs-waste-panel { display:none; margin:0 0 12px; padding:10px 16px; background:#fff8f6; border:1px solid #ffe1da; border-radius:8px; font-size:12.5px; color:#7a4a3a; max-height:220px; overflow:auto; }
+    .jobs-waste-panel.open { display:block; }
+    .waste-row { padding:4px 0; border-bottom:1px dashed #f2ddd7; word-break:break-all; }
+    .waste-row:last-child { border-bottom:none; }
     .jobs-toolbar-v2 {
       display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
       padding: 16px;
@@ -2145,6 +2152,13 @@
       </div>
     </div>
 
+    <div class="jobs-pipeline-bar" id="jobsPipelineBar">
+      <span class="jobs-pipeline-label">注册流水线</span>
+      <span id="jobsPipelineSummary">-</span>
+      <button type="button" class="jobs-tb-btn" id="btnJobsPipelineWaste" style="display:none;">废弃邮箱</button>
+    </div>
+    <div class="jobs-waste-panel" id="jobsWastePanel"></div>
+
     <section class="jobs-panel-v2" id="jobsPanelV2" aria-label="注册任务">
       <div class="jobs-toolbar-v2" id="jobsToolbarV2">
         <button type="button" class="jobs-tb-btn jobs-tb-btn--retry" id="btnRetrySelectedJobsV2" disabled title="重试选中的失败、已停止或已取消任务">重试选中</button>
@@ -3070,6 +3084,50 @@ function updateJobsSelectionUi(pageRows = null) {
   }
 }
 
+let PIPELINE_WASTE = null;
+async function loadJobsPipeline() {
+  try {
+    const r = await api('/api/registration/pipeline');
+    const bar = document.getElementById('jobsPipelineBar');
+    const sum = document.getElementById('jobsPipelineSummary');
+    const wasteBtn = document.getElementById('btnJobsPipelineWaste');
+    if (!bar || !sum) return;
+    const phaseMap = { register: '注册中', twofa: '补2FA/密码', liveness: '查活中', done: '已完成' };
+    const phase = phaseMap[r.phase] || r.phase || '空闲';
+    sum.textContent = `阶段 ${phase} · 账号 ${r.accounts_total || 0} · 成功 ${r.successes || 0}/${r.target_success || '-'} · 密码 ${r.password_ok || 0} · 2FA ${r.twofa_ok || 0}`;
+    PIPELINE_WASTE = r.waste_emails || null;
+    const waste = PIPELINE_WASTE || {};
+    const nFail = (waste.account_failures || []).length;
+    const nDis = (waste.pool_disabled || []).length;
+    if (nFail + nDis > 0) {
+      wasteBtn.style.display = '';
+      wasteBtn.textContent = `废弃邮箱 ${nFail + nDis}`;
+      wasteBtn.title = `账号侧失败 ${nFail} 个 / 邮箱池禁用 ${nDis} 个（点击展开）`;
+    } else {
+      wasteBtn.style.display = 'none';
+    }
+    bar.style.display = 'flex';
+  } catch (e) { /* 空闲/接口异常时静默 */ }
+}
+function toggleJobsWaste() {
+  const panel = document.getElementById('jobsWastePanel');
+  if (!panel) return;
+  if (panel.classList.contains('open')) { panel.classList.remove('open'); return; }
+  const waste = PIPELINE_WASTE || {};
+  const rows = [];
+  for (const it of (waste.account_failures || [])) {
+    rows.push(`<div class="waste-row" title="${esc(it.password_error || '')}">👤 ${esc(it.email)} · 密码 ${esc(it.password_status || '-')} · 2FA ${esc(it.twofa_status || '-')}</div>`);
+  }
+  for (const it of (waste.pool_disabled || [])) {
+    rows.push(`<div class="waste-row" title="${esc(it.note || '')}">📮 ${esc(it.email)} · 邮箱池已禁用${it.updated_at ? ' · ' + esc(it.updated_at) : ''}</div>`);
+  }
+  panel.innerHTML = rows.length ? rows.join('') : '<div class="waste-row">本批没有废弃邮箱记录</div>';
+  panel.classList.add('open');
+}
+(function bindJobsPipelineV2(){
+  const btn = document.getElementById('btnJobsPipelineWaste');
+  if (btn) btn.addEventListener('click', toggleJobsWaste);
+})();
 async function refreshJobs() {
   try {
     const p = PAGERS.jobs;
@@ -3086,6 +3144,7 @@ async function refreshJobs() {
       renderJobs();
     }
     loadSummary();
+    loadJobsPipeline();
   } catch(e) {}
 }
 

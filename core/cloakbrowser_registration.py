@@ -402,6 +402,32 @@ def run_cloak_registration(
         except Exception as exc:
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
+        # 出口一致性记录（只记录、不行动）：注册开始时锁定的出口 IP 与结束时实测对比。
+        # 同会话中途换 IP 是明显风控信号；这里只登记到账号 extra，供存活率分析。
+        exit_drift: dict = {}
+        try:
+            import requests as _requests
+            from config import proxy as _proxy_cfg2
+            _trace_proxy = str(getattr(_proxy_cfg2, "MIHOMO_PROXY_URL", "") or "").strip()
+            _start_ip = str(((opened.raw or {}).get("proxy_exit_ip") if opened else "") or "").strip()
+            _resp = _requests.get(
+                "https://auth.openai.com/cdn-cgi/trace",
+                proxies={"http": _trace_proxy, "https": _trace_proxy} if _trace_proxy else None,
+                timeout=(3.0, 8.0),
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"},
+            )
+            _end_ip = ""
+            for _line in (_resp.text or "").splitlines():
+                if _line.startswith("ip="):
+                    _end_ip = _line.partition("=")[2].strip()
+                    break
+            exit_drift = {"start_ip": _start_ip, "end_ip": _end_ip}
+            if _start_ip and _end_ip and _start_ip != _end_ip:
+                exit_drift["drifted"] = True
+                logger.warning("[Cloak注册][出口跳变] 注册期间出口 IP 变化: %s -> %s（仅记录，不影响结果）", _start_ip, _end_ip)
+        except Exception as _exc:
+            exit_drift = {"error": f"{type(_exc).__name__}"}
+
         # 统计注册浏览器关闭前的完整会话；注册后停留期间的网络请求也计入。
         post_register_dwell(email, label="Cloak注册")
         if traffic_tracker is not None:
@@ -430,6 +456,7 @@ def run_cloak_registration(
                 "proxy_exit_country": _registration_exit_country(opened),
                 "cloak_profile_seed": profile_seed,
                 "registration_password": openai_password,
+                "exit_drift": exit_drift,
                 "codex": codex_result,
                 "network_traffic": network_traffic,
             },

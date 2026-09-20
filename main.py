@@ -249,7 +249,11 @@ def run_registration(
             proxy_selection = {}
             if use_mihomo_source:
                 try:
-                    proxy_selection = _proxy_cfg.pick_registration_proxy()
+                    # 批次国家偏好（独立字段，不覆盖全局允许地区）；未配置时回退全局策略。
+                    batch_countries = getattr(_proxy_cfg, "REGISTRATION_BATCH_ALLOWED_COUNTRIES", None) or None
+                    proxy_selection = _proxy_cfg.pick_registration_proxy(
+                        allowed_countries_override=batch_countries
+                    )
                 except Exception as exc:
                     last_result = {"success": False, "email": email, "error": f"Mihomo 代理选择失败: {type(exc).__name__}"}
                     break

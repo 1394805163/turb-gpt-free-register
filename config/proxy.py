@@ -121,6 +121,10 @@ MIHOMO_REGISTRATION_EXCLUDED_MULTIPLIERS = ["0.2"]
 REGISTRATION_PROXY_EXCLUDED_COUNTRIES = ["HK"]
 REGISTRATION_PROXY_ALLOWED_COUNTRIES = []
 
+# 批次级注册出口国家偏好（由注册流水线切批时写入，仅注册链路使用）：
+# 独立于全局 REGISTRATION_PROXY_ALLOWED_COUNTRIES，避免实验批次覆盖用户配置。
+REGISTRATION_BATCH_ALLOWED_COUNTRIES = []
+
 # 套餐/Plus 试用资格查询与 Codex Agent Token 生成共用这组独立网络策略，
 # 避免批量请求被注册代理池中的临时本地代理拖垮，也避免无条件直连造成出口策略失控。
 #   auto   = 优先使用 PLAN_CHECK_PROXY 或代理池；本地代理端口未监听时回退直连
@@ -733,6 +737,7 @@ apply_env_overrides(globals(), {
     'MIHOMO_REGISTRATION_EXCLUDED_MULTIPLIERS': 'list_str_delimited',
     'REGISTRATION_PROXY_EXCLUDED_COUNTRIES': 'list_str_delimited',
     'REGISTRATION_PROXY_ALLOWED_COUNTRIES': 'list_str_delimited',
+    'REGISTRATION_BATCH_ALLOWED_COUNTRIES': 'list_str_delimited',
     'PLAN_CHECK_PROXY_MODE': 'str',
     'PLAN_CHECK_PROXY': 'str',
     'PLAN_CHECK_TIMEOUT': 'float',
