@@ -658,3 +658,156 @@ def set_account_password(
             _gate.__exit__(None, None, None)
         except Exception:
             pass
+
+
+def add_password_protocol(
+    email: str,
+    *,
+    password: str | None = None,
+    proxy: str | None = None,
+    proxy_selection: dict | None = None,
+    save: bool = True,
+    otp_wait: int = 90,
+) -> dict:
+    """协议版补密码（无浏览器）。按 2026-09-21 浏览器版同一流程抓包 1:1 复现：
+
+    1) GET  chatgpt.com/backend-api/accounts/add_password/eligibility      (Bearer AT)
+    2) POST chatgpt.com/api/auth/signin/openai?...&reauth=password&post_login_add_password=true
+    3) GET  auth.openai.com/api/accounts/authorize...                      (重认证链，必要时邮箱 OTP)
+    4) POST auth.openai.com/api/accounts/password/add  {"password": "..."}
+           headers: openai-sentinel-token + Referer: .../reset-password/new-password
+
+    返回 {ok, status, email, password?, error?}；status: updated / failed / skipped
+    """
+    email = str(email or "").strip()
+    if not email:
+        return {"ok": False, "status": "skipped", "error": "email 为空"}
+
+    import json as _json
+    from urllib.parse import urlencode
+
+    from core import db
+    from core.roxy_registration import _registration_password
+
+    acc = db.get_account_by_email(email) or {}
+    access_token = str(acc.get("access_token") or "").strip()
+    if not access_token:
+        return {"ok": False, "status": "failed", "email": email, "error": "本地没有 access_token，先查活刷新"}
+
+    new_password = str(password or "").strip() or _registration_password()
+    if save:
+        try:
+            db.update_account_registration_password(email, new_password)
+            logger.info("[补密码-协议] 密码值已先行登记（防丢失）")
+        except Exception as exc:
+            logger.warning("[补密码-协议] 密码先行登记失败（继续）：%s", str(exc)[:140])
+
+    from core.account_export import (
+        _follow_reauth_with_retry,
+        _validate_reauth_otp,
+    )
+    from core.cloakbrowser_driver import account_fingerprint_seed
+    from core.openai_auth import build_sentinel_header, request_sentinel_token
+    from core.session import BrowserSession, close_browser_session
+
+    if not proxy and not proxy_selection:
+        proxy, proxy_selection = _resolve_fresh_account_route(email)
+
+    session = BrowserSession(proxy=proxy, fingerprint_seed=account_fingerprint_seed(email) or None)
+    try:
+        # ---- 1) 资格检查 ----
+        elig_headers = session.get_chatgpt_headers(referer="https://chatgpt.com/")
+        elig_headers["authorization"] = f"Bearer {access_token}"
+        elig_headers["oai-device-id"] = session.device_id
+        elig = session.get(
+            "https://chatgpt.com/backend-api/accounts/add_password/eligibility",
+            headers=elig_headers,
+        )
+        logger.info("[补密码-协议] eligibility status=%s", getattr(elig, "status_code", "?"))
+        if int(getattr(elig, "status_code", 0) or 0) != 200:
+            return {
+                "ok": False,
+                "status": "failed",
+                "email": email,
+                "error": f"eligibility HTTP {getattr(elig, 'status_code', '?')}: {(getattr(elig, 'text', '') or '')[:200]}",
+            }
+
+        # ---- 2) 发起带 post_login_add_password 的重认证 ----
+        csrf_resp = session.get(
+            "https://chatgpt.com/api/auth/csrf",
+            headers=session.get_nextauth_headers(referer="https://chatgpt.com/"),
+        )
+        csrf_resp.raise_for_status()
+        csrf_token = csrf_resp.json()["csrfToken"]
+        signin_url = "https://chatgpt.com/api/auth/signin/openai?" + urlencode({
+            "login_hint": email,
+            "reauth": "password",
+            "post_login_add_password": "true",
+            "max_age": "0",
+            "ext-oai-did": session.device_id,
+        })
+        signin_headers = session.get_nextauth_headers(referer="https://chatgpt.com/")
+        signin_headers["content-type"] = "application/x-www-form-urlencoded"
+        signin_headers["origin"] = "https://chatgpt.com"
+        signin_resp = session.post(
+            signin_url,
+            headers=signin_headers,
+            data=urlencode({"callbackUrl": "https://chatgpt.com/", "csrfToken": csrf_token, "json": "true"}),
+        )
+        signin_resp.raise_for_status()
+        auth_url = str((signin_resp.json() or {}).get("url") or "")
+        if not auth_url:
+            return {"ok": False, "status": "failed", "email": email, "error": f"未拿到 reauth authorize URL: {signin_resp.text[:200]}"}
+        logger.info("[补密码-协议] 已拿到重认证 authorize URL")
+
+        # ---- 3) 跟随重认证链（必要时邮箱 OTP）----
+        reauth_after = time.time()
+        final_url = str(_follow_reauth_with_retry(session, auth_url) or "")
+        logger.info("[补密码-协议] 重认证落点=%s", final_url[:120])
+        if "email-verification" in final_url or "email-otp" in final_url:
+            from core.email_provider import OtpWaitSession, wait_for_otp
+
+            logger.info("[补密码-协议] 需要邮箱 OTP，开始等待…")
+            otp = OtpWaitSession(wait_fn=wait_for_otp).wait(email, after_ts=reauth_after, max_wait=otp_wait)
+            continue_url = str(_validate_reauth_otp(session, otp) or "")
+            logger.info("[补密码-协议] OTP 通过，continue=%s", continue_url[:120])
+            if continue_url:
+                session.get(
+                    continue_url,
+                    headers=session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification"),
+                    allow_redirects=True,
+                )
+
+        # ---- 4) sentinel + 提交新密码 ----
+        sentinel_resp = request_sentinel_token(session, "username_password_create")
+        sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "username_password_create")
+        add_headers = session.get_auth_headers(referer="https://auth.openai.com/reset-password/new-password")
+        add_headers["content-type"] = "application/json"
+        add_headers["openai-sentinel-token"] = sentinel_header
+        if so_header:
+            add_headers["openai-sentinel-so-token"] = so_header
+        add_resp = session.post(
+            "https://auth.openai.com/api/accounts/password/add",
+            headers=add_headers,
+            data=_json.dumps({"password": new_password}, separators=(",", ":")),
+        )
+        status = int(getattr(add_resp, "status_code", 0) or 0)
+        logger.info("[补密码-协议] password/add status=%s", status)
+        if status != 200:
+            return {
+                "ok": False,
+                "status": "failed",
+                "email": email,
+                "password": new_password,
+                "error": f"password/add HTTP {status}: {(getattr(add_resp, 'text', '') or '')[:240]}",
+            }
+        return {"ok": True, "status": "updated", "email": email, "password": new_password, "method": "protocol"}
+    except Exception as exc:
+        logger.exception("[补密码-协议] 失败")
+        return {"ok": False, "status": "failed", "email": email, "password": new_password,
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    finally:
+        try:
+            close_browser_session(session)
+        except Exception:
+            pass
