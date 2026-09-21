@@ -15,6 +15,7 @@ from config import proxy as proxy_cfg
 from core import db
 from core.log_safety import redact_email
 from core.pipeline_concurrency import PIPELINE_MAX_CONCURRENCY, pipeline_slot
+from core.session import close_browser_session
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,7 @@ def _safe_email_filename(email: str) -> str:
 
 def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigger: str, verify_task: bool) -> dict:
     env = None
+    relay = None
     route_meta: dict = {}
     timeout_seconds = 0.0
     attempts = 0
@@ -119,13 +121,13 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
         if not db.mark_account_codex_agent_running(account_id):
             return {"ok": False, "error": "账号已删除或 Codex Agent 状态已被重置"}
         from core.codex_agent import create_codex_agent_identity
-        from core.chatgpt_plan import resolve_plan_check_route
+        from core.chatgpt_plan import open_plan_check_proxy, resolve_plan_check_route
         from core.session import BrowserSession
 
         # 和查套餐一致解析网络路径；每个账号独立创建 BrowserSession，
         # 从而得到独立 oai-did / oai-session-id / Datadog trace / 浏览器画像 / 代理出口。
         route = resolve_plan_check_route(None)
-        route_meta = {k: v for k, v in route.items() if k != "proxy"}
+        route_meta = {k: v for k, v in route.items() if k not in {"proxy", "upstream_proxy"}}
         timeout_seconds, attempts, retry_delay = _agent_request_settings()
         last_exc: Exception | None = None
         auth_json = None
@@ -133,7 +135,14 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
             attempt_count = attempt
             _wait_for_rate_slot()
             try:
-                env = BrowserSession(proxy=route["proxy"], detect_exit_geo=False, fingerprint_seed=f"account:{email.lower()}")
+                effective_proxy, relay = open_plan_check_proxy(
+                    route, route["proxy"], timeout=timeout_seconds,
+                )
+                env = BrowserSession(
+                    proxy=effective_proxy,
+                    detect_exit_geo=False,
+                    fingerprint_seed=f"account:{email.lower()}:attempt:{attempt}",
+                )
                 logger.info(
                     "[CodexAgent] 独立环境: %s attempt=%s/%s route=%s proxy=%s did=%s session=%s profile_ua=%s",
                     redact_email(email),
@@ -156,10 +165,13 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
             except Exception as exc:
                 last_exc = exc
                 try:
-                    env.session.close()
+                    close_browser_session(env)
                 except Exception:
                     pass
                 env = None
+                if relay is not None:
+                    relay.close()
+                    relay = None
                 if attempt >= attempts or not _retryable_agent_error(exc):
                     raise
                 wait_seconds = min(30.0, retry_delay * attempt)
@@ -285,9 +297,11 @@ def _run_generate_inner(*, account_id: int, email: str, access_token: str, trigg
     finally:
         if env is not None:
             try:
-                env.session.close()
+                close_browser_session(env)
             except Exception:
                 pass
+        if relay is not None:
+            relay.close()
         _QUEUE_SLOTS.release()
 
 

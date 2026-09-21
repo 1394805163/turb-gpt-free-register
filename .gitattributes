@@ -3,3 +3,6 @@
 *.template text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+
+# Sentinel SDK 为 minified 单行文件，字节级哈希被测试断言；禁止行尾转换
+sentinel/sdk.js -text

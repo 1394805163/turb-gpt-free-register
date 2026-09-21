@@ -11,3 +11,4 @@ playwright>=1.49.0
 python-dotenv>=1.0.0
 gunicorn>=23.0.0
 playwright-stealth>=2.0.3
+PySocks>=1.7.1  # core/proxy_chain.py 链式代理（SOCKS5 中继）

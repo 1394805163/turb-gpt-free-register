@@ -125,16 +125,24 @@ REGISTRATION_PROXY_ALLOWED_COUNTRIES = []
 # 独立于全局 REGISTRATION_PROXY_ALLOWED_COUNTRIES，避免实验批次覆盖用户配置。
 REGISTRATION_BATCH_ALLOWED_COUNTRIES = []
 
+# 代理池使用的本地上游代理。填写后形成：本地上游 -> 代理池目标代理 -> ChatGPT；
+# 留空则直接使用代理池中的目标代理，不启动链式中继。
+PROXY_POOL_UPSTREAM_PROXY = ""
+
 # 套餐/Plus 试用资格查询与 Codex Agent Token 生成共用这组独立网络策略，
 # 避免批量请求被注册代理池中的临时本地代理拖垮，也避免无条件直连造成出口策略失控。
-#   auto   = 优先使用 PLAN_CHECK_PROXY 或代理池；本地代理端口未监听时回退直连
+#   auto   = 优先使用 PLAN_CHECK_PROXY 或代理池；没有代理时才按 direct 运行
 #   proxy  = 强制使用 PLAN_CHECK_PROXY 或代理池，失败直接报错
 #   direct = 始终直连
 PLAN_CHECK_PROXY_MODE = "auto"
 
 # 套餐查询 / Codex Agent Token 生成专用代理。留空时 auto/proxy 模式从 PROXY_POOL 选择。
 # 代理可能包含账号密码，因此 WebUI 会把它保存到 .env。
-PLAN_CHECK_PROXY = ""
+PLAN_CHECK_PROXY = []
+
+# 套餐查询 / Codex Agent Token 生成的上游代理。填写后形成：本地代理 -> 动态代理 -> ChatGPT。
+# 例如 http://127.0.0.1:7897；留空则直接连接 PLAN_CHECK_PROXY。
+PLAN_CHECK_UPSTREAM_PROXY = ""
 
 # 查套餐 / 生成 Codex Agent Token 使用独立的短超时和有限重试，避免后台任务长时间卡住。
 PLAN_CHECK_TIMEOUT = 15.0
@@ -197,6 +205,45 @@ def get_proxy_pool() -> list[str]:
     if bool(REGISTRATION_PROXY_REQUIRED):
         return []
     return list(_CONFIGURED_PROXY_POOL or PROXY_POOL or [])
+
+
+def _valid_port(value: str) -> bool:
+    return value.isdigit() and 1 <= int(value) <= 65535
+
+
+def normalize_proxy_url(value: str, default_scheme: str = "http") -> str:
+    """Normalize common proxy shorthand while preserving explicit URLs."""
+    text = str(value or "").strip()
+    if not text or "://" in text:
+        return text
+    parts = text.split(":", 3)
+    if len(parts) == 4 and parts[0] and _valid_port(parts[1]) and parts[2] and parts[3]:
+        host, port, username, password = parts
+        return f"{default_scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+    if len(parts) == 4 and parts[0] and parts[1] and parts[2] and _valid_port(parts[3]):
+        username, password, host, port = parts
+        return f"{default_scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+    parsed = urlparse(f"//{text}")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if parsed.hostname and port:
+        return f"{default_scheme}://{text}"
+    return text
+
+
+def normalize_proxy_list(values, default_scheme: str = "http") -> list[str]:
+    """Normalize a multiline proxy list and omit empty entries."""
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = values.splitlines()
+    return [
+        normalized
+        for value in values
+        if (normalized := normalize_proxy_url(value, default_scheme=default_scheme))
+    ]
 
 
 def pick_proxy() -> str:
@@ -738,8 +785,10 @@ apply_env_overrides(globals(), {
     'REGISTRATION_PROXY_EXCLUDED_COUNTRIES': 'list_str_delimited',
     'REGISTRATION_PROXY_ALLOWED_COUNTRIES': 'list_str_delimited',
     'REGISTRATION_BATCH_ALLOWED_COUNTRIES': 'list_str_delimited',
+    'PROXY_POOL_UPSTREAM_PROXY': 'str',
     'PLAN_CHECK_PROXY_MODE': 'str',
-    'PLAN_CHECK_PROXY': 'str',
+    'PLAN_CHECK_PROXY': 'list_str_multiline',
+    'PLAN_CHECK_UPSTREAM_PROXY': 'str',
     'PLAN_CHECK_TIMEOUT': 'float',
     'PLAN_CHECK_MAX_ATTEMPTS': 'int',
     'PLAN_CHECK_RETRY_DELAY': 'float',
@@ -750,6 +799,8 @@ apply_env_overrides(globals(), {
     'PLAN_CHECK_JITTER': 'float',
 })
 _CONFIGURED_PROXY_POOL = list(PROXY_POOL or [])
+PROXY_POOL = normalize_proxy_list(PROXY_POOL)
+PLAN_CHECK_PROXY = normalize_proxy_list(PLAN_CHECK_PROXY)
 PROXY_POOL, PROXY_POOL_LOADED_FROM = resolve_proxy_pool(PROXY_POOL, PROXY_POOL_FILE)
 if PROXY_POOL_LOADED_FROM:
     logger.info("已从验证结果文件加载 %s 个代理: %s", len(PROXY_POOL), PROXY_POOL_LOADED_FROM)

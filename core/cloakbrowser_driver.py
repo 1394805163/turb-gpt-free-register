@@ -197,10 +197,11 @@ class _SwitchTo:
 class CloakSeleniumDriver:
     """只实现本项目 Roxy Selenium 流程实际用到的 WebDriver 子集。"""
 
-    def __init__(self, browser: Any, context: Any | None, page: Any):
+    def __init__(self, browser: Any, context: Any | None, page: Any, proxy_relay: Any | None = None):
         self.browser = browser
         self.context = context
         self.page = page
+        self._proxy_relay = proxy_relay
         self._page_load_timeout_ms = int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90) * 1000
         self.switch_to = _SwitchTo(self)
 
@@ -264,6 +265,9 @@ class CloakSeleniumDriver:
             self.browser.close()
         except Exception:
             pass
+        relay, self._proxy_relay = self._proxy_relay, None
+        if relay is not None:
+            relay.close()
 
     def find_elements(self, by: Any, selector: str) -> list[CloakElement]:
         loc = self._locator(by, selector)
@@ -678,6 +682,16 @@ def build_cloak_driver(
             raise RuntimeError("Resin 门禁已关闭但 CloakBrowser 代理开关未开启；已阻止直连注册")
         if not str(proxy or "").strip() and not _allows_transparent_mihomo_route(proxy_selection):
             raise RuntimeError("Mihomo 美国代理不可用；已阻止直连注册")
+
+    # 代理链（可选）：PROXY_POOL_UPSTREAM_PROXY 非空时，用本地上游中转到达上面选出的
+    # 目标代理（本地上游 -> 目标代理 -> ChatGPT）。留空时 relay=None，行为不变。
+    proxy_relay = None
+    proxy_pool_target = str(proxy or "").strip()
+    if proxy_pool_target and str(getattr(_proxy_cfg, "PROXY_POOL_UPSTREAM_PROXY", "") or "").strip():
+        from core.proxy_chain import open_proxy_pool_proxy
+
+        proxy, proxy_relay = open_proxy_pool_proxy(proxy_pool_target)
+
     try:
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:
@@ -769,7 +783,7 @@ def build_cloak_driver(
         _seat_release()
         raise
 
-    driver = CloakSeleniumDriver(browser=browser, context=context, page=page)
+    driver = CloakSeleniumDriver(browser=browser, context=context, page=page, proxy_relay=proxy_relay)
 
     # quit() 时释放席位（原 quit 可能抛错，也要保证释放）
     _orig_quit = driver.quit
@@ -778,6 +792,11 @@ def build_cloak_driver(
         try:
             _orig_quit()
         finally:
+            if proxy_relay is not None:
+                try:
+                    proxy_relay.close()
+                except Exception:
+                    pass
             _seat_release()
 
     driver.quit = _quit_and_release_seat
@@ -793,6 +812,7 @@ def build_cloak_driver(
         "proxy_node": proxy_selection.get("node_name") or "",
         "proxy_exit_ip": proxy_selection.get("exit_ip") or "",
         "proxy_selection_ms": proxy_selection.get("selection_ms") or 0,
+        "proxy_pool_target": proxy_pool_target or proxy_url,
         "locale": locale_opts,
         "options": {k: v for k, v in opts.items() if k != "license_key"},
     })

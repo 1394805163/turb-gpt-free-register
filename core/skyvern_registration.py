@@ -26,5 +26,4 @@ def run_skyvern_registration(
         batch_dir=batch_dir,
         on_email_acquired=on_email_acquired,
         cloud_provider="skyvern",
-        on_email_acquired=on_email_acquired,
     )
