@@ -39,7 +39,7 @@ from core.account_export import (
     create_batch_archive_dir,
 )
 from core.pipeline_concurrency import pipeline_limited
-from core.email_provider import acquire_email_after_input, wait_for_otp
+from core.email_provider import acquire_email, acquire_email_after_input, wait_for_otp
 from core.humanize import delay as human_delay
 from core.log_safety import redact_email, redact_emails
 from core.name_samples import random_display_name
