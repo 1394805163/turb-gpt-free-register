@@ -695,12 +695,25 @@ def add_password_protocol(
         return {"ok": False, "status": "failed", "email": email, "error": "本地没有 access_token，先查活刷新"}
 
     new_password = str(password or "").strip() or _registration_password()
+    # 先行登记是防"服务端已设密码但进程崩溃"；但如果最后没能设上，必须把本地值
+    # 回滚回原密码，否则会把一个可用密码覆盖成服务端并不认识的假密码。
+    prev_password = str((db.get_account_by_email(email) or {}).get("password") or "").strip()
     if save:
         try:
             db.update_account_registration_password(email, new_password)
             logger.info("[补密码-协议] 密码值已先行登记（防丢失）")
         except Exception as exc:
             logger.warning("[补密码-协议] 密码先行登记失败（继续）：%s", str(exc)[:140])
+
+    def _fail(payload: dict) -> dict:
+        """失败收口：把"先行登记"的本地密码回滚为原值（服务端并未接受新密码）。"""
+        if save and prev_password:
+            try:
+                db.update_account_registration_password(email, prev_password)
+                logger.info("[补密码-协议] 本地密码已回滚为原值")
+            except Exception as exc:
+                logger.warning("[补密码-协议] 本地密码回滚失败：%s", str(exc)[:140])
+        return payload
 
     from core.account_export import (
         _follow_reauth_with_retry,
@@ -725,12 +738,12 @@ def add_password_protocol(
         )
         logger.info("[补密码-协议] eligibility status=%s", getattr(elig, "status_code", "?"))
         if int(getattr(elig, "status_code", 0) or 0) != 200:
-            return {
+            return _fail({
                 "ok": False,
                 "status": "failed",
                 "email": email,
                 "error": f"eligibility HTTP {getattr(elig, 'status_code', '?')}: {(getattr(elig, 'text', '') or '')[:200]}",
-            }
+            })
 
         # ---- 2) 发起带 post_login_add_password 的重认证 ----
         csrf_resp = session.get(
@@ -757,7 +770,8 @@ def add_password_protocol(
         signin_resp.raise_for_status()
         auth_url = str((signin_resp.json() or {}).get("url") or "")
         if not auth_url:
-            return {"ok": False, "status": "failed", "email": email, "error": f"未拿到 reauth authorize URL: {signin_resp.text[:200]}"}
+            return _fail({"ok": False, "status": "failed", "email": email,
+                          "error": f"未拿到 reauth authorize URL: {signin_resp.text[:200]}"})
         logger.info("[补密码-协议] 已拿到重认证 authorize URL")
 
         # ---- 3) 跟随重认证链（必要时邮箱 OTP）----
@@ -780,11 +794,11 @@ def add_password_protocol(
             factor_id = continue_url.rstrip("/").split("/mfa-challenge/")[-1].split("?")[0].strip()
             totp_secret = str((db.get_account_by_email(email) or {}).get("totp_secret") or "").strip()
             if not factor_id or not totp_secret:
-                return {
+                return _fail({
                     "ok": False, "status": "failed", "email": email, "password": new_password,
                     "error": ("账号已开 2FA，补密码需 TOTP："
                               f"factor_id={'有' if factor_id else '无'} totp_secret={'有' if totp_secret else '无'}"),
-                }
+                })
             import pyotp
             from core.openai_auth import validate_mfa_totp
 
@@ -819,18 +833,18 @@ def add_password_protocol(
         status = int(getattr(add_resp, "status_code", 0) or 0)
         logger.info("[补密码-协议] password/add status=%s", status)
         if status != 200:
-            return {
+            return _fail({
                 "ok": False,
                 "status": "failed",
                 "email": email,
                 "password": new_password,
                 "error": f"password/add HTTP {status}: {(getattr(add_resp, 'text', '') or '')[:240]}",
-            }
+            })
         return {"ok": True, "status": "updated", "email": email, "password": new_password, "method": "protocol"}
     except Exception as exc:
         logger.exception("[补密码-协议] 失败")
-        return {"ok": False, "status": "failed", "email": email, "password": new_password,
-                "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        return _fail({"ok": False, "status": "failed", "email": email, "password": new_password,
+                      "error": f"{type(exc).__name__}: {str(exc)[:300]}"})
     finally:
         try:
             close_browser_session(session)

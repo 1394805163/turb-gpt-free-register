@@ -3146,6 +3146,124 @@ def create_app(auth_code: str | None = None) -> Flask:
             "batch_id": batch_id,
         })
 
+    # ----------------------------------------------------------
+    # 协议补密码（无浏览器） + 日志合一
+    # ----------------------------------------------------------
+    @app.post("/api/accounts/add-password")
+    def api_accounts_add_password():
+        """批量协议补密码（无头、2FA 账号自动过 TOTP）。Body {account_ids:[...]}。"""
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 500:
+            return jsonify({"ok": False, "error": "单次最多提交 500 个账号"}), 400
+        try:
+            from core import add_password_service
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"补密码服务加载失败：{type(exc).__name__}: {exc}"}), 503
+
+        started, busy, failed, skipped = [], [], [], []
+        seen: set[int] = set()
+        for raw in ids:
+            try:
+                acc_id = int(raw)
+            except (TypeError, ValueError):
+                skipped.append({"id": raw, "reason": "ID 非法"})
+                continue
+            if acc_id in seen:
+                continue
+            seen.add(acc_id)
+            acc = db.get_account(acc_id)
+            if not acc:
+                skipped.append({"id": acc_id, "reason": "账号不存在"})
+                continue
+            email = str(acc.get("email") or "").strip()
+            if not email:
+                skipped.append({"id": acc_id, "reason": "邮箱为空"})
+                continue
+            if not str(acc.get("access_token") or "").strip():
+                skipped.append({"id": acc_id, "email": email, "reason": "缺少 access_token，请先查活"})
+                continue
+            try:
+                queued = add_password_service.enqueue_add_password(
+                    account_id=acc_id, email=email, trigger="manual_bulk",
+                )
+            except Exception as exc:
+                failed.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            item = {"id": acc_id, "email": email, **{k: v for k, v in queued.items() if k != "future"}}
+            if queued.get("accepted"):
+                item["status"] = "queued"
+                started.append(item)
+            elif queued.get("busy"):
+                busy.append(item)
+            else:
+                failed.append(item)
+
+        return jsonify({
+            "ok": True,
+            "started": started,
+            "busy": busy,
+            "failed": failed,
+            "skipped": skipped,
+            "started_count": len(started),
+            "busy_count": len(busy),
+            "failed_count": len(failed),
+            "skipped_count": len(skipped),
+            "queue": add_password_service.queue_settings(),
+        }), (202 if started else 200)
+
+    @app.get("/api/accounts/add-password-log")
+    def api_account_add_password_log():
+        """读取某邮箱最近一次协议补密码日志。?email=xxx"""
+        from core import add_password_service
+        email = (request.args.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        return jsonify(_read_log_tail(
+            add_password_service.log_path(email),
+            max_bytes=80_000,
+            running_fn=lambda: add_password_service.is_running(email),
+        ))
+
+    @app.get("/api/accounts/all-logs")
+    def api_account_all_logs():
+        """日志合一：查活刷新 AT / 2FA / 补密码 / Codex 补跑 / 邮箱换绑。?email=xxx"""
+        from core import account_liveness
+        from core import add_password_service, codex_retry_service as _retry_svc
+        from core import email_change_service, twofa_service
+        email = (request.args.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        acc = db.get_account_by_email(email) or {}
+        acc_id = int(acc.get("id") or 0)
+        twofa_status = str(acc.get("totp_setup_status") or "")
+        sources = [
+            ("live", "查活刷新 AT（登录换新 accessToken）", account_liveness.log_path(email),
+             lambda: live_check_service.is_checking(email)),
+            ("twofa", "2FA 设置", twofa_service.log_path(email),
+             lambda: bool(twofa_status in {"queued", "running"}) or (bool(acc_id) and twofa_service.is_running(acc_id))),
+            ("add_password", "补密码（协议直连）", add_password_service.log_path(email),
+             lambda: add_password_service.is_running(email)),
+            ("codex_retry", "Codex 补跑", _retry_svc.log_path(email),
+             lambda: _retry_svc.is_retrying(email)),
+            ("email_change", "邮箱换绑", email_change_service.log_path(acc_id) if acc_id else None,
+             lambda: bool(acc_id) and email_change_service.is_running(acc_id)),
+        ]
+        out = []
+        for key, label, path, running_fn in sources:
+            if path is None:
+                out.append({"key": key, "label": label, "log": "", "running": False})
+                continue
+            data = _read_log_tail(path, max_bytes=60_000, running_fn=running_fn)
+            out.append({
+                "key": key, "label": label,
+                "log": data.get("log") or "",
+                "running": bool(data.get("running")),
+            })
+        return jsonify({"ok": True, "email": email, "account_id": acc_id, "sources": out})
+
     @app.get("/api/codex/retry-log")
     def api_codex_retry_log():
         """读取某邮箱最近一次补跑的日志。?email=xxx"""

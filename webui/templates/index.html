@@ -198,8 +198,8 @@
       width: 100%; max-width: 100%; min-width: 0;
       max-height: 320px; overflow: auto; line-height: 1.5;
     }
-    #logPanel, #retryLogPanel, #liveLogPanel, #totpLogPanel, #emailChangeLogPanel, #qrPanel { min-width: 0; max-width: 100%; overflow-x: hidden; }
-    #logPanel:not(.hidden), #retryLogPanel:not(.hidden), #liveLogPanel:not(.hidden), #totpLogPanel:not(.hidden), #emailChangeLogPanel:not(.hidden), #qrPanel:not(.hidden) {
+    #logPanel, #retryLogPanel, #liveLogPanel, #totpLogPanel, #emailChangeLogPanel, #allLogPanel, #qrPanel { min-width: 0; max-width: 100%; overflow-x: hidden; }
+    #logPanel:not(.hidden), #retryLogPanel:not(.hidden), #liveLogPanel:not(.hidden), #totpLogPanel:not(.hidden), #emailChangeLogPanel:not(.hidden), #allLogPanel:not(.hidden), #qrPanel:not(.hidden) {
       position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
       z-index: 1000; display: block; width: min(1100px, calc(100vw - 48px));
       max-height: min(760px, calc(100vh - 48px)); overflow: hidden;
@@ -207,9 +207,12 @@
       background: var(--surface); box-shadow: 0 0 0 9999px rgba(15,23,42,.45), 0 24px 70px rgba(15,23,42,.34);
     }
     #qrPanel:not(.hidden) { width: min(520px, calc(100vw - 48px)); text-align: center; }
-    #logPanel h3, #retryLogPanel h3, #liveLogPanel h3, #totpLogPanel h3, #emailChangeLogPanel h3, #qrPanel h3 { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-    #logPanel h3 .btn, #retryLogPanel h3 .btn, #liveLogPanel h3 .btn, #totpLogPanel h3 .btn, #emailChangeLogPanel h3 .btn, #qrPanel h3 .btn { margin-left:auto; float:none !important; }
-    #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #totpLogPanel .log, #emailChangeLogPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
+    #logPanel h3, #retryLogPanel h3, #liveLogPanel h3, #totpLogPanel h3, #emailChangeLogPanel h3, #allLogPanel h3, #qrPanel h3 { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+    #logPanel h3 .btn, #retryLogPanel h3 .btn, #liveLogPanel h3 .btn, #totpLogPanel h3 .btn, #emailChangeLogPanel h3 .btn, #allLogPanel h3 .btn, #qrPanel h3 .btn { margin-left:auto; float:none !important; }
+    #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #totpLogPanel .log, #emailChangeLogPanel .log, #allLogPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
+    #allLogContent .all-log-sec { margin: 0 0 14px; }
+    #allLogContent .all-log-sec h4 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: var(--muted); }
+    #allLogContent .all-log-sec pre { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.5; }
     #qrPanel img { display:block; max-width:min(360px, calc(100vw - 96px)); max-height:420px; margin:12px auto; border:1px solid var(--line); border-radius:10px; background:#fff; }
     #qrPanel .qr-link { display:block; word-break:break-all; white-space:normal; font-size:12px; color:var(--muted); margin-top:8px; }
     .hidden { display: none !important; }
@@ -2303,7 +2306,8 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnSetupSelectedTotpV2" disabled title="给选中的账号批量开启 2FA，并在完成后写回 TOTP 密钥">批量开2FA</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnChangeSelectedEmailsV2" disabled title="为选中的账号从指定邮箱来源领取新邮箱并换绑">批量换邮箱</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnNoteSelectedAccountsV2" disabled title="给选中的账号统一设置备注，留空可清空备注">备注</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnSetPasswordV2" disabled title="给选中账号补设密码（无头浏览器逐个执行，约 1.5-2 分钟/个）">补密码</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnSetPasswordV2" disabled title="给选中账号补设密码（无头浏览器逐个执行，约 1.5-2 分钟/个）">补密码(浏览器)</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnSetPasswordProtocolV2" disabled title="给选中账号用协议直连补密码（无浏览器，约 20-40 秒/个；已开 2FA 的账号自动过 TOTP）">补密码(协议)</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLinesV2" disabled title="复制选中账号的完整整行，每个账号一行">复制行</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedTokensV2" disabled title="复制选中账号的 Token，每个账号一行">复制Token</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedEmailsV2" disabled title="复制选中账号的邮箱，每个账号一行">复制邮箱</button>
@@ -2370,6 +2374,12 @@
         <button class="btn" id="btnCloseEmailChangeLog" style="float:right;min-height:28px;">关闭</button>
       </h3>
       <div class="log" id="emailChangeLogContent">加载中…</div>
+    </div>
+    <div class="body hidden" id="allLogPanel">
+      <h3>全部日志：<span id="allLogEmail" style="font-size:13px;font-weight:400;color:var(--muted);"></span>
+        <button class="btn" id="btnCloseAllLog" style="float:right;min-height:28px;">关闭</button>
+      </h3>
+      <div class="log" id="allLogContent">加载中…</div>
     </div>
   </div>
 
@@ -3157,6 +3167,7 @@ function updateModalScrollLock() {
     || !$('#liveLogPanel').classList.contains('hidden')
     || !$('#totpLogPanel').classList.contains('hidden')
     || !$('#emailChangeLogPanel').classList.contains('hidden')
+    || !$('#allLogPanel').classList.contains('hidden')
     || !$('#qrPanel').classList.contains('hidden')
     || !$('#outlookImportModal').classList.contains('hidden')
     || !$('#emailChangeModalV2').classList.contains('hidden');
@@ -3841,7 +3852,9 @@ function _accountsV2MoreMenu(r) {
     `<button type="button" data-account-change-email-log="${esc(r.id)}" title="查看最近一次邮箱换绑日志">换绑日志</button>`,
     `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this); return false;" title="重新登录该账号，成功则刷新最新 AT/accessToken">查活刷新AT</button>`,
     `<button type="button" data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button>`,
+    `<button type="button" data-account-add-password="${esc(r.id)}" title="协议直连补设密码（无浏览器，约 20-40 秒；已开 2FA 的账号自动过 TOTP）">补密码(协议)</button>`,
     `<button type="button" data-account-totp-log="${esc(r.email)}" title="查看该账号最近一次 2FA 设置日志">2FA日志</button>`,
+    `<button type="button" data-account-all-logs="${esc(r.email)}" title="查看该账号全部日志：查活刷新 AT / 2FA / 补密码 / Codex 补跑 / 邮箱换绑">全部日志</button>`,
     _planAction(r),
     _extractLinkAction(r),
     _codexAction(r),
@@ -3923,7 +3936,7 @@ function updateAccountSelectionUi(pageRows = null) {
   const v2Ids = [
     'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
     'btnRetrySelectedCodexV2', 'btnStopSelectedCodexV2', 'btnSetupSelectedTotpV2', 'btnChangeSelectedEmailsV2',
-    'btnNoteSelectedAccountsV2', 'btnSetPasswordV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2',
+    'btnNoteSelectedAccountsV2', 'btnSetPasswordV2', 'btnSetPasswordProtocolV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2',
     'btnCopySelectedEmailsV2', 'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
     'btnDownloadSelectedCpaV2', 'btnDownloadSelectedFullExportV2', 'btnCopySelectedFullExportV2',
   ];
@@ -4074,6 +4087,65 @@ function closeEmailChangeLog() {
 }
 $('#btnCloseEmailChangeLog').addEventListener('click', closeEmailChangeLog);
 
+// ---------- 全部日志（查活 / 2FA / 补密码 / 补跑 / 换绑 合一） ----------
+let allLogEmail = null, allLogTimer = null;
+
+function openAllLogs(email) {
+  allLogEmail = email;
+  $('#allLogEmail').textContent = email;
+  $('#allLogPanel').classList.remove('hidden');
+  updateModalScrollLock();
+  $('#allLogContent').textContent = '加载中…';
+  pollAllLogs();
+  clearInterval(allLogTimer);
+  allLogTimer = setInterval(pollAllLogs, 5000);
+}
+async function pollAllLogs() {
+  if (!allLogEmail) return;
+  try {
+    const r = await api(`/api/accounts/all-logs?email=${encodeURIComponent(allLogEmail)}`);
+    const c = $('#allLogContent');
+    const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
+    const html = (r.sources || []).map(s => {
+      const body = (s.log || '').trim() || '(暂无日志)';
+      const flag = s.running ? ' · 运行中…' : '';
+      return `<section class="all-log-sec"><h4>${esc(s.label)}${flag}</h4><pre>${esc(body)}</pre></section>`;
+    }).join('');
+    c.innerHTML = html || '(暂无日志)';
+    if (atBottom) c.scrollTop = c.scrollHeight;
+    if (!(r.sources || []).some(s => s.running)) {
+      clearInterval(allLogTimer);
+      loadAccounts();
+    }
+  } catch(e) {}
+}
+function closeAllLogs() {
+  $('#allLogPanel').classList.add('hidden');
+  updateModalScrollLock();
+  clearInterval(allLogTimer);
+  allLogTimer = null;
+  allLogEmail = null;
+}
+$('#btnCloseAllLog').addEventListener('click', closeAllLogs);
+
+// ---------- 协议补密码（单个账号） ----------
+async function addAccountPassword(accountId) {
+  const acc = (pageRows || []).find(r => Number(r.id) === Number(accountId)) || {};
+  const label = acc.email || ('#' + accountId);
+  if (!confirm(`给 ${label} 补设密码？(协议直连，无浏览器，约 20-40 秒；已开 2FA 的账号会自动过 TOTP)`)) return;
+  try {
+    const r = await api('/api/accounts/add-password', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({account_ids: [Number(accountId)]}),
+    });
+    const skipped = Number(r.skipped_count || 0);
+    showToast(`已入队 ${r.started_count || 0} 个${skipped ? `，跳过 ${skipped} 个` : ''}`);
+    if (acc.email) openAllLogs(acc.email);
+  } catch (e) {
+    showToast('补密码失败: ' + e.message);
+  }
+}
+
 // 账号操作按钮（事件委托）
 async function onAccountsBodyClick(e) {
   const moreToggle = e.target.closest('[data-acc-more-toggle]');
@@ -4200,6 +4272,18 @@ async function onAccountsBodyClick(e) {
   const totpBtn = e.target.closest('[data-account-totp-setup]');
   if (totpBtn) {
     await setupAccountTotp(Number(totpBtn.dataset.accountTotpSetup), totpBtn);
+    return;
+  }
+
+  const addPwBtn = e.target.closest('[data-account-add-password]');
+  if (addPwBtn) {
+    await addAccountPassword(Number(addPwBtn.dataset.accountAddPassword));
+    return;
+  }
+
+  const allLogBtn = e.target.closest('[data-account-all-logs]');
+  if (allLogBtn) {
+    openAllLogs(allLogBtn.dataset.accountAllLogs);
     return;
   }
 
@@ -4967,6 +5051,32 @@ async function setSelectedPasswords() {
     pollPasswordFixStatus();
   } catch (e) { showToast('补密码失败: ' + e.message); }
 }
+async function setSelectedProtocolPasswords() {
+  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+  if (!ids.length) { showToast('请先勾选账号'); return; }
+  if (!confirm(`为勾选的 ${ids.length} 个账号用协议直连补密码？\n\n无浏览器，约 20-40 秒/个；已开 2FA 的账号会自动过 TOTP。`)) return;
+  const btn = document.getElementById('btnSetPasswordProtocolV2');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '入队中…'; }
+  try {
+    const r = await api('/api/accounts/add-password', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({account_ids: ids}),
+    });
+    const details = [];
+    if (r.skipped_count) details.push(`跳过 ${r.skipped_count} 个`);
+    if (r.busy_count) details.push(`进行中 ${r.busy_count} 个`);
+    if (r.failed_count) details.push(`失败 ${r.failed_count} 个`);
+    showToast(`补密码(协议)已入队 ${r.started_count || 0} 个${details.length ? '，' + details.join('，') : ''}`);
+    await loadAccounts();
+  } catch (e) {
+    showToast('补密码(协议)失败: ' + e.message);
+  } finally {
+    if (btn) { btn.textContent = oldText; }
+    updateAccountSelectionUi();
+  }
+}
+
 async function pollPasswordFixStatus() {
   try {
     const r = await api('/api/accounts/set-password/status');
@@ -5569,6 +5679,7 @@ $('#emailChangeModalV2').addEventListener('click', e => { if (e.target.id === 'e
   bind('btnChangeSelectedEmailsV2', () => openEmailChangeModal(Array.from(ACCOUNT_SELECTED)));
   bind('btnNoteSelectedAccountsV2', noteSelectedAccounts);
   bind('btnSetPasswordV2', setSelectedPasswords);
+  bind('btnSetPasswordProtocolV2', setSelectedProtocolPasswords);
   bind('btnCopySelectedLinesV2', copySelectedAccountLines);
   bind('btnCopySelectedTokensV2', copySelectedAccountTokens);
   bind('btnCopySelectedEmailsV2', copySelectedAccountEmails);
