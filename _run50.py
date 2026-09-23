@@ -238,6 +238,15 @@ def main() -> None:
                 continue
             if str(acc.get("password_pending_status") or "") == "done":
                 continue
+            # 上一次后处理失败后冷却 8 分钟再重试：否则每个循环都白等一次 OTP（~100s），
+            # 把注册节奏从 10/h 拖到 ~5/h（2026-09-24 06:24 实测）。
+            if str(acc.get("password_pending_status") or "") == "pending":
+                try:
+                    last_try = datetime.fromisoformat(str(acc.get("password_pending_at") or ""))
+                    if (now - last_try) < timedelta(minutes=8):
+                        continue
+                except Exception:
+                    pass
             if str(acc.get("push_status") or "") == "pushed" and acc.get("password"):
                 db.set_account_password_pending(acc.get("email"), status="done", reason="已完成")
                 continue
