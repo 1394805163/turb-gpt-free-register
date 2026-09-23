@@ -688,6 +688,30 @@ def pick_registration_proxy(*, allowed_countries_override: object = None) -> dic
     allowed = _normalize_country_codes(REGISTRATION_PROXY_ALLOWED_COUNTRIES)
     excluded = _normalize_country_codes(REGISTRATION_PROXY_EXCLUDED_COUNTRIES) or {"HK"}
 
+    # transparent 模式下全局同一时刻只有一个出口：注册任务已占用出口时，aux 流程
+    # （补密码 / 查活 / 套餐查询 / 补跑）**不许再切节点**，否则正在跑的注册会在中途
+    # 换出口（新号跨国跳变 = 最典型的风控特征）。aux 直接用当前节点出网即可。
+    try:
+        from core.route_lock import in_registration_flow, registration_busy
+
+        if registration_busy() and not in_registration_flow():
+            logger.info(
+                "[出口] 注册正在占用全局出口（transparent 单一出口），本轮不切节点，沿用当前节点"
+            )
+            return {
+                "mode": "current_route",
+                "group": str(MIHOMO_REGISTRATION_GROUP or MIHOMO_US_GROUP or "").strip(),
+                "node_name": "",
+                "proxy_url": "",
+                "transparent": bool(MIHOMO_TRANSPARENT_ROUTING),
+                "allowed_countries": sorted(allowed),
+                "excluded_countries": sorted(excluded),
+                "skipped_switch": True,
+                "skip_reason": "registration_in_progress",
+            }
+    except Exception:
+        pass
+
     if source == "resin":
         pool = get_proxy_pool()
         if not pool:

@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
+from core.route_lock import registration_guard
+
 from config import cloakbrowser as _cfg
 from config import email as _email_cfg
 from config import twofa as _twofa_cfg
@@ -158,6 +160,7 @@ def _assert_login_gate_not_blocked(driver) -> None:
         raise RuntimeError(f"ChatGPT/Cloudflare 拦截当前代理，准备轮换；title={state.get('title') or '-'}")
 
 
+@registration_guard
 def run_cloak_registration(
     email: str,
     name: str,

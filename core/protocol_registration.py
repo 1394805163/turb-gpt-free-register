@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import time
 
+from core.route_lock import registration_guard
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,6 +85,7 @@ def _login_and_fetch_session(driver, session, email: str) -> dict:
     return info
 
 
+@registration_guard
 def run_protocol_registration(
     email: str,
     *,
