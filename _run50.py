@@ -153,19 +153,26 @@ def post_process(acc: dict) -> dict:
     except Exception:
         pass
     res = login_with_password(email, pw, totp_secret=totp, country_hint=hint, write_back=False, timeout=30)
-    if not res.get("ok"):
-        db.set_account_password_pending(email, status="pending", reason=f"换AT失败：{str(res.get('error') or '')[:80]}")
-        return {**out, "ok": False, "step": "login", "error": str(res.get("error") or "")[:120]}
-    db.update_account_liveness(acc_id, {"ok": True, "status": "live", "method": "password_login_at_only",
-                                       "access_token": str(res.get("access_token") or ""),
-                                       "checked_at": datetime.now().isoformat(timespec="seconds")})
-    log(f"  [{acc_id}] 换 AT OK ({(res.get('elapsed_ms') or 0)/1000:.1f}s)")
+    at_ok = bool(res.get("ok"))
+    at_err = str(res.get("error") or "")[:120]
+    if at_ok:
+        db.update_account_liveness(acc_id, {"ok": True, "status": "live", "method": "password_login_at_only",
+                                           "access_token": str(res.get("access_token") or ""),
+                                           "checked_at": datetime.now().isoformat(timespec="seconds")})
+        log(f"  [{acc_id}] 换 AT OK ({(res.get('elapsed_ms') or 0)/1000:.1f}s)")
+    else:
+        # 没有 2FA 的号（注册期 2FA 失败）走密码登录会 409，此时硬卡在换 AT 会让这号永远推不出去。
+        # 推送本来就是"只推 AT"，所以先用注册时的 AT 推出去，换 AT 记在 reason 里等重试。
+        log(f"  [{acc_id}] 换 AT 失败（{at_err[:60]}）→ 先按现有 AT 推送，换 AT 记待重试")
 
     push = push_account(acc_id)
     payload = _account_payload(db.get_account(acc_id) or {})
     out.update({"push": push.get("status"), "kind": payload.get("credential_kind"), "has_rt": bool(payload.get("refresh_token"))})
     if push.get("status") == "pushed":
-        db.set_account_password_pending(email, status="done", reason="补密码+换AT+推送达标")
+        db.set_account_password_pending(
+            email, status="done",
+            reason=("补密码+换AT+推送达标" if at_ok else f"补密码+推送达标（换AT失败待重试：{at_err[:60]}）"),
+        )
         log(f"  [{acc_id}] 推送 OK kind={out['kind']} 含RT={out['has_rt']}")
         out["ok"] = True
     else:
