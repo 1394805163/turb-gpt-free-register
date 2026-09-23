@@ -17,7 +17,7 @@ MAX_PER_HOUR = 10
 # 注册子进程最长存活；超时按已完成结果继续判定（账号可能已经建好）。
 SUB_TIMEOUT = 300
 MAX_PER_IP_PER_HOUR = 10
-GAP_RANGE = (60, 150)
+GAP_RANGE = (50, 95)  # 号间间隔 76-150 -> 50-95：一号一出口 IP，跨号间隔不是同 IP 信号；为窗口留余量（2026-09-24 06:45）
 MIN_AGE_MIN = 15
 DRIVER = "cloak"
 STATE = "_run50.state.json"
@@ -286,8 +286,10 @@ def main() -> None:
                 f"| 出口 ip={exit_info['ip'] or '?'} node={exit_info['node'] or '?'} country={exit_info['country'] or '?'} "
                 f"| 本小时 {used_hour + 1}/{MAX_PER_HOUR}")
         else:
-            log(f"注册未成功（累计尝试 {st['attempts']}），等 3 分钟再来")
-            time.sleep(180)
+            log(f"注册未成功（累计尝试 {st['attempts']}），等 90 秒再来")
+            # 失败退避 3min->90s：失败时账号根本没建出来（死别名/超时），新号会用新邮箱+新出口，
+            # 长退避只是白等（2026-09-24 06:45 为了给窗口留余量收紧）。
+            time.sleep(90)
         save_state(st)
 
         # 4) 池子卫生 + 人类节奏间隔
