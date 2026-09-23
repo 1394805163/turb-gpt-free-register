@@ -524,6 +524,32 @@ def is_license_busy_error(exc: BaseException) -> bool:
     return "session limit reached" in text or "CloakBrowserLicenseError" in text
 
 
+_LAUNCH_BUSY_RETRY_WAITS = (15.0, 30.0)
+
+
+def launch_with_busy_retry(launch_fn, *, waits=_LAUNCH_BUSY_RETRY_WAITS, sleeper=time.sleep):
+    """执行 launch_fn()；撞到"席位居满"时退避重试，其它异常原样抛出。
+
+    席位在**服务端**释放有延迟（本地文件锁已经放掉、服务端计数还挂着），所以刚关掉
+    一个浏览器就立刻开下一个，仍可能收到 `session limit reached`。这层退避让注册
+    不必因此作废（之前注册路径没有这层保护，整轮会直接失败）。
+    """
+    attempt = 0
+    while True:
+        try:
+            return launch_fn()
+        except Exception as exc:
+            if attempt >= len(waits) or not is_license_busy_error(exc):
+                raise
+            wait = float(waits[attempt])
+            logger.warning(
+                "[Cloak] 席位居满（服务端释放延迟），%.0fs 后重试（%s/%s）：%s",
+                wait, attempt + 2, len(waits) + 1, str(exc)[:120],
+            )
+            sleeper(wait)
+            attempt += 1
+
+
 def _assert_mihomo_us_exit(selection: dict | None, geo: dict | None) -> None:
     data = selection if isinstance(selection, dict) else {}
     if str(data.get("mode") or "") != "mihomo_us":
@@ -769,16 +795,18 @@ def build_cloak_driver(
     if not _seat_acquire(label=f"proxy={_proxy_log_label(proxy_url)} seed={seed or '-'}"):
         raise RuntimeError("浏览器席位等待超时（另一个进程正在使用 CloakBrowser）")
 
-    try:
+    def _do_launch():
         if user_data_dir:
-            context = launch_persistent_context(user_data_dir, **opts)
-            page = context.new_page()
-            browser = getattr(context, "browser", None) or context
+            ctx = launch_persistent_context(user_data_dir, **opts)
+            pg = ctx.new_page()
             # persistent context 的 locale/timezone 已通过 launch_persistent_context 参数传入。
-        else:
-            browser = launch(**opts)
-            context = browser.new_context(**context_kwargs)
-            page = context.new_page()
+            return getattr(ctx, "browser", None) or ctx, ctx, pg
+        br = launch(**opts)
+        ctx = br.new_context(**context_kwargs)
+        return br, ctx, ctx.new_page()
+
+    try:
+        browser, context, page = launch_with_busy_retry(_do_launch)
     except Exception:
         _seat_release()
         raise
@@ -816,3 +844,39 @@ def build_cloak_driver(
         "locale": locale_opts,
         "options": {k: v for k, v in opts.items() if k != "license_key"},
     })
+
+
+if __name__ == "__main__":  # 自检：席位退避重试的次数与"其它异常原样抛"
+    class _Busy(RuntimeError):
+        pass
+
+    calls = {"n": 0}
+
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _Busy("CloakBrowser Pro: session limit reached for your plan.")
+        return "browser"
+
+    assert launch_with_busy_retry(_flaky, waits=(0.0, 0.0), sleeper=lambda _s: None) == "browser"
+    assert calls["n"] == 3, calls
+
+    def _always():
+        raise _Busy("session limit reached")
+
+    try:
+        launch_with_busy_retry(_always, waits=(0.0,), sleeper=lambda _s: None)
+        raise AssertionError("席位一直满时必须抛出")
+    except _Busy:
+        pass
+
+    def _other():
+        raise ValueError("boom")
+
+    try:
+        launch_with_busy_retry(_other, waits=(0.0,), sleeper=lambda _s: None)
+        raise AssertionError("非席位错误必须原样抛出")
+    except ValueError:
+        pass
+
+    print("cloakbrowser_driver launch-retry self-check OK")
