@@ -13,6 +13,9 @@ WINDOW_HOURS = 7.0
 # 2026-09-24 03:30 由 8 提到 10：主人定的硬线是「单 IP ≤10/小时」，我们一号一出口 IP，
 # 抬全局上限不碰这条线；池子清掉 85 个已消耗别名后失败率下降，8/h 已成瓶颈。
 MAX_PER_HOUR = 10
+
+# 注册子进程最长存活；超时按已完成结果继续判定（账号可能已经建好）。
+SUB_TIMEOUT = 300
 MAX_PER_IP_PER_HOUR = 10
 GAP_RANGE = (60, 150)
 MIN_AGE_MIN = 15
@@ -59,8 +62,18 @@ def launch_registration() -> tuple[bool, dict | None]:
     env = {**os.environ, "REGISTRATION_DRIVER": DRIVER, "ENABLE_2FA": "True"}
     with open("_run50.reg.log", "a", encoding="utf-8") as fh:
         fh.write(f"\n===== {datetime.now():%H:%M:%S} 开始一次注册 =====\n")
-        subprocess.run([sys.executable, "-X", "utf8", "main.py", "-n", "1", "--continue-on-fail"],
-                       env=env, stdout=fh, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen([sys.executable, "-X", "utf8", "main.py", "-n", "1", "--continue-on-fail"],
+                                env=env, stdout=fh, stderr=subprocess.STDOUT)
+        try:
+            proc.wait(timeout=SUB_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            log(f"⚠ 注册子进程超过 {SUB_TIMEOUT}s 未退出（常见于 2FA 等验证码的尾巴），强制结束并继续")
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     new = [a for a in _accounts() if a.get("id") not in before and str(a.get("created_at") or "")[:10] == datetime.now().strftime("%Y-%m-%d")]
     return (bool(new), new[0] if new else None)
 
