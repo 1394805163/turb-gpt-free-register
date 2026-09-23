@@ -163,7 +163,22 @@ def post_process(acc: dict) -> dict:
     else:
         # 没有 2FA 的号（注册期 2FA 失败）走密码登录会 409，此时硬卡在换 AT 会让这号永远推不出去。
         # 推送本来就是"只推 AT"，所以先用注册时的 AT 推出去，换 AT 记在 reason 里等重试。
-        log(f"  [{acc_id}] 换 AT 失败（{at_err[:60]}）→ 先按现有 AT 推送，换 AT 记待重试")
+        log(f"  [{acc_id}] 换 AT 失败（{at_err[:60]}）→ 用现有 AT 协议验活后照常推送，换 AT 记待重试")
+        # 推送闸门要求 live_check_status=live；换 AT 失败时用现有 AT 做一次协议验活（无浏览器）。
+        try:
+            from core.chatgpt_plan import check_account_plan
+
+            cur_at = str(freshest.get("access_token") or "")
+            probe = check_account_plan(cur_at) if cur_at else {"ok": False, "error": "无 AT"}
+            if probe.get("ok"):
+                db.update_account_liveness(acc_id, {"ok": True, "status": "live", "method": "token",
+                                                   "access_token": cur_at,
+                                                   "checked_at": datetime.now().isoformat(timespec="seconds")})
+                log(f"  [{acc_id}] 现有 AT 协议验活 OK（plan={probe.get('current_plan_type')}）")
+            else:
+                log(f"  [{acc_id}] 现有 AT 验活失败：{str(probe.get('error'))[:60]}")
+        except Exception as _probe_exc:
+            log(f"  [{acc_id}] 现有 AT 验活异常：{type(_probe_exc).__name__}")
 
     push = push_account(acc_id)
     payload = _account_payload(db.get_account(acc_id) or {})
