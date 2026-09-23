@@ -23,6 +23,9 @@ _state_lock = Lock()
 logger = logging.getLogger(__name__)
 
 # 收件人可能出现在这些头部；头部预过滤与全文解析共用，避免两处漂移。
+# 单次 IMAP 操作的最小 socket 超时（见 _request_timeout）。
+_MIN_REQUEST_TIMEOUT = 5.0
+
 RECIPIENT_HEADER_NAMES = (
     "To", "Cc", "Bcc", "Delivered-To", "X-Original-To", "X-Apple-Original-To",
     "Envelope-To", "X-Envelope-To", "Apparently-To", "Resent-To",
@@ -197,7 +200,11 @@ class ICloudMailboxPool:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("iCloud OTP 等待总预算已耗尽")
-        return min(timeout, remaining)
+        # 单一 socket 操作的最小超时下限：预算快耗尽时不能把超时压到毫秒级。
+        # 否则等待验证码的最后几次轮询会"秒失败"（表现为假 TimeoutError），
+        # 刚好在这段时间到达的验证码就被白白错过 —— 2026-09-24 多个号 2FA/补密码
+        # "iCloud OTP wait timed out" 的根因之一。单个操作最多超出预算几秒，可接受。
+        return max(_MIN_REQUEST_TIMEOUT, min(timeout, remaining))
 
     def _bind_deadline(self, imap, deadline: float | None, *, fallback: float | None = None) -> float:
         timeout = self._request_timeout(deadline=deadline, fallback=fallback)
