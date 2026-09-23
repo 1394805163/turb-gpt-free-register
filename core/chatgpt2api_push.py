@@ -50,6 +50,11 @@ def _retryable_status(status_code: int) -> bool:
     return int(status_code) in {408, 425, 429} or 500 <= int(status_code) <= 599
 
 
+def _push_at_only() -> bool:
+    """AT-only 模式：只下发 AT，不下发 RT/id_token（下游不再持有 RT）。"""
+    return bool(getattr(cfg, "CHATGPT2API_PUSH_AT_ONLY", False))
+
+
 def _account_payload(account: dict) -> dict:
     """转换为 chatgpt2api/CPA 可识别的 Codex 凭据对象。
 
@@ -69,6 +74,10 @@ def _account_payload(account: dict) -> dict:
     if not oauth_refresh_token and email_source != "outlook":
         oauth_refresh_token = str(account.get("refresh_token") or "").strip()
     id_token = str(account.get("chatgpt_id_token") or account.get("id_token") or "").strip()
+    if _push_at_only():
+        # AT-only：RT 与 id_token 一律不下发（避免下游与本地抢同一条一次性 RT）
+        oauth_refresh_token = ""
+        id_token = ""
     credential_kind = "complete" if oauth_refresh_token and id_token else "access_only"
     payload = {
         "type": "codex",
@@ -129,7 +138,8 @@ def push_account(
         return {"ok": False, "status": "missing", "error": "账号不存在"}
     # 没有 refresh_token 的账号（例如注册后就被删的死号）不要推给下游：
     # 下游靠 RT 续期，AT 过期后只会变成一条报错记录。
-    if not str(account.get("chatgpt_refresh_token") or "").strip():
+    # AT-only 模式放行：下游拿到的就是无 RT 凭据，续期由本地账密+2FA 负责。
+    if not _push_at_only() and not str(account.get("chatgpt_refresh_token") or "").strip():
         return {
             "ok": False,
             "status": "no_refresh_token",

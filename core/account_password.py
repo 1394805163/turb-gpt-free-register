@@ -764,6 +764,7 @@ def add_password_protocol(
         reauth_after = time.time()
         final_url = str(_follow_reauth_with_retry(session, auth_url) or "")
         logger.info("[补密码-协议] 重认证落点=%s", final_url[:120])
+        continue_url = str(final_url or "")
         if "email-verification" in final_url or "email-otp" in final_url:
             from core.email_provider import OtpWaitSession, wait_for_otp
 
@@ -771,12 +772,36 @@ def add_password_protocol(
             otp = OtpWaitSession(wait_fn=wait_for_otp).wait(email, after_ts=reauth_after, max_wait=otp_wait)
             continue_url = str(_validate_reauth_otp(session, otp) or "")
             logger.info("[补密码-协议] OTP 通过，continue=%s", continue_url[:120])
-            if continue_url:
-                session.get(
-                    continue_url,
-                    headers=session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification"),
-                    allow_redirects=True,
-                )
+
+        # ---- 3.5) 已开 2FA 的账号：重认证链会停在 /mfa-challenge/<factor_id>。
+        # 必须先提交 TOTP 再进 password/add，否则服务端按 invalid_auth_step 拒绝
+        # （2FA 与密码是同一把锁的两道工序，缺一步都不成立）。
+        if "/mfa-challenge/" in continue_url:
+            factor_id = continue_url.rstrip("/").split("/mfa-challenge/")[-1].split("?")[0].strip()
+            totp_secret = str((db.get_account_by_email(email) or {}).get("totp_secret") or "").strip()
+            if not factor_id or not totp_secret:
+                return {
+                    "ok": False, "status": "failed", "email": email, "password": new_password,
+                    "error": ("账号已开 2FA，补密码需 TOTP："
+                              f"factor_id={'有' if factor_id else '无'} totp_secret={'有' if totp_secret else '无'}"),
+                }
+            import pyotp
+            from core.openai_auth import validate_mfa_totp
+
+            logger.info("[补密码-协议] 进入 MFA challenge，提交 TOTP：factor=%s", factor_id[:12])
+            continue_url = str(validate_mfa_totp(
+                session, pyotp.TOTP(totp_secret).now(), factor_id,
+                referer=f"https://auth.openai.com/mfa-challenge/{factor_id}",
+            ) or continue_url)
+            logger.info("[补密码-协议] 2FA 通过，continue=%s", continue_url[:120])
+
+        # 落到加密码页（或先跟一跳回调），为 password/add 建立正确步进
+        if continue_url and "/mfa-challenge/" not in continue_url:
+            session.get(
+                continue_url,
+                headers=session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification"),
+                allow_redirects=True,
+            )
 
         # ---- 4) sentinel + 提交新密码 ----
         sentinel_resp = request_sentinel_token(session, "username_password_create")
