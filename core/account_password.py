@@ -317,6 +317,7 @@ def _resolve_fresh_account_route(email: str) -> tuple[str | None, dict | None]:
         logger.warning("[补密码] 出口预检失败，改按注册国家直选节点：%s", str(exc)[:120])
         try:
             from config import proxy as proxy_cfg
+            from core.registration_preflight import preflight_proxy
 
             # 账号注册地之外再并入全局允许地区（US/JP/TW/SG 之类）：
             # 后置流程（补密码/补2FA/查活）只要求落在允许地区内，
@@ -330,8 +331,33 @@ def _resolve_fresh_account_route(email: str) -> tuple[str | None, dict | None]:
                 for code in (getattr(proxy_cfg, "MIHOMO_REGISTRATION_ALLOWED_COUNTRIES", []) or [])
                 if str(code).strip()
             }
-            selection = proxy_cfg.pick_registration_proxy(allowed_countries_override=allowed_union)
-            return None, selection
+            # 节点名带国家码不代表真实出口：曾选到"US 节点"却从 HK(45.196.236.74) 出网。
+            # 兜底选路必须过 trace 预检（排除 HK）才放行，否则换节点重选。
+            last_selection: dict | None = None
+            for attempt in range(1, 4):
+                selection = proxy_cfg.pick_registration_proxy(allowed_countries_override=allowed_union)
+                check = preflight_proxy(
+                    selection.get("proxy_url"),
+                    require_country="",
+                    allowed_countries=sorted(allowed_union),
+                    excluded_countries=["HK"],
+                    allow_transparent=bool(selection.get("transparent")),
+                    route_identity=str(selection.get("node_name") or selection.get("proxy_url") or ""),
+                    force=True,
+                )
+                if check.get("ok"):
+                    logger.info(
+                        "[补密码] 兜底选路通过出口预检：node=%s country=%s ip=%s（尝试 %s/3）",
+                        selection.get("node_name") or "-", check.get("country"), check.get("ip"), attempt,
+                    )
+                    return selection.get("proxy_url"), selection
+                last_selection = selection
+                logger.warning(
+                    "[补密码] 兜底节点出口不合法（尝试 %s/3）：country=%s reason=%s",
+                    attempt, check.get("country") or "未知", str(check.get("reason"))[:90],
+                )
+            logger.warning("[补密码] 3 次兜底选路都未过出口预检（已排除 HK），仍按最后一次选路执行")
+            return None, last_selection
         except Exception as exc2:
             logger.warning("[补密码] 按国家直选也失败，交给默认选路：%s", str(exc2)[:120])
             return None, None
