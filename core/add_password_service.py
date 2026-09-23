@@ -136,12 +136,32 @@ if __name__ == "__main__":
     print("add_password_service self-check OK:", p.name)
 
 
+# 这些阶段在跑时不要补密码：补密码要挑/切 mihomo 节点，会让正在跑的注册
+# 中途换出口（新号几分钟内跨国跳变是最典型的风控特征）。
+_NODE_SWITCHING_STAGES = ("registration", "live_check", "codex_oauth")
+
+
+def _busy_stages() -> list[str]:
+    try:
+        from core.pipeline_concurrency import pipeline_snapshot
+
+        stages = pipeline_snapshot().get("by_stage") or {}
+        return sorted(name for name in _NODE_SWITCHING_STAGES if int(stages.get(name) or 0) > 0)
+    except Exception:
+        return []
+
+
 def sweep_pending(*, limit: int = _SWEEP_LIMIT, min_age_minutes: float = _SWEEP_MIN_AGE_MINUTES) -> dict:
     """扫描"注册后待补密码"的账号并补跑。
 
     只挑：挂号 pending、没有密码、账号没死、有 access_token、并且注册已满
     min_age_minutes（默认 15 分钟，避开注册后立刻补密码撞 rate_limit_exceeded）。
     """
+    busy = _busy_stages()
+    if busy:
+        logger.info("[补密码] 扫描器跳过本轮：注册/查活/Codex 授权进行中 %s（避免切节点打断出口）", busy)
+        return {"scanned": 0, "picked": 0, "queued": [], "skipped_reason": "pipeline_busy", "busy": busy}
+
     from datetime import datetime, timedelta
 
     from core import db
