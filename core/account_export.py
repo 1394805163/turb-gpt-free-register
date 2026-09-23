@@ -817,6 +817,21 @@ def save_account_data(
                 f"{redact_email(email)}, {type(exc).__name__}: {str(exc)[:180]}"
             )
 
+    # 无密码注册（passwordless signup）：注册期不会产生密码，这里只挂号。
+    # 由 add_password_service 的扫描器在"账号够老"后再补密码 —— 刚注册完立刻补
+    # 会被 OpenAI 发信限流（rate_limit_exceeded），所以不能在注册线程里做。
+    if not str(extra.get("registration_password") or "").strip():
+        try:
+            from core import db as _db_password
+
+            if _db_password.set_account_password_pending(email, status="pending", reason="注册后待补密码"):
+                logger.info("[补密码] 已挂号待补密码: id=%s, email=%s", row_id, redact_email(email))
+        except Exception as exc:
+            logger.warning(
+                "[补密码] 挂号失败（不影响注册结果）: %s, %s: %s",
+                redact_email(email), type(exc).__name__, str(exc)[:140],
+            )
+
     if auto_plan_check is None:
         try:
             from config import register as _register_cfg

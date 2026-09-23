@@ -3810,6 +3810,45 @@ def update_account_session_tokens(email: str, session: dict | None) -> bool:
         return True
 
 
+def set_account_password_pending(email: str, *, status: str, reason: str = "") -> bool:
+    """无密码注册账号的"待补密码"挂号/收尾。
+
+    status: pending（待补）/ in_progress（已入队）/ done / failed / skipped
+    入队时 attempts +1，用于限制重试次数，避免失败账号被无限重试。
+    """
+    target = str(email or "").strip()
+    if not target:
+        return False
+    with _LOCK:
+        row = _load_account_row(email=target)
+        if row is None:
+            return False
+        now = _now()
+        normalized = str(status or "").strip().lower()
+        if not normalized:  # 传空 = 清掉挂号（不要默认成 pending，否则"清理"会重新挂号）
+            row["password_pending_status"] = None
+            row["password_pending"] = False
+            row["password_pending_reason"] = str(reason or "")[:160]
+            row["updated_at"] = now
+            _save_account_row(row)
+            return True
+        row["password_pending_status"] = normalized
+        row["password_pending_at"] = now
+        row["password_pending_reason"] = str(reason or "")[:160]
+        if normalized == "pending":
+            row["password_pending"] = True
+        elif normalized in {"done", "failed", "skipped"}:
+            row["password_pending"] = False
+        if normalized == "in_progress":
+            try:
+                row["password_pending_attempts"] = int(row.get("password_pending_attempts") or 0) + 1
+            except (TypeError, ValueError):
+                row["password_pending_attempts"] = 1
+        row["updated_at"] = now
+        _save_account_row(row)
+    return True
+
+
 def update_account_registration_password(email: str, password: str) -> bool:
     """记录/覆盖账号的 OpenAI 登录密码（补设密码或密码注册后调用）。
 

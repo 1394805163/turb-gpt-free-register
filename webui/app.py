@@ -418,6 +418,14 @@ def create_app(auth_code: str | None = None) -> Flask:
         recovered_email_changes = db.recover_interrupted_email_changes()
         if recovered_email_changes:
             logger.warning("已恢复 %s 个因 WebUI 重启中断的邮箱换绑状态", recovered_email_changes)
+        # 注册是"无密码注册"：注册落库时挂号 pending，这里拉起扫描器在账号够老
+        # （默认 15 分钟，避开注册后立刻补密码撞发信限流）后自动补密码。
+        try:
+            from core import add_password_service
+
+            add_password_service.start_sweeper()
+        except Exception as exc:
+            logger.warning("自动补密码扫描器启动失败：%s: %s", type(exc).__name__, str(exc)[:160])
 
 
     # ----------------------------------------------------------
