@@ -65,6 +65,12 @@ def main() -> int:
     ap.add_argument("--sleep", type=float, default=3.0)
     ap.add_argument("--only-password", action="store_true")
     ap.add_argument("--only-2fa", action="store_true")
+    ap.add_argument(
+        "--quick-screen",
+        action="store_true",
+        help="跑浏览器流程前先用协议登录快筛（默认关：它自己会触发一封登录码，"
+             "把后面浏览器流程要用的那封码顶掉，导致收口拿到旧码被判 invalid）",
+    )
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
@@ -101,7 +107,11 @@ def main() -> int:
         # 快筛：有密码的号先跑一次纯协议登录（5 秒，不占浏览器席位）。
         # 能提前发现"账号已被删除/停用"，也能顺手刷新 AT/RT。
         acc_row = db.get_account_by_email(email) or {}
-        if str(acc_row.get("password") or "").strip() and not str(acc_row.get("chatgpt_refresh_token") or "").strip():
+        if (
+            args.quick_screen
+            and str(acc_row.get("password") or "").strip()
+            and not str(acc_row.get("chatgpt_refresh_token") or "").strip()
+        ):
             try:
                 from core.password_login import login_with_password
 

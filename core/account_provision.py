@@ -180,10 +180,12 @@ def provision_account(
                 time.sleep(4)
                 _diag("提交密码后")
         if _is_email_verification_page(driver):
-            if not _submit_email_code(email, login_otp_after, "登录"):
-                _diag("登录验证码未被接受")
-                raise RuntimeError("登录验证码提交未被接受（页面仍停在 email-verification）")
+            ok_submit = _submit_email_code(email, login_otp_after, "登录")
             _diag("提交登录验证码后")
+            if not ok_submit:
+                # 实测：判定 'invalid' 之后页面仍可能已经跳到 chatgpt.com（登录其实成功了），
+                # 所以这里不判死，交给下面的 session 读取决定真实状态。
+                logger.warning("[收口] 登录验证码提交结果非 accepted，继续读 session 判定真实状态")
         if _is_mfa_challenge_page(driver):
             if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
                 raise RuntimeError("2FA 动态码未通过，无法继续")
@@ -245,8 +247,9 @@ def provision_account(
             auth_url = _trigger_reauth(session, email)
             driver.get(auth_url)
             time.sleep(3)
-            if not _submit_email_code(email, reauth_otp_after, "补2FA-reauth"):
-                raise RuntimeError("补2FA reauth 验证码提交未被接受")
+            ok_reauth = _submit_email_code(email, reauth_otp_after, "补2FA-reauth")
+            if not ok_reauth:
+                logger.warning("[收口] reauth 验证码提交结果非 accepted，继续读 session 判定真实状态")
             time.sleep(3)
             fresh = _fetch_chatgpt_session(driver, timeout=90)
             fresh_token = str((fresh or {}).get("accessToken") or "")
