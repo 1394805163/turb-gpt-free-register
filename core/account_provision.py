@@ -123,6 +123,14 @@ def provision_account(
             logger.info("[收口][诊断] %s 验证码提交结果：%s", label, outcome)
             if outcome == "accepted":
                 return True
+            # 实测（2026-09-24 11:39）：提交成功、页面已经跳走，但这里仍可能读到页面上
+            # 残留的错误横幅判成 'invalid'。所以先看"是否已离开验证码页"，离开即视为通过。
+            try:
+                if not _is_email_verification_page(driver):
+                    logger.info("[收口] %s 判定 %s，但页面已离开验证码页 → 视为通过", label, outcome)
+                    return True
+            except Exception:
+                pass
             if attempt == 2:
                 return False
             logger.warning("[收口] %s 验证码未被接受（%s），点重发并等新码重试一次", label, outcome)
