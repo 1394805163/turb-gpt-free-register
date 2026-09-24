@@ -103,6 +103,46 @@ def provision_account(
 
     _gate = pipeline_slot("live_check")
     _gate.__enter__()
+    def _submit_email_code(email: str, after_ts: float, label: str) -> bool:
+        """取码 → 填写 → 提交；被服务端拒绝时改用"最新一封"重试一次。
+
+        2026-09-24 实测：同一别名 30 秒内可能连收两封码（11:16:26 / 11:16:54），
+        旧码被新码顶掉后提交会被拒，页面停在 email-verification 不动 ——
+        收口流程原来忽略提交结果，于是白等 90 秒后拿到 WARNING_BANNER。
+        """
+        code = OtpWaitSession(wait_fn=wait_for_otp).wait(email, after_ts=after_ts, max_wait=90)
+        if not code:
+            raise RuntimeError(f"{label} 未取到验证码")
+        logger.info("[收口] %s 验证码已收到（len=%s），提交", label, len(str(code)))
+        for attempt in (1, 2):
+            _clear_otp_inputs(driver)
+            _type_otp(driver, code)
+            _click_continue(driver)
+            outcome = _wait_after_email_otp_submit(driver, timeout=25)
+            logger.info("[收口][诊断] %s 验证码提交结果：%s", label, outcome)
+            if outcome == "accepted":
+                return True
+            if attempt == 2:
+                return False
+            logger.warning("[收口] %s 验证码未被接受（%s），改用最新一封码重试一次", label, outcome)
+            time.sleep(3)
+            fresh = OtpWaitSession(wait_fn=wait_for_otp).wait(email, after_ts=time.time() - 60, max_wait=60)
+            if fresh and str(fresh) != str(code):
+                code = fresh
+                logger.info("[收口] %s 已换用新码重试", label)
+                continue
+            return False
+        return False
+
+    def _diag(tag: str) -> None:
+        """定位"卡在哪一步"用：记录当前页面 URL/标题（只写日志，不改行为）。"""
+        try:
+            url = str(getattr(driver, "current_url", "") or "")
+            title = str(getattr(driver, "title", "") or "")[:60]
+            logger.info("[收口][诊断] %s | url=%s | title=%s", tag, url[:160], title)
+        except Exception:
+            pass
+
     driver = None
     try:
         driver, opened = build_cloak_driver(
@@ -126,6 +166,8 @@ def provision_account(
         next_state = _submit_email_and_wait_next(
             driver, email, attempts=2, timeout=120, allow_password_page=True
         )
+        logger.info("[收口][诊断] next_state=%s", next_state)
+        _diag("提交邮箱后")
         if next_state == "login_password":
             logger.info("[收口] 进入登录密码页：优先切换一次性验证码入口")
             _fill_password_page_if_present(driver, email, timeout=45)
@@ -136,15 +178,12 @@ def provision_account(
                 logger.info("[收口] 未找到一次性验证码入口，改用 DB 密码登录")
                 _submit_login_password(driver, stored_password)
                 time.sleep(4)
+                _diag("提交密码后")
         if _is_email_verification_page(driver):
-            login_session = OtpWaitSession(wait_fn=wait_for_otp)
-            login_code = login_session.wait(email, after_ts=login_otp_after, max_wait=90)
-            logger.info("[收口] 登录验证码已收到（len=%s），提交", len(str(login_code or "")))
-            _clear_otp_inputs(driver)
-            _type_otp(driver, login_code)
-            _click_continue(driver)
-            _wait_after_email_otp_submit(driver, timeout=25)
-        time.sleep(2)
+            if not _submit_email_code(email, login_otp_after, "登录"):
+                _diag("登录验证码未被接受")
+                raise RuntimeError("登录验证码提交未被接受（页面仍停在 email-verification）")
+            _diag("提交登录验证码后")
         if _is_mfa_challenge_page(driver):
             if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
                 raise RuntimeError("2FA 动态码未通过，无法继续")
@@ -206,13 +245,8 @@ def provision_account(
             auth_url = _trigger_reauth(session, email)
             driver.get(auth_url)
             time.sleep(3)
-            reauth_session = OtpWaitSession(wait_fn=wait_for_otp)
-            reauth_code = reauth_session.wait(email, after_ts=reauth_otp_after, max_wait=90)
-            logger.info("[收口][补2FA] reauth 验证码已收到（len=%s）", len(str(reauth_code or "")))
-            _clear_otp_inputs(driver)
-            _type_otp(driver, reauth_code)
-            _click_continue(driver)
-            _wait_after_email_otp_submit(driver, timeout=25)
+            if not _submit_email_code(email, reauth_otp_after, "补2FA-reauth"):
+                raise RuntimeError("补2FA reauth 验证码提交未被接受")
             time.sleep(3)
             fresh = _fetch_chatgpt_session(driver, timeout=90)
             fresh_token = str((fresh or {}).get("accessToken") or "")
