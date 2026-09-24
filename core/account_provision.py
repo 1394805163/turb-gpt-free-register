@@ -67,6 +67,7 @@ def provision_account(
         _clear_otp_inputs,
         _click_continue,
         _fetch_chatgpt_session,
+        _click_resend_email_otp,
         _fill_password_page_if_present,
         _is_email_verification_page,
         _is_login_password_page,
@@ -124,14 +125,22 @@ def provision_account(
                 return True
             if attempt == 2:
                 return False
-            logger.warning("[收口] %s 验证码未被接受（%s），改用最新一封码重试一次", label, outcome)
+            logger.warning("[收口] %s 验证码未被接受（%s），点重发并等新码重试一次", label, outcome)
+            # 关键：不点重发就只能拿到"上一封"（属于上一个流程状态），依旧 invalid。
+            # 这里强制让服务端按"当前页面状态"重新发一封（注册链路同款做法）。
+            try:
+                resent = _click_resend_email_otp(driver, timeout=20)
+                logger.info("[收口][诊断] %s 重发结果：%s", label, {k: v for k, v in (resent or {}).items() if k in ("ok", "reason")})
+            except Exception as exc:
+                logger.info("[收口][诊断] %s 重发异常：%s", label, type(exc).__name__)
             time.sleep(3)
-            fresh = OtpWaitSession(wait_fn=wait_for_otp).wait(email, after_ts=time.time() - 60, max_wait=60)
+            fresh = OtpWaitSession(wait_fn=wait_for_otp).wait(email, after_ts=time.time() - 20, max_wait=75)
             if fresh and str(fresh) != str(code):
                 code = fresh
                 logger.info("[收口] %s 已换用新码重试", label)
                 continue
-            return False
+            logger.warning("[收口] %s 未取到新码，保持原码再试一次", label)
+            continue
         return False
 
     def _diag(tag: str) -> None:
