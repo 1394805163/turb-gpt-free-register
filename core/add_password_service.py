@@ -29,6 +29,55 @@ def is_running(email: str) -> bool:
         return str(email or "").strip().lower() in _RUNNING
 
 
+def _refresh_tokens_after_password(email: str) -> None:
+    """补密码成功后立刻协议换新 AT/RT 并回写（best-effort）。
+
+    背景：改密（reset-password）会让改密前写回的 access_token 立即失效
+    （401 token_revoked），run50c 曾因此把整条流水线卡在"未测活"上。
+    失败不改变补密码结果，后续查活（协议）还会兜底刷新。
+    """
+    try:
+        from core import db
+        from core.password_login import login_with_password
+
+        acc = db.get_account_by_email(email) or {}
+        password = str(acc.get("password") or "").strip()
+        if not password:
+            logger.warning("[补密码] 改密后刷新 AT 跳过：本地没有密码值")
+            return
+        totp = str(acc.get("totp_secret") or "").strip()
+        country_hint = ""
+        try:
+            from core.live_check_service import _young_account_country_hint
+
+            country_hint = _young_account_country_hint(int(acc.get("id") or 0)) or ""
+        except Exception:
+            country_hint = ""
+        last_error = "-"
+        for attempt in (1, 2):
+            try:
+                res = login_with_password(
+                    email, password,
+                    totp_secret=totp,
+                    country_hint=country_hint,
+                    write_back=True,
+                    timeout=30,
+                )
+            except Exception as exc:  # noqa: BLE001
+                res = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+            if res.get("ok"):
+                logger.info("[补密码] 改密后已协议刷新 AT/RT 并回写（attempt=%s，%sms）",
+                            attempt, res.get("elapsed_ms") or "-")
+                return
+            last_error = str(res.get("error") or "-")[:160]
+            logger.warning("[补密码] 改密后刷新 AT 失败（attempt=%s）：%s", attempt, last_error)
+            if attempt == 1:
+                time.sleep(5)
+        logger.warning("[补密码] 改密后刷新 AT 两次失败，交由后续查活兜底：%s", last_error)
+    except Exception as exc:  # noqa: BLE001 - best effort，不影响补密码结果
+        logger.warning("[补密码] 改密后刷新 AT 异常：%s", str(exc)[:160])
+
+
 _SWEEP_INTERVAL_SECONDS = 300
 _SWEEP_MIN_AGE_MINUTES = 15.0
 _SWEEP_LIMIT = 2
@@ -56,7 +105,7 @@ def _run(email: str, trigger: str) -> dict:
         logger.info("[补密码] 任务结束：%s | %s", result.get("status"),
                     str(result.get("error") or "-")[:200])
         if result.get("ok"):
-            logger.info("[补密码] 密码已写回账号，可点「查活刷新AT」用账密+2FA 换新 AT")
+            logger.info("[补密码] 密码已写回账号，准备协议刷新 AT（改密会吊销旧 AT）")
         try:
             from core import db
 
@@ -75,6 +124,9 @@ def _run(email: str, trigger: str) -> dict:
                         reason=f"待重试({attempts}/{_MAX_ATTEMPTS})：{str(result.get('error') or '')[:100]}")
         except Exception as exc:
             logger.warning("[补密码] 挂号状态回写失败：%s", str(exc)[:140])
+        if result.get("ok"):
+            # 改密会吊销改密前写回的 AT：立刻协议换新并回写，避免整批卡在"未测活"（run50c 教训）。
+            _refresh_tokens_after_password(email)
         return {
             "status": str(result.get("status") or ""),
             "ok": bool(result.get("ok")),
