@@ -99,6 +99,56 @@ def _follow_to_code(session, url: str, *, max_hops: int = 8) -> str:
     raise RuntimeError(f"跟随 continue_url 超过 {max_hops} 跳仍未取得 code: {current[:120]}")
 
 
+def _finish_email_verification_login(session, email: str, *, timeout: int = 30) -> str:
+    """在 email-verification 落地页完成邮箱 OTP 登录，返回 OAuth authorization code。
+
+    页面加载通常已自动发送验证码；先等自动码（最多 75s），超时后显式重发一次再等。
+    含 MFA（TOTP）与 continue_url → code 的跟随。任何失败抛异常，由调用方落回上层兜底。
+    """
+    from core.email_provider import OtpWaitSession, wait_for_otp
+    from core.openai_auth import send_email_otp, validate_email_otp
+    from core import db as _db
+
+    email_source = ""
+    try:
+        email_source = str((_db.get_account_by_email(email) or {}).get("email_source") or "").strip() or None
+    except Exception:
+        email_source = None
+
+    t0 = time.time()
+    wait_session = OtpWaitSession(wait_fn=wait_for_otp, max_wait=210)
+    code = None
+    try:
+        code = wait_session.wait(email, after_ts=t0 - 25, max_wait=75, email_source=email_source)
+        logger.info("[password-login] 邮箱验证墙：自动验证码已到达（len=%s）", len(str(code or "")))
+    except Exception:
+        logger.info("[password-login] 邮箱验证墙：75s 未收到自动验证码，显式重发一次")
+        send_email_otp(session)
+        code = wait_session.wait(email, after_ts=time.time(), max_wait=120, email_source=email_source)
+    wait_session.mark_used(code)
+
+    validate_result = validate_email_otp(session, code, sentinel_header=None, so_header=None)
+    page = validate_result.get("page") if isinstance(validate_result, dict) else {}
+    page = page if isinstance(page, dict) else {}
+    page_type = str(page.get("type") or "")
+    continue_url = str(
+        validate_result.get("continue_url")
+        or validate_result.get("external_url")
+        or ""
+    ).strip()
+
+    if page_type == "mfa_challenge" or "/mfa-challenge" in continue_url:
+        from core.account_liveness import _pass_mfa_challenge  # 局部导入，避免循环依赖
+
+        mfa = _pass_mfa_challenge(session, email, validate_result)
+        continue_url = str(mfa.get("continue_url") or continue_url)
+
+    auth_code = _extract_code(continue_url)
+    if not auth_code:
+        auth_code = _follow_to_code(session, continue_url)
+    return auth_code
+
+
 def login_with_password(
     email: str,
     password: str,
@@ -220,79 +270,93 @@ def login_with_password(
             return {"ok": False, "error": error_code or "authorize_error", "detail": detail, "steps": step}
         _mark("authorize", True, final_url[:120])
 
-        # ② sentinel token（best-effort：失败也继续，与下游 try/except 行为一致）
-        sentinel_ok = False
-        token_header = so_header = None
-        try:
-            from core.openai_auth import build_sentinel_header, request_sentinel_token
-            sent = request_sentinel_token(session, "password_verify")
-            token_header, so_header = build_sentinel_header(session, sent, "password_verify")
-            sentinel_ok = bool(token_header)
-        except Exception as exc:
-            logger.warning("[password-login] sentinel 获取失败（继续尝试）: %s", str(exc)[:200])
-        _mark("sentinel", sentinel_ok)
+        email_wall = "/email-verification" in final_url
+        login_data = {}
+        if email_wall:
+            # 邮箱验证墙：authorize 直接落到 email-verification（“组合流程补设 2FA”
+            # 的账号常见；此时 password/verify 必 409 invalid_state）。
+            # 改走邮箱 OTP：页面自动发码 → 取码验证 → 如有 MFA 提交 TOTP → 取 code。
+            _mark("email_verification", True, "authorize 落在邮箱验证页，转邮箱 OTP 登录")
+            try:
+                code = _finish_email_verification_login(session, target, timeout=timeout)
+            except Exception as exc:
+                _mark("email_verification", False, f"{type(exc).__name__}: {str(exc)[:160]}")
+                return {"ok": False, "error": "email_verification_login_failed",
+                        "detail": {"message": str(exc)[:240]}, "steps": step}
+        else:
+            # ② sentinel token（best-effort：失败也继续，与下游 try/except 行为一致）
+            sentinel_ok = False
+            token_header = so_header = None
+            try:
+                from core.openai_auth import build_sentinel_header, request_sentinel_token
+                sent = request_sentinel_token(session, "password_verify")
+                token_header, so_header = build_sentinel_header(session, sent, "password_verify")
+                sentinel_ok = bool(token_header)
+            except Exception as exc:
+                logger.warning("[password-login] sentinel 获取失败（继续尝试）: %s", str(exc)[:200])
+            _mark("sentinel", sentinel_ok)
 
-        # ③ 提交密码
-        login_headers = session.get_auth_headers(referer=f"{AUTH_BASE}/log-in")
-        login_headers["oai-device-id"] = device_id
-        if sentinel_ok:
-            login_headers["openai-sentinel-token"] = token_header
-            if so_header:
-                login_headers["openai-sentinel-so-token"] = so_header
-        login_resp = session.post(
-            f"{AUTH_BASE}/api/accounts/password/verify",
-            headers=login_headers,
-            data=json.dumps({"password": password}),
-            timeout=timeout,
-        )
-        login_data = _resp_json(login_resp)
-        if login_resp.status_code != 200:
-            error_obj = login_data.get("error") if isinstance(login_data.get("error"), dict) else {}
-            error_code = str(error_obj.get("code") or "")
-            error_msg = str(error_obj.get("message") or "")
-            if error_code == "unsupported_country_region_territory":
-                _mark("password_verify", False, error_code)
-                return {"ok": False, "error": error_code, "detail": login_data, "steps": step}
-            if "Invalid credentials" in error_msg or "wrong password" in error_msg.lower():
-                _mark("password_verify", False, "invalid_password")
-                return {"ok": False, "error": "invalid_password", "detail": login_data, "steps": step}
-            _mark("password_verify", False, f"status={login_resp.status_code} code={error_code}")
-            return {"ok": False, "error": f"password_verify_failed_{login_resp.status_code}",
-                    "detail": login_data, "steps": step}
-        _mark("password_verify", True)
+            # ③ 提交密码
+            login_headers = session.get_auth_headers(referer=f"{AUTH_BASE}/log-in")
+            login_headers["oai-device-id"] = device_id
+            if sentinel_ok:
+                login_headers["openai-sentinel-token"] = token_header
+                if so_header:
+                    login_headers["openai-sentinel-so-token"] = so_header
+            login_resp = session.post(
+                f"{AUTH_BASE}/api/accounts/password/verify",
+                headers=login_headers,
+                data=json.dumps({"password": password}),
+                timeout=timeout,
+            )
+            login_data = _resp_json(login_resp)
+            if login_resp.status_code != 200:
+                error_obj = login_data.get("error") if isinstance(login_data.get("error"), dict) else {}
+                error_code = str(error_obj.get("code") or "")
+                error_msg = str(error_obj.get("message") or "")
+                if error_code == "unsupported_country_region_territory":
+                    _mark("password_verify", False, error_code)
+                    return {"ok": False, "error": error_code, "detail": login_data, "steps": step}
+                if "Invalid credentials" in error_msg or "wrong password" in error_msg.lower():
+                    _mark("password_verify", False, "invalid_password")
+                    return {"ok": False, "error": "invalid_password", "detail": login_data, "steps": step}
+                _mark("password_verify", False, f"status={login_resp.status_code} code={error_code}")
+                return {"ok": False, "error": f"password_verify_failed_{login_resp.status_code}",
+                        "detail": login_data, "steps": step}
+            _mark("password_verify", True)
 
-        # ④ 取 authorization code（直出 / MFA / 邮箱 OTP）
-        code = _extract_code(str(login_data.get("continue_url") or ""))
-        page = login_data.get("page") if isinstance(login_data.get("page"), dict) else {}
-        page_type = str(page.get("type") or "")
+            # ④ 取 authorization code（直出 / MFA / 邮箱 OTP）
+            code = _extract_code(str(login_data.get("continue_url") or ""))
+            page = login_data.get("page") if isinstance(login_data.get("page"), dict) else {}
+            page_type = str(page.get("type") or "")
 
-        if not code and page_type == "mfa_challenge":
-            payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
-            factors = payload.get("factors") or []
-            factor_id = str((factors[0] or {}).get("id") or "") if factors else ""
-            if not totp_secret:
-                _mark("mfa_challenge", False, "缺少 totp_secret")
-                return {"ok": False, "error": "need_totp_secret", "detail": login_data, "steps": step}
-            if not factor_id:
-                _mark("mfa_challenge", False, "缺少 factor id")
-                return {"ok": False, "error": "mfa_challenge_no_factor", "detail": login_data, "steps": step}
-            import pyotp
-            from core.openai_auth import validate_mfa_totp
-            referer = str(login_data.get("continue_url") or f"{AUTH_BASE}/mfa-challenge")
-            continue_url = validate_mfa_totp(
-                session, pyotp.TOTP(totp_secret).now(), factor_id, referer=referer)
-            code = _follow_to_code(session, continue_url)
-            _mark("mfa_challenge", True, code[:8] + "***")
-        elif not code and page_type == "email_otp_verification":
-            _mark("email_otp", False, "需要邮箱验证码（暂不支持导入账号收码）")
-            return {"ok": False, "error": "need_email_otp", "detail": login_data, "steps": step}
-        elif not code:
-            continue_url = str(login_data.get("continue_url") or "").strip()
-            if continue_url:
-                try:
-                    code = _follow_to_code(session, continue_url)
-                except Exception as exc:
-                    logger.warning("[password-login] 跟随 continue_url 失败: %s", str(exc)[:200])
+            if not code and page_type == "mfa_challenge":
+                payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
+                factors = payload.get("factors") or []
+                factor_id = str((factors[0] or {}).get("id") or "") if factors else ""
+                if not totp_secret:
+                    _mark("mfa_challenge", False, "缺少 totp_secret")
+                    return {"ok": False, "error": "need_totp_secret", "detail": login_data, "steps": step}
+                if not factor_id:
+                    _mark("mfa_challenge", False, "缺少 factor id")
+                    return {"ok": False, "error": "mfa_challenge_no_factor", "detail": login_data, "steps": step}
+                import pyotp
+                from core.openai_auth import validate_mfa_totp
+                referer = str(login_data.get("continue_url") or f"{AUTH_BASE}/mfa-challenge")
+                continue_url = validate_mfa_totp(
+                    session, pyotp.TOTP(totp_secret).now(), factor_id, referer=referer)
+                code = _follow_to_code(session, continue_url)
+                _mark("mfa_challenge", True, code[:8] + "***")
+            elif not code and page_type == "email_otp_verification":
+                _mark("email_otp", False, "需要邮箱验证码（暂不支持导入账号收码）")
+                return {"ok": False, "error": "need_email_otp", "detail": login_data, "steps": step}
+            elif not code:
+                continue_url = str(login_data.get("continue_url") or "").strip()
+                if continue_url:
+                    try:
+                        code = _follow_to_code(session, continue_url)
+                    except Exception as exc:
+                        logger.warning("[password-login] 跟随 continue_url 失败: %s", str(exc)[:200])
 
         if not code:
             _mark("authorization_code", False, "未取得")
