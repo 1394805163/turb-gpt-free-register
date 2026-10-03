@@ -47,7 +47,11 @@ def refresh_account_credentials(
             str(acc.get("push_status") or "") in {"pushed", "success"}
             or bool(str(acc.get("exported_at") or "").strip())
         )
-        if handed_off:
+        # 只有"下游确实持有可续期 RT"时才拒绝本地刷新（避免两边抢同一条一次性 RT）；
+        # AT-only 推送（下游 RT 缺失/失效）时本地是唯一刷新方，必须允许消耗本地 RT。
+        downstream_rt = str(acc.get("downstream_rt_status") or "").strip().lower()
+        downstream_can_refresh = downstream_rt in {"valid", "ok"}
+        if handed_off and downstream_can_refresh:
             return {
                 "ok": False,
                 "status": "downstream_managed",
