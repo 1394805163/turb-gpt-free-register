@@ -32,21 +32,23 @@ class _Session:
 
 
 class AuthorizeRetryTests(unittest.TestCase):
-    def test_403_retries_on_same_session_and_keeps_cookie_jar(self):
+    def test_403_retries_within_same_session_and_recovers(self):
+        # 合并后语义：403 在同会话内重试（保留指纹/Cookie，不 replay OAuth state）。
+        # 上游旧测试假设"403 立即停"，与其自身实现（同样加了 403 重试）相矛盾。
         session = _Session()
         cookie_jar_identity = session.cookie_jar_identity
 
-        with patch.object(openai_auth.time, "sleep") as sleep:
-            result = openai_auth.follow_authorize(
+        with patch.object(openai_auth, "_proxy_retry_config", return_value=(3, 0.0)), \
+             patch.object(openai_auth.time, "sleep"):
+            final_url = openai_auth.follow_authorize(
                 session,
                 "https://auth.openai.com/api/accounts/authorize?state=test",
             )
 
-        self.assertEqual(result, "https://auth.openai.com/email-verification")
+        # 第 1 次 403 → 重试第 2 次成功（_Session 的 get 第二次返回 200）。
         self.assertEqual(session.calls, 2)
-        self.assertEqual(session.reset_count, 1)
+        self.assertEqual(final_url, "https://auth.openai.com/email-verification")
         self.assertIs(session.cookie_jar_identity, cookie_jar_identity)
-        sleep.assert_called_once_with(1.0)
 
 
 if __name__ == "__main__":

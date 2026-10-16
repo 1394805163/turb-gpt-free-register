@@ -171,7 +171,12 @@ class EmailLogRedactionTests(unittest.TestCase):
             self.assertIn(email_fingerprint(ALIAS), output)
 
     def test_protocol_driver_logs_redacted_email_and_external_error(self):
-        session = Mock(proxy=None, device_id="device-fixture", auth_session_logging_id="log-fixture")
+        session = Mock(
+            proxy=None,
+            device_id="device-fixture",
+            oai_session_id="session-fixture",
+            auth_session_logging_id="log-fixture",
+        )
         with patch.object(registration_main._roxy_cfg, "REGISTRATION_DRIVER", "protocol"), patch.object(
             registration_main, "BrowserSession", return_value=session
         ), patch.object(

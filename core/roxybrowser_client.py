@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
 import time
 from dataclasses import dataclass
 from urllib.parse import unquote, urljoin, urlparse
@@ -14,6 +15,30 @@ import requests
 from config import roxybrowser as _cfg
 
 logger = logging.getLogger(__name__)
+
+# Roxy 的 /browser/create 在多 worker 同时到达时可能返回“正在创建中”。
+# 为所有客户端实例共享创建时隙，确保进程内请求起始时间至少错开配置的间隔。
+_CREATE_SLOT_LOCK = threading.Lock()
+_NEXT_CREATE_SLOT = 0.0
+# 创建 Profile 到拿到调试地址期间串行化，避免 Roxy 内核/端口竞争。
+_ROXY_WINDOW_CREATE_LOCK = threading.Lock()
+
+
+def _wait_for_create_slot() -> None:
+    global _NEXT_CREATE_SLOT
+
+    interval = max(0.0, float(getattr(_cfg, "ROXY_CREATE_INTERVAL", 1.5) or 0.0))
+    if interval <= 0:
+        return
+
+    with _CREATE_SLOT_LOCK:
+        now = time.monotonic()
+        wait_for = max(0.0, _NEXT_CREATE_SLOT - now)
+        _NEXT_CREATE_SLOT = max(now, _NEXT_CREATE_SLOT) + interval
+
+    if wait_for > 0:
+        logger.info("[Roxy] /browser/create 请求错峰，等待 %.2fs", wait_for)
+        time.sleep(wait_for)
 
 
 @dataclass
@@ -214,10 +239,13 @@ class RoxyBrowserClient:
     def request(self, method: str, path: str, *, params: dict | None = None, json_body: dict | None = None) -> dict:
         url = _join_url(self.api_base, path)
         method_u = method.upper()
-        # create 超时后服务端可能已创建环境，直接重试可能产生孤儿环境；默认不重试 create。
         is_create = str(path or "").rstrip("/").endswith("/create") or "browser/create" in str(path or "")
-        max_attempts = 1 if is_create else max(1, int(getattr(_cfg, "ROXY_API_RETRIES", 3) or 3))
-        base_delay = max(0.5, float(getattr(_cfg, "ROXY_API_RETRY_DELAY", 2) or 2))
+        if is_create:
+            max_attempts = max(1, int(getattr(_cfg, "ROXY_CREATE_RETRIES", 3) or 3))
+            base_delay = max(0.5, float(getattr(_cfg, "ROXY_CREATE_RETRY_DELAY", 3) or 3))
+        else:
+            max_attempts = max(1, int(getattr(_cfg, "ROXY_API_RETRIES", 3) or 3))
+            base_delay = max(0.5, float(getattr(_cfg, "ROXY_API_RETRY_DELAY", 2) or 2))
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -256,8 +284,10 @@ class RoxyBrowserClient:
                     raise
                 delay = base_delay * attempt
                 logger.warning(
-                    "[Roxy] API 请求失败，将在 %.1fs 后重试：%s %s attempt=%s/%s error=%s",
-                    delay, method_u, path, attempt, max_attempts, exc,
+                    "[Roxy] API 请求失败，将在 %.1fs 后使用相同%s重试：%s %s attempt=%s/%s error=%s",
+                    delay,
+                    " create payload/name " if is_create else "请求参数",
+                    method_u, path, attempt, max_attempts, exc,
                 )
                 time.sleep(delay)
         raise last_exc or RuntimeError(f"Roxy API 请求失败 {method_u} {path}")
@@ -457,7 +487,7 @@ class RoxyBrowserClient:
             from core.proxy_chain import open_proxy_pool_proxy
 
             target_proxy = _proxy_cfg.pick_proxy()
-            proxy_url, relay = open_proxy_pool_proxy(target_proxy)
+            proxy_url, relay = open_proxy_pool_proxy(target_proxy, measure_transport=True)
             self._proxy_pool_relay = relay
             self._proxy_pool_target = str(target_proxy or "").strip()
             if proxy_url:
@@ -465,7 +495,7 @@ class RoxyBrowserClient:
                 body["proxyInfo"] = proxy_info
                 logger.info(
                     "[Roxy] 创建环境启用代理池：target=%s transport=%s type=%s host=%s port=%s",
-                    str(target_proxy or "").strip(), str(proxy_url or "").strip(),
+                    _mask_proxy(target_proxy), _mask_proxy(proxy_url),
                     proxy_info.get("protocol") or proxy_info.get("proxyCategory"),
                     proxy_info.get("host"),
                     proxy_info.get("port"),
@@ -487,6 +517,7 @@ class RoxyBrowserClient:
             body.get("osVersion") or "-",
             random_os_enabled,
         )
+        _wait_for_create_slot()
         result = self.request(_cfg.ROXY_CREATE_METHOD, _cfg.ROXY_CREATE_PATH, json_body=body)
         profile_id = _first(result, [
             ("id",), ("dirId",), ("dir_id",), ("profile_id",), ("profileId",), ("browser_id",),
@@ -506,6 +537,10 @@ class RoxyBrowserClient:
         return text
 
     def open_profile(self, profile_id: str | None = None) -> RoxyOpenResult:
+        with _ROXY_WINDOW_CREATE_LOCK:
+            return self._open_profile_locked(profile_id)
+
+    def _open_profile_locked(self, profile_id: str | None = None) -> RoxyOpenResult:
         one_profile = bool(getattr(_cfg, "ROXY_ONE_PROFILE_PER_ACCOUNT", True))
         configured_pid = self._normalize_profile_id(profile_id if profile_id is not None else getattr(_cfg, "ROXY_PROFILE_ID", ""))
         if one_profile and configured_pid:
@@ -631,14 +666,26 @@ class RoxyBrowserClient:
     def close_proxy_pool_relay(self) -> None:
         relay, self._proxy_pool_relay = self._proxy_pool_relay, None
         if relay is not None:
-            if relay.last_error:
-                logger.warning(
-                    "[Roxy] 代理链最后一次错误：target=%s upstream=%s error=%s",
-                    _mask_proxy(self._proxy_pool_target),
-                    _mask_proxy(getattr(relay.upstream, "raw", "")),
-                    relay.last_error,
-                )
             relay.close()
+            # last_error 是本轮历史错误，不能在成功任务收尾时再次当作当前故障告警。
+            # 未恢复的连接失败已在发生处带 destination 输出 WARNING。
+            targets = relay.traffic_snapshot().get("destinations", [])
+            failed = sum(item.get("failed_connection_count", 0) for item in targets)
+            retries = sum(item.get("connect_retry_count", 0) for item in targets)
+            recovered = sum(item.get("recovered_connection_count", 0) for item in targets)
+            if failed or retries:
+                logger.info("[Roxy] 代理链连接汇总：握手重试=%s，重试恢复=%s，失败连接=%s（失败详情见发生时的 destination 日志）",
+                            retries, recovered, failed)
+
+    def proxy_transport_snapshot(self) -> dict | None:
+        """返回本轮 Roxy 经本地代理链传输的全浏览器流量。"""
+        relay = self._proxy_pool_relay
+        if relay is None:
+            return None
+        try:
+            return relay.traffic_snapshot()
+        except Exception:
+            return None
 
     @staticmethod
     def _extract_debugger_address(payload: dict) -> str | None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -23,6 +24,36 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="live-ch
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
 _RUNNING: set[int] = set()
 _LOCK = threading.Lock()
+_NETWORK_RETRY_HINTS = (
+    "403", "429", "502", "503", "504", "proxy", "socks", "timeout",
+    "timed out", "connection", "closed", "reset",
+)
+
+
+def _configured_live_check_proxies(proxy_cfg) -> list[str]:
+    """查活优先使用套餐专用代理池，未配置时使用注册代理池。"""
+    values = list(getattr(proxy_cfg, "PLAN_CHECK_PROXY", []) or [])
+    if not values:
+        values = list(getattr(proxy_cfg, "PROXY_POOL", []) or [])
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _live_proxy_route(proxy_url: str, proxy_cfg) -> dict:
+    route = resolve_plan_check_route(explicit_proxy=proxy_url)
+    upstream = str(getattr(proxy_cfg, "PLAN_CHECK_UPSTREAM_PROXY", "") or "").strip()
+    if upstream:
+        route["upstream_proxy"] = upstream
+        route["upstream_proxy_used"] = _mask_proxy(upstream) or None
+        route["network_route"] = "proxy_chain"
+    route["proxy_mode"] = "proxy_pool"
+    return route
+
+
+def _retryable_live_check_result(result: dict) -> bool:
+    if result.get("ok") or result.get("status") == "deactivated":
+        return False
+    text = str(result.get("error") or "").lower()
+    return any(hint in text for hint in _NETWORK_RETRY_HINTS)
 
 
 def is_checking(email: str) -> bool:
@@ -170,12 +201,14 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
                 }
             else:
                 raise
-        selected_proxy = route.get("proxy")
         from config import proxy as proxy_cfg
+        candidates = _configured_live_check_proxies(proxy_cfg)
+        # 上游：查活规则独立于套餐查询的 direct/auto 选择——只要任一代理池有数据，
+        # 就禁止直连，并从池中随机选择一个出口（我方路由失败/为空时的兜底）。
+        if candidates and not str(route.get("proxy") or "").strip():
+            route = _live_proxy_route(random.choice(candidates), proxy_cfg)
+        selected_proxy = str(route.get("proxy") or "").strip()
         timeout = float(getattr(proxy_cfg, "PLAN_CHECK_TIMEOUT", 15.0) or 15.0)
-        effective_proxy, relay = open_plan_check_proxy(
-            route, selected_proxy, timeout=timeout,
-        )
         # 查活必须沿用账号注册时记录的邮箱来源。不能只调用
         # resolve_email_source(email)：Remail 等临时邮箱的上下文只在领取进程
         # 内存中存在，服务重启后按当前 EMAIL_SOURCE 推断会把来源判错。
@@ -195,44 +228,63 @@ def _run_live_check_inner(*, account_id: int, email: str, proxy: str | None, tri
             f"country_hint={country_hint or '-'} "
             f"fallback_reason={route.get('proxy_fallback_reason') or '-'}"
         )
-        # 每个网络路由尝试拥有自己的任务级身份状态；同一路由的完整认证链及
-        # 内部重试复用同一组 device/session 标识，不同账号绝不共享。
-        fingerprint_state: dict = {}
-        result = check_account_liveness(
-            email,
-            proxy=effective_proxy,
-            clear_log=False,
-            rotate_transparent_route=route.get("network_route") == "transparent",
-            proxy_selection=route.get("proxy_selection"),
-            email_source=email_source,
-            fingerprint_state=fingerprint_state,
-            method=method or None,
-        )
-        # 认证链早期 403 通常是该出口被 CF 拦截，不代表账号死亡。
-        # auto/proxy 模式下如果用了代理，额外直连兜底一次，便于和套餐查询的 auto 语义保持接近。
-        err_text = str(result.get("error") or "")
-        if (
-            not result.get("ok")
-            and result.get("status") == "failed"
-            and "403" in err_text
-            and selected_proxy
-            and str(route.get("network_route") or "") == "proxy"
-        ):
+        # 每个代理出口使用独立 BrowserSession/指纹/Cookie。网络类失败后换池中
+        # 尚未使用的代理；池非空时绝不直连。
+        max_routes = max(1, int(getattr(proxy_cfg, "PLAN_CHECK_MAX_ATTEMPTS", 3) or 3))
+        used_proxies: set[str] = set()
+        result: dict = {"ok": False, "status": "failed", "error": "查活未执行"}
+        for route_attempt in range(1, max_routes + 1):
+            selected_proxy = str(route.get("proxy") or "").strip()
+            if selected_proxy:
+                used_proxies.add(selected_proxy)
+            effective_proxy, relay = open_plan_check_proxy(
+                route, selected_proxy, timeout=timeout,
+            )
             _append_log(
                 email,
-                "[查活] 代理路线完整会话收到 403，启动独立直连会话兜底一次（不复用代理画像/Cookie/会话ID）",
+                f"[查活] 网络出口尝试 {route_attempt}/{max_routes}："
+                f"{_mask_proxy(selected_proxy) or 'direct'}",
             )
-            # BrowserSession 约定：None=从代理池抽取，""=明确直连。
-            # 出口发生变化时必须重新按真实出口探测画像，不能把代理的 JP/VN
-            # 语言时区伪装到直连；因此直连兜底使用独立的任务身份状态。
             result = check_account_liveness(
                 email,
-                proxy="",
+                proxy=effective_proxy,
                 clear_log=False,
                 email_source=email_source,
-                fingerprint_state={},
+                # 我方：透明路由轮换 + 节点选择沿用同一次选路；指纹按尝试序号决定是否重建。
+                rotate_transparent_route=route.get("network_route") == "transparent",
+                proxy_selection=route.get("proxy_selection"),
+                fingerprint_state={"force_fresh": route_attempt > 1},
                 method=method or None,
             )
+            if relay is not None:
+                relay.close()
+                relay = None
+            if not _retryable_live_check_result(result):
+                break
+
+            remaining = [item for item in candidates if item not in used_proxies]
+            if remaining and route_attempt < max_routes:
+                next_proxy = random.choice(remaining)
+                _append_log(
+                    email,
+                    "[查活] 当前代理发生网络/403错误，放弃该会话并随机切换下一代理："
+                    f"{_mask_proxy(next_proxy)}",
+                )
+                route = _live_proxy_route(next_proxy, proxy_cfg)
+                continue
+
+            if candidates:
+                break
+
+            # 没有任何代理池数据时，保留原先的一次直连兜底行为。
+            if selected_proxy and route_attempt < max_routes:
+                _append_log(
+                    email,
+                    "[查活] 未配置可替换代理，启动独立直连会话兜底一次",
+                )
+                route = resolve_plan_check_route(explicit_proxy="")
+                continue
+            break
         db.update_account_liveness(account_id, result)
         if result.get("ok"):
             _append_log(email, "[查活] 完成：账号正常，已刷新最新 AT/accessToken")

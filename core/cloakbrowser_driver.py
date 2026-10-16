@@ -269,6 +269,13 @@ class CloakSeleniumDriver:
         if relay is not None:
             relay.close()
 
+    def proxy_transport_snapshot(self) -> dict | None:
+        relay = self._proxy_relay
+        try:
+            return relay.traffic_snapshot() if relay is not None else None
+        except Exception:
+            return None
+
     def find_elements(self, by: Any, selector: str) -> list[CloakElement]:
         loc = self._locator(by, selector)
         try:
@@ -712,12 +719,13 @@ def build_cloak_driver(
     # 代理链（可选）：PROXY_POOL_UPSTREAM_PROXY 非空时，用本地上游中转到达上面选出的
     # 目标代理（本地上游 -> 目标代理 -> ChatGPT）。留空时 relay=None，行为不变。
     proxy_relay = None
+    # 我方选路为唯一入口（resin/mihomo 已在上方定好 proxy）；上游的省流量统计能力
+    # 通过 measure_transport 叠加进来：上游链非空时走它，否则仅本地计量中继。
     proxy_pool_target = str(proxy or "").strip()
-    if proxy_pool_target and str(getattr(_proxy_cfg, "PROXY_POOL_UPSTREAM_PROXY", "") or "").strip():
+    if proxy_pool_target and bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
         from core.proxy_chain import open_proxy_pool_proxy
 
-        proxy, proxy_relay = open_proxy_pool_proxy(proxy_pool_target)
-
+        proxy, proxy_relay = open_proxy_pool_proxy(proxy_pool_target, measure_transport=True)
     try:
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:

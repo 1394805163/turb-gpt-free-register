@@ -9,6 +9,7 @@ TLS/IP/代理隧道等协议额外开销，因此不等同于代理服务商的�
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import threading
 import time
@@ -20,6 +21,46 @@ from typing import Any
 from config import browser as _browser_cfg
 
 logger = logging.getLogger(__name__)
+
+
+def merge_proxy_transport_traffic(observed: dict | None, transport: dict | None, *, label: str) -> dict | None:
+    """传输层全量计数作为总量；页面明细仍保留原来的 HTTP 统计口径。"""
+    # transport 来自浏览器驱动/代理中继，形状不可信：非 dict 直接跳过，别让统计拖垮注册结果。
+    if not isinstance(transport, dict) or not transport.get("available"):
+        return observed
+    result = dict(observed or {})
+    for field in ("upload_bytes", "download_bytes", "total_bytes"):
+        result.setdefault("browser_observed_" + field, _non_negative_int(result.get(field)))
+    result["proxy_transport"] = dict(transport)
+    upload = _non_negative_int(transport.get("upload_bytes"))
+    download = _non_negative_int(transport.get("download_bytes"))
+    result.update(available=True, upload_bytes=upload, download_bytes=download,
+                  total_bytes=upload + download, measurement_scope="proxy_transport_all_browser_targets",
+                  method="local_proxy.transport", label=label,
+                  note="本地代理隧道双向传输字节，包含 TLS、启动阶段和后台请求；不含 TCP/IP 开销、重传或代理商计费差异")
+    browser_total = result["browser_observed_total_bytes"]
+    logger.info("[%s] 代理传输流量：上传 %.2f MiB，下载 %.2f MiB，总计 %.2f MiB；页面可见 %.2f MiB",
+                label, upload / 1048576, download / 1048576, (upload + download) / 1048576, browser_total / 1048576)
+    destinations = transport.get("destinations") or []
+    consuming = sorted((item for item in destinations if _non_negative_int(item.get("total_bytes")) > 0),
+                       key=lambda item: _non_negative_int(item.get("total_bytes")), reverse=True)
+    if destinations:
+        logger.info("[%s] 代理目标流量归因：有消耗目标 %s 个（按隧道目标 host:port；含启动和后台流量，不能区分页面/扩展发起者）",
+                    label, len(consuming))
+    for index, item in enumerate(consuming, 1):
+        host = str(item.get("host") or "<unknown>")
+        endpoint = f"[{host}]:{item.get('port', 0)}" if ":" in host else f"{host}:{item.get('port', 0)}"
+        total = _non_negative_int(item.get("total_bytes"))
+        logger.info("[%s] [代理目标] #%s target=%s upload=%sB download=%sB total=%sB (%.2f MiB) share=%.2f%% connections=%s failed=%s retries=%s recovered=%s",
+                    label, index, endpoint, item.get("upload_bytes", 0), item.get("download_bytes", 0),
+                    total, total / 1048576, total * 100 / (upload + download) if upload + download else 0,
+                    item.get("connection_count", 0), item.get("failed_connection_count", 0),
+                    item.get("connect_retry_count", 0), item.get("recovered_connection_count", 0))
+    for item in destinations:
+        if _non_negative_int(item.get("blocked_connection_count")):
+            logger.info("[%s] [代理拦截] target=%s:%s blocked=%s（上游连接前拒绝，未产生代理传输流量）",
+                        label, item.get("host"), item.get("port"), item["blocked_connection_count"])
+    return result
 
 
 _RESOURCE_TYPE_ALIASES = {
@@ -109,6 +150,20 @@ def _safe_url_for_log(url: Any, *, max_length: int = 600) -> str:
     return safe[:max_length] + ("…" if len(safe) > max_length else "")
 
 
+def _is_loopback_url(url: Any) -> bool:
+    """本机回环 HTTP(S)/WS(S) 资源不属于代理或公网注册流量。"""
+    try:
+        parsed = urlsplit(str(url or ""))
+        if parsed.scheme.lower() not in {"http", "https", "ws", "wss"}:
+            return False
+        host = str(parsed.hostname or "").strip().lower().rstrip(".")
+        if host == "localhost" or host.endswith(".localhost"):
+            return True
+        return bool(host and ipaddress.ip_address(host).is_loopback)
+    except (TypeError, ValueError):
+        return False
+
+
 def _coverage_count(value: Any) -> int:
     """把 Profiler 覆盖率中的 count/offset 规范化为非负整数。"""
     try:
@@ -158,6 +213,7 @@ class _TrafficAccumulator:
         self.websocket_count = 0
         self._reported = False
         self._data_saver: Any | None = None
+        self._local_asset_cache: Any | None = None
         self._detail_log_enabled = bool(getattr(_browser_cfg, "BROWSER_TRAFFIC_DETAIL_LOG", False))
         try:
             configured_max = int(getattr(_browser_cfg, "BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES", 2000) or 2000)
@@ -187,6 +243,10 @@ class _TrafficAccumulator:
     def attach_data_saver(self, data_saver: Any | None) -> None:
         """把省流量拦截器的计数附加到浏览器流量快照。"""
         self._data_saver = data_saver
+
+    def attach_local_asset_cache(self, cache: Any | None) -> None:
+        """让统计器把 Fetch.fulfillRequest 本地正文排除出代理下载流量。"""
+        self._local_asset_cache = cache
 
     def _js_coverage_mark_target_attempt(self) -> None:
         if not self._js_coverage_log_enabled:
@@ -500,6 +560,7 @@ class _TrafficAccumulator:
         mime_type: Any = "",
         websocket_payload_upload_bytes: Any = 0,
         websocket_payload_download_bytes: Any = 0,
+        size_source: str = "browser_observed",
         detail_key: Any = None,
     ) -> None:
         """记录单个资源的脱敏明细，供 stop() 时输出分析日志。"""
@@ -534,6 +595,7 @@ class _TrafficAccumulator:
             "websocket_payload_upload_bytes": _non_negative_int(websocket_payload_upload_bytes),
             "websocket_payload_download_bytes": _non_negative_int(websocket_payload_download_bytes),
             "url": _safe_url_for_log(url),
+            "size_source": size_source,
         }
         with self._lock:
             existing_index = self._request_detail_index.get(detail_key)
@@ -586,7 +648,10 @@ class _TrafficAccumulator:
             return
         self._prepare_request_details()
         with self._lock:
-            details = list(self._request_details)
+            all_details = list(self._request_details)
+        details = [item for item in all_details if self._is_consuming_detail(item)]
+        upload_total = sum(int(item["upload_bytes"]) for item in details)
+        download_total = sum(int(item["download_bytes"]) for item in details)
         type_totals: dict[str, dict[str, int]] = defaultdict(
             lambda: {"count": 0, "upload_bytes": 0, "download_bytes": 0, "blocked": 0, "failed": 0}
         )
@@ -598,9 +663,14 @@ class _TrafficAccumulator:
             totals["blocked"] += int(bool(item["blocked"]))
             totals["failed"] += int(bool(item["failed"]))
         logger.info(
-            "[%s] 浏览器资源明细汇总：记录 %s 条，按类型=%s",
+            "[%s] 浏览器资源明细汇总：消耗流量访问 %s 条，跳过零流量/拦截/本地访问 %s 条，"
+            "upload=%sB download=%sB total=%sB，按类型=%s",
             self.label,
             len(details),
+            len(all_details) - len(details),
+            upload_total,
+            download_total,
+            upload_total + download_total,
             json.dumps(dict(sorted(type_totals.items())), ensure_ascii=False, separators=(",", ":")),
         )
         ranked = sorted(
@@ -612,16 +682,17 @@ class _TrafficAccumulator:
             reverse=True,
         )[: self._detail_log_max_entries]
         logger.info(
-            "[%s] 浏览器资源明细开始：按单请求总字节降序，输出 %s/%s 条（URL 查询值已脱敏）",
+            "[%s] 浏览器资源明细开始：按单请求总字节降序，输出 %s/%s 条"
+            "（URL 查询值已脱敏；页面 HTTP/WS 口径，不含 TLS；估算项标记 size_source）",
             self.label,
             len(ranked),
             len(details),
         )
         for index, item in enumerate(ranked, 1):
             logger.info(
-                "[%s] [资源明细] #%s %s %s status=%s upload=%sB download=%sB "
+                "[%s] [资源明细] #%s %s %s status=%s upload=%sB download=%sB total=%sB "
                 "body=%sB headers=%sB failed=%s blocked=%s unfinished=%s cache=%s "
-                "mime=%s ws_upload=%sB ws_download=%sB url=%s",
+                "mime=%s ws_upload=%sB ws_download=%sB size_source=%s url=%s",
                 self.label,
                 index,
                 item["type"],
@@ -629,6 +700,7 @@ class _TrafficAccumulator:
                 item["status"] if item["status"] is not None else "-",
                 item["upload_bytes"],
                 item["download_bytes"],
+                int(item["upload_bytes"]) + int(item["download_bytes"]),
                 item["response_body_bytes"],
                 item["response_header_bytes"],
                 int(bool(item["failed"])),
@@ -638,9 +710,19 @@ class _TrafficAccumulator:
                 item.get("mime_type", ""),
                 item.get("websocket_payload_upload_bytes", 0),
                 item.get("websocket_payload_download_bytes", 0),
+                item.get("size_source", "browser_observed"),
                 item["url"],
             )
         logger.info("[%s] 浏览器资源明细结束", self.label)
+
+    @staticmethod
+    def _is_consuming_detail(item: dict[str, Any]) -> bool:
+        """只输出有字节消耗的公网访问；失败/未完成但已收发的访问仍保留。"""
+        if item.get("blocked") or _is_loopback_url(item.get("url")):
+            return False
+        if str(item.get("url") or "").lower().startswith(("data:", "blob:")):
+            return False
+        return _non_negative_int(item.get("upload_bytes")) + _non_negative_int(item.get("download_bytes")) > 0
 
     def _build_snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -679,6 +761,7 @@ class _TrafficAccumulator:
                 "detail_log_enabled": bool(self._detail_log_enabled),
                 "detail_log_max_entries": int(self._detail_log_max_entries),
                 "detail_recorded_count": int(len(self._request_details)),
+                "detail_consuming_count": sum(self._is_consuming_detail(item) for item in self._request_details),
                 "js_coverage": self._js_coverage_snapshot(),
                 "note": note,
             }
@@ -939,6 +1022,7 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
             blocked=blocked,
             unfinished=unfinished,
             cache_status=metadata["cache_status"],
+            size_source="playwright.sizes" if include_response else "estimated_upload",
             mime_type=metadata["mime_type"],
             detail_key=f"playwright:{request_id}",
         )
@@ -1204,6 +1288,7 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
         self._log_supported: bool | None = None
         self._network_event_count = 0
         self._requests: dict[str, dict[str, Any]] = {}
+        self._excluded_loopback_request_ids: set[str] = set()
         self._fallback_seen: set[tuple[Any, ...]] = set()
         self._request_generations: dict[str, int] = {}
         self._websocket_stats: dict[str, dict[str, Any]] = {}
@@ -1355,6 +1440,7 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
             unfinished=unfinished,
             cache_status=cache_status,
             mime_type=response.get("mimeType") if isinstance(response, dict) else "",
+            size_source="cdp.encoded+estimated_headers",
             websocket_payload_upload_bytes=ws_upload,
             websocket_payload_download_bytes=ws_download,
             detail_key=record.get("detail_key"),
@@ -1386,6 +1472,28 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
 
     def _handle_cdp_event(self, method: str, params: dict[str, Any]) -> None:
         self._network_event_count += 1
+
+        event_request_id = str(params.get("requestId") or "")
+        if method == "Network.webSocketCreated" and _is_loopback_url(params.get("url")):
+            if event_request_id:
+                self._excluded_loopback_request_ids.add(event_request_id)
+            return
+        if (
+            method != "Network.requestWillBeSent"
+            and event_request_id
+            and event_request_id in self._excluded_loopback_request_ids
+        ):
+            return
+
+        def is_local_asset(request_id: str) -> bool:
+            cache = self._local_asset_cache
+            if cache is None:
+                return False
+            try:
+                return bool(cache.was_fulfilled_network_request(request_id))
+            except Exception:
+                return False
+
         if method == "Network.requestWillBeSent":
             request_id = str(params.get("requestId") or "")
             if not request_id:
@@ -1401,6 +1509,11 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
             request = params.get("request") or {}
             resource_type = _normalize_resource_type(params.get("type") or "")
             request_url = str(request.get("url") or "") if isinstance(request, dict) else ""
+            if _is_loopback_url(request_url):
+                self._excluded_loopback_request_ids.add(request_id)
+                self._requests.pop(request_id, None)
+                return
+            self._excluded_loopback_request_ids.discard(request_id)
             if resource_type == "other" and request_url.lower().startswith(("ws:", "wss:")):
                 resource_type = "websocket"
             generation = self._request_generations.get(request_id, 0) + 1
@@ -1431,6 +1544,9 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                 record["response"] = response
                 if response.get("fromDiskCache") or response.get("fromMemoryCache"):
                     record["served_from_cache"] = True
+                if is_local_asset(request_id):
+                    record["served_from_cache"] = True
+                    record["served_from_local_asset_cache"] = True
             return
 
         if method == "Network.webSocketHandshakeResponseReceived":
@@ -1452,12 +1568,18 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
             request_id = str(params.get("requestId") or "")
             record = self._requests.get(request_id)
             if record is not None:
+                if is_local_asset(request_id):
+                    record["served_from_cache"] = True
+                    record["served_from_local_asset_cache"] = True
                 self._finish_cdp_request(record, body_size=params.get("encodedDataLength", 0))
             return
 
         if method == "Network.dataReceived":
             request_id = str(params.get("requestId") or "")
             record = self._requests.get(request_id)
+            if record is not None and is_local_asset(request_id):
+                record["served_from_cache"] = True
+                record["served_from_local_asset_cache"] = True
             if record is not None and not record.get("served_from_cache"):
                 record["received_body_bytes"] = (
                     _non_negative_int(record.get("received_body_bytes"))
@@ -1601,6 +1723,9 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                 logger.debug("[%s] 无法读取 performance log：%s", self.label, exc)
             self._log_supported = False
             return 0
+        # 部分驱动/异常场景返回 None 或非列表；统计层必须容忍，不能拖垮注册主流程。
+        if not isinstance(entries, (list, tuple)):
+            return 0
 
         parsed = 0
         for entry in entries or []:
@@ -1658,6 +1783,8 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
         for item in entries:
             if not isinstance(item, dict):
                 continue
+            if _is_loopback_url(item.get("name")):
+                continue
             key = (
                 document,
                 time_origin,
@@ -1688,6 +1815,7 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                 response_body_bytes=encoded_body,
                 response_header_bytes=max(0, transfer - encoded_body),
                 cache_status="miss" if raw_transfer else "unknown",
+                size_source="resource_timing" if raw_transfer else "resource_timing.encoded_fallback",
                 detail_key=f"timing:{key}",
             )
 

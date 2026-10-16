@@ -12,8 +12,10 @@ EMAIL_SOURCE 支持单个或多个来源：
     "mailnest"
     "cloudmail"
     "remail"
+    "mailcode"           # 域名邮箱 MailCode
+    "xigua"
     "outlook,generic_api,mailnest,cloudmail,remail"   # 按顺序兜底
-    ["outlook", "generic_api", "mailnest", "cloudmail", "remail"]  # 也兼容列表写法
+    ["outlook", "generic_api", "mailnest", "cloudmail", "remail", "xigua"]  # 也兼容列表写法
 """
 import logging
 import math
@@ -24,7 +26,7 @@ from core.log_safety import redact_email
 
 logger = logging.getLogger(__name__)
 
-_VALID_SOURCES = ("outlook", "generic_api", "imap", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "remail", "icloud")
+_VALID_SOURCES = ("outlook", "generic_api", "imap", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "remail", "icloud", "xigua", "mailcode")
 
 
 class OtpWaitSession:
@@ -121,6 +123,12 @@ def _pick_from_source(source: str) -> str:
         return pick_account().email
     if source == "remail":
         from core.remail_client import pick_account
+        return pick_account().email
+    if source == "mailcode":
+        from core.mailcode_client import pick_account
+        return pick_account().email
+    if source == "xigua":
+        from core.xigua_client import pick_account
         return pick_account().email
     from core.outlook_client import pick_account
     return pick_account().email
@@ -225,6 +233,12 @@ def resolve_email_source(email: str) -> str:
     from core.remail_client import get_account_context as get_remail_context
     if get_remail_context(email):
         return "remail"
+    from core.mailcode_client import get_account_context as get_mailcode_context
+    if get_mailcode_context(email):
+        return "mailcode"
+    from core.xigua_client import get_account_context as get_xigua_context
+    if get_xigua_context(email):
+        return "xigua"
 
     from core import db
     if db.get_imap_email_by_email(email):
@@ -358,6 +372,12 @@ def wait_for_otp(
     if source == "remail":
         from core.remail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "mailcode":
+        from core.mailcode_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "xigua":
+        from core.xigua_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     from core.outlook_client import fetch_latest_otp
     return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
 
@@ -412,6 +432,12 @@ def release_email(
         release_account(email, status=status, note=note)
     elif source == "remail":
         from core.remail_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "mailcode":
+        from core.mailcode_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "xigua":
+        from core.xigua_client import release_account
         release_account(email, status=status, note=note)
     else:
         from core.outlook_client import release_account
