@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -82,8 +83,25 @@ _SWEEP_INTERVAL_SECONDS = 300
 _SWEEP_MIN_AGE_MINUTES = 15.0
 _SWEEP_LIMIT = 2
 _MAX_ATTEMPTS = 3
+# 重认证 OTP 超时基本都是对面节流（一小时内连发多封就会被限），
+# 失败后按 attempts 递增冷却，避免扫描器 5 分钟一轮继续撞墙。
+_OTP_RETRY_COOLDOWN_MINUTES = 10
+_OTP_THROTTLE_MARKERS = ("otp wait timed out", "otp_timeout")
 _sweeper_started = False
 _sweeper_lock = threading.Lock()
+
+
+def _looks_like_otp_throttle(error: str) -> bool:
+    text = str(error or "").lower()
+    return any(marker in text for marker in _OTP_THROTTLE_MARKERS)
+
+
+def _next_retry_at(error: str, attempts: int) -> str | None:
+    """OTP 节流类失败返回下次允许重试的时间；其它失败返回 None（走常规节奏）。"""
+    if not _looks_like_otp_throttle(error):
+        return None
+    minutes = _OTP_RETRY_COOLDOWN_MINUTES * max(1, int(attempts or 1))
+    return (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
 
 
 def _run(email: str, trigger: str) -> dict:
@@ -114,14 +132,19 @@ def _run(email: str, trigger: str) -> dict:
             else:
                 acc = db.get_account_by_email(email) or {}
                 attempts = int(acc.get("password_pending_attempts") or 0)
+                error_text = str(result.get("error") or "")
                 if attempts >= _MAX_ATTEMPTS:
                     db.set_account_password_pending(
                         email, status="failed",
-                        reason=f"补密码连续失败 {attempts} 次：{str(result.get('error') or '')[:100]}")
+                        reason=f"补密码连续失败 {attempts} 次：{error_text[:100]}")
                 else:
+                    next_retry_at = _next_retry_at(error_text, attempts)
+                    reason = f"待重试({attempts}/{_MAX_ATTEMPTS})：{error_text[:100]}"
+                    if next_retry_at:
+                        reason += f"（冷却 {_OTP_RETRY_COOLDOWN_MINUTES * max(1, attempts)} 分钟后自动重试）"
                     db.set_account_password_pending(
                         email, status="pending",
-                        reason=f"待重试({attempts}/{_MAX_ATTEMPTS})：{str(result.get('error') or '')[:100]}")
+                        reason=reason, next_retry_at=next_retry_at)
         except Exception as exc:
             logger.warning("[补密码] 挂号状态回写失败：%s", str(exc)[:140])
         if result.get("ok"):
@@ -235,6 +258,13 @@ def sweep_pending(*, limit: int = _SWEEP_LIMIT, min_age_minutes: float = _SWEEP_
         # 真假难分。成功/失败只认 _run 跑完后的写回（done / pending / failed）。
         if not str(acc.get("access_token") or "").strip():
             continue
+        next_retry_raw = str(acc.get("password_pending_next_retry_at") or "").strip()
+        if next_retry_raw:
+            try:
+                if now < datetime.fromisoformat(next_retry_raw):
+                    continue
+            except (TypeError, ValueError):
+                pass
         try:
             created = datetime.fromisoformat(str(acc.get("created_at") or ""))
         except (TypeError, ValueError):

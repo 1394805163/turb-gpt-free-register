@@ -3919,11 +3919,15 @@ def update_account_session_tokens(email: str, session: dict | None) -> bool:
         return True
 
 
-def set_account_password_pending(email: str, *, status: str, reason: str = "") -> bool:
+def set_account_password_pending(
+    email: str, *, status: str, reason: str = "", next_retry_at: str | None = None
+) -> bool:
     """无密码注册账号的"待补密码"挂号/收尾。
 
     status: pending（待补）/ in_progress（已入队）/ done / failed / skipped
     入队时 attempts +1，用于限制重试次数，避免失败账号被无限重试。
+    next_retry_at: 下次允许重试的时间；扫描器在此之前会跳过该账号
+    （重认证 OTP 被对面节流时，密集重试只会继续撞墙）。
     """
     target = str(email or "").strip()
     if not target:
@@ -3938,6 +3942,7 @@ def set_account_password_pending(email: str, *, status: str, reason: str = "") -
             row["password_pending_status"] = None
             row["password_pending"] = False
             row["password_pending_reason"] = str(reason or "")[:160]
+            row["password_pending_next_retry_at"] = None
             row["updated_at"] = now
             _save_account_row(row)
             return True
@@ -3948,6 +3953,10 @@ def set_account_password_pending(email: str, *, status: str, reason: str = "") -
             row["password_pending"] = True
         elif normalized in {"done", "failed", "skipped"}:
             row["password_pending"] = False
+        if normalized in {"done", "failed", "skipped"}:
+            row["password_pending_next_retry_at"] = None
+        elif next_retry_at:
+            row["password_pending_next_retry_at"] = str(next_retry_at)
         if normalized == "in_progress":
             try:
                 row["password_pending_attempts"] = int(row.get("password_pending_attempts") or 0) + 1
@@ -3987,6 +3996,74 @@ def update_account_registration_password(email: str, password: str) -> bool:
         row["extra_json"] = json.dumps(extra_data, ensure_ascii=False)
         row["password"] = str(password)
         row["password_updated_at"] = _now()
+        row["updated_at"] = _now()
+        _save_account_row(row)
+        return True
+
+
+def clear_account_registration_password(email: str, *, reason: str = "") -> bool:
+    """清除本地登记的账号密码。
+
+    补密码失败且服务端明确没有接受新密码（如重认证 OTP 超时）时调用：
+    本地先行登记的候选值并不生效，留着只会让 UI/导出把假密码当真密码。
+    """
+    target = str(email or "").strip().lower()
+    if not target:
+        return False
+    with _LOCK:
+        row = _load_account_row(email=target)
+        if row is None:
+            return False
+        extra = row.get("extra_json")
+        if isinstance(extra, str) and extra.strip():
+            try:
+                extra_data = json.loads(extra)
+            except Exception:
+                extra_data = {}
+        elif isinstance(extra, dict):
+            extra_data = dict(extra)
+        else:
+            extra_data = {}
+        if isinstance(extra_data, dict):
+            extra_data.pop("registration_password", None)
+            row["extra_json"] = json.dumps(extra_data, ensure_ascii=False)
+        row["password"] = None
+        row["password_updated_at"] = None
+        row["password_status"] = "cleared"
+        row["password_status_reason"] = str(reason or "")[:160]
+        row["updated_at"] = _now()
+        row["copy_line"] = _account_line(row)
+        _save_account_row(row)
+        return True
+
+
+def mark_account_password_unverified(email: str, *, reason: str = "") -> bool:
+    """把本地密码标记为"未验证"：提交过 password/add 但没拿到成功响应。"""
+    target = str(email or "").strip().lower()
+    if not target:
+        return False
+    with _LOCK:
+        row = _load_account_row(email=target)
+        if row is None:
+            return False
+        row["password_status"] = "unverified"
+        row["password_status_reason"] = str(reason or "")[:160]
+        row["updated_at"] = _now()
+        _save_account_row(row)
+        return True
+
+
+def mark_account_password_verified(email: str) -> bool:
+    """把本地密码标记为已验证（服务端 password/add 已返回成功）。"""
+    target = str(email or "").strip().lower()
+    if not target:
+        return False
+    with _LOCK:
+        row = _load_account_row(email=target)
+        if row is None:
+            return False
+        row["password_status"] = "verified"
+        row["password_status_reason"] = None
         row["updated_at"] = _now()
         _save_account_row(row)
         return True

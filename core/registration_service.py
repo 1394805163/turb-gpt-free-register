@@ -547,6 +547,9 @@ def _registration_process_entry(
     birthday: str,
 ) -> None:
     """Run browser automation in a process that can be forcefully reaped."""
+    # 标记：注册跑在隔离子进程里。子进程里入队的后台任务（2FA/套餐查询）
+    # 会随子进程收尾被杀，所以它们统一由父进程在任务成功后入队。
+    os.environ["TURB_REG_SUBPROCESS"] = "1"
     try:
         os.setsid()
     except Exception:
@@ -574,6 +577,84 @@ def _registration_process_entry(
             })
         except Exception:
             pass
+
+
+def _enqueue_post_registration_tasks(*, account_id, email, log_line=None) -> None:
+    """注册成功后的后台任务统一由父进程入队（2FA / 套餐查询）。
+
+    这些任务过去在注册子进程里入队：子进程收尾被杀时会一起消失，
+    账号会卡在 totp_setup_status=running，直到 WebUI 重启才恢复。
+    """
+    def _log(text: str) -> None:
+        if log_line is None:
+            return
+        try:
+            log_line(text)
+        except Exception:
+            pass
+
+    try:
+        acc_id = int(account_id or 0)
+    except (TypeError, ValueError):
+        acc_id = 0
+    target_email = str(email or "").strip()
+    if not acc_id or not target_email:
+        return
+    acc = db.get_account(acc_id) or {}
+    if not acc:
+        return
+    account_email = str(acc.get("email") or target_email)
+
+    try:
+        from config import twofa as _twofa_cfg
+
+        auto_twofa = bool(getattr(_twofa_cfg, "ENABLE_2FA", False))
+    except Exception:
+        auto_twofa = False
+    if auto_twofa and not str(acc.get("totp_secret") or "").strip():
+        try:
+            from core import twofa_service
+
+            queued = twofa_service.enqueue_account_totp_setup(
+                account_id=acc_id,
+                email=account_email,
+                access_token=str(acc.get("access_token") or "").strip(),
+                trigger="registration_auto",
+                proxy=str(acc.get("proxy_used") or "") or None,
+            )
+            if queued.get("accepted"):
+                _log(f"[2FA] 注册后自动开启 2FA 已在父进程入队: id={acc_id}")
+            elif queued.get("busy"):
+                _log(f"[2FA] 账号已有 2FA 任务，跳过: id={acc_id}")
+            else:
+                _log(f"[2FA] 注册后自动开启 2FA 入队失败: id={acc_id} {queued.get('error')}")
+        except Exception as exc:
+            _log(f"[2FA] 注册后自动开启 2FA 入队异常: {type(exc).__name__}: {str(exc)[:160]}")
+
+    try:
+        from config import register as _register_cfg
+
+        auto_plan = bool(getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False))
+    except Exception:
+        auto_plan = False
+    if auto_plan:
+        try:
+            from core.plan_check_service import enqueue_account_plan_check
+
+            queued = enqueue_account_plan_check(
+                account_id=acc_id,
+                email=account_email,
+                access_token=str(acc.get("access_token") or "").strip(),
+                trigger="registration_auto",
+            )
+            if queued.get("accepted"):
+                _log(f"[Plan] 注册后套餐查询已在父进程入队: id={acc_id}")
+            elif queued.get("busy"):
+                _log(f"[Plan] 账号已有套餐查询，跳过: id={acc_id}")
+            else:
+                _log(f"[Plan] 注册后套餐查询入队失败: id={acc_id} {queued.get('error')}")
+        except Exception as exc:
+            _log(f"[Plan] 注册后套餐查询入队异常: {type(exc).__name__}: {str(exc)[:160]}")
 
 
 def _run_registration_isolated(job_id: int, log_file: str, email: str, name: str, birthday: str) -> dict:
@@ -720,6 +801,11 @@ def _run_one_job_inner(job_id: int, log_file: str) -> None:
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 log_logger.info("[Job %s] 成功: %s", job_id, redact_email(result.get("email")))
+                _enqueue_post_registration_tasks(
+                    account_id=(result or {}).get("account_id"),
+                    email=(result or {}).get("email"),
+                    log_line=lambda text: log_logger.info("[Job %s] %s", job_id, text),
+                )
             else:
                 # 注意：失败也可能伴随 account_id（如 Codex 失败但账号已注册成功）
                 err = (result or {}).get("error") if isinstance(result, dict) else "unknown"

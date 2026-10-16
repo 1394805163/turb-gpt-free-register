@@ -9,6 +9,7 @@
 避免再起新会话被风控关联或缺失登录态。
 """
 import json
+import os
 import threading
 import logging
 import random
@@ -833,7 +834,12 @@ def save_account_data(
         auto_twofa = bool(getattr(_twofa_cfg, "ENABLE_2FA", False))
     except Exception:
         auto_twofa = False
-    if auto_twofa and not str(totp_secret or "").strip():
+    # 注册跑在隔离子进程时不在子进程里入队：任务会随子进程收尾被杀，
+    # 改由父进程（registration_service）在任务成功后统一入队。
+    in_registration_subprocess = str(os.environ.get("TURB_REG_SUBPROCESS") or "").strip() == "1"
+    if auto_twofa and in_registration_subprocess:
+        logger.info("[2FA] 子进程模式：注册后自动开启 2FA 交给父进程入队: id=%s", row_id)
+    elif auto_twofa and not str(totp_secret or "").strip():
         try:
             from core.twofa_service import enqueue_account_totp_setup
 
@@ -880,6 +886,9 @@ def save_account_data(
             auto_plan_check = False
     if not auto_plan_check:
         logger.info(f"[Plan] 注册后自动套餐查询已跳过: id={row_id}, email={redact_email(email)}")
+        return row_id
+    if in_registration_subprocess:
+        logger.info(f"[Plan] 子进程模式：注册后套餐查询交给父进程入队: id={row_id}")
         return row_id
     # session 中的 account.planType 不能说明 Plus 试用资格。账号落库后只负责
     # 入队，由专用线程池异步查询并回写，避免占用注册工作线程。

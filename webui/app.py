@@ -177,6 +177,7 @@ def _compact_account_for_list(row: dict) -> dict:
     for key in (
         "user_name", "email_source", "original_email", "note", "archived", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
+        "password_status", "password_status_reason",
         "eligible_promo_campaigns", "plus_trial_discount_percentage",
         "plan_check_status", "codex_status", "codex_agent_status",
         "totp_setup_status",

@@ -23,6 +23,33 @@ logger = logging.getLogger(__name__)
 _DRIVER_WATCHDOG_SECONDS = 600.0
 
 
+def settle_local_password_after_failure(
+    *, email: str, prev_password: str, submitted: bool, error: str, save: bool = True
+) -> None:
+    """补密码失败后收口本地密码登记。
+
+    - 有原密码：回滚为原值（服务端并没有接受新密码）
+    - 无原密码且已提交 password/add：可能已在服务端生效，保留候选值但标记"未验证"
+    - 无原密码且未提交：清除候选值，避免 UI/导出把从未生效的假密码当真密码
+    """
+    if not save:
+        return
+    from core import db
+
+    try:
+        if str(prev_password or "").strip():
+            db.update_account_registration_password(email, prev_password)
+            logger.info("[补密码-协议] 本地密码已回滚为原值")
+        elif submitted:
+            db.mark_account_password_unverified(email, reason=error)
+            logger.warning("[补密码-协议] 已提交但未确认，本地密码标记为未验证")
+        else:
+            db.clear_account_registration_password(email, reason=error)
+            logger.info("[补密码-协议] 未提交新密码，已清除本地候选值")
+    except Exception as exc:
+        logger.warning("[补密码-协议] 本地密码收口失败：%s", str(exc)[:140])
+
+
 def _start_driver_watchdog(driver, *, seconds: float = _DRIVER_WATCHDOG_SECONDS):
     """WebDriver 命令无超时；卡死时到点强退浏览器，让主流程抛错走失败分支。"""
     import threading
@@ -731,14 +758,19 @@ def add_password_protocol(
         except Exception as exc:
             logger.warning("[补密码-协议] 密码先行登记失败（继续）：%s", str(exc)[:140])
 
+    # password/add 是否真正提交过：提交前的失败 = 服务端没有新密码，本地候选值直接清掉；
+    # 提交后没拿到成功响应 = 可能已在服务端生效，保留但标记"未验证"，避免假密码被当真。
+    submitted_state = {"done": False}
+
     def _fail(payload: dict) -> dict:
-        """失败收口：把"先行登记"的本地密码回滚为原值（服务端并未接受新密码）。"""
-        if save and prev_password:
-            try:
-                db.update_account_registration_password(email, prev_password)
-                logger.info("[补密码-协议] 本地密码已回滚为原值")
-            except Exception as exc:
-                logger.warning("[补密码-协议] 本地密码回滚失败：%s", str(exc)[:140])
+        """失败收口：恢复/清理"先行登记"的本地密码。"""
+        settle_local_password_after_failure(
+            email=email,
+            prev_password=prev_password,
+            submitted=bool(submitted_state["done"]),
+            error=str(payload.get("error") or ""),
+            save=save,
+        )
         return payload
 
     from core.account_export import (
@@ -772,32 +804,36 @@ def add_password_protocol(
             })
 
         # ---- 2) 发起带 post_login_add_password 的重认证 ----
-        csrf_resp = session.get(
-            "https://chatgpt.com/api/auth/csrf",
-            headers=session.get_nextauth_headers(referer="https://chatgpt.com/"),
-        )
-        csrf_resp.raise_for_status()
-        csrf_token = csrf_resp.json()["csrfToken"]
-        signin_url = "https://chatgpt.com/api/auth/signin/openai?" + urlencode({
-            "login_hint": email,
-            "reauth": "password",
-            "post_login_add_password": "true",
-            "max_age": "0",
-            "ext-oai-did": session.device_id,
-        })
-        signin_headers = session.get_nextauth_headers(referer="https://chatgpt.com/")
-        signin_headers["content-type"] = "application/x-www-form-urlencoded"
-        signin_headers["origin"] = "https://chatgpt.com"
-        signin_resp = session.post(
-            signin_url,
-            headers=signin_headers,
-            data=urlencode({"callbackUrl": "https://chatgpt.com/", "csrfToken": csrf_token, "json": "true"}),
-        )
-        signin_resp.raise_for_status()
-        auth_url = str((signin_resp.json() or {}).get("url") or "")
-        if not auth_url:
-            return _fail({"ok": False, "status": "failed", "email": email,
-                          "error": f"未拿到 reauth authorize URL: {signin_resp.text[:200]}"})
+        def _start_reauth() -> str:
+            """走一遍 signin/openai?reauth=password 拿 authorize URL（重发 OTP 时复用）。"""
+            csrf_resp = session.get(
+                "https://chatgpt.com/api/auth/csrf",
+                headers=session.get_nextauth_headers(referer="https://chatgpt.com/"),
+            )
+            csrf_resp.raise_for_status()
+            csrf_token = csrf_resp.json()["csrfToken"]
+            signin_url = "https://chatgpt.com/api/auth/signin/openai?" + urlencode({
+                "login_hint": email,
+                "reauth": "password",
+                "post_login_add_password": "true",
+                "max_age": "0",
+                "ext-oai-did": session.device_id,
+            })
+            signin_headers = session.get_nextauth_headers(referer="https://chatgpt.com/")
+            signin_headers["content-type"] = "application/x-www-form-urlencoded"
+            signin_headers["origin"] = "https://chatgpt.com"
+            signin_resp = session.post(
+                signin_url,
+                headers=signin_headers,
+                data=urlencode({"callbackUrl": "https://chatgpt.com/", "csrfToken": csrf_token, "json": "true"}),
+            )
+            signin_resp.raise_for_status()
+            url = str((signin_resp.json() or {}).get("url") or "")
+            if not url:
+                raise RuntimeError(f"未拿到 reauth authorize URL: {signin_resp.text[:200]}")
+            return url
+
+        auth_url = _start_reauth()
         logger.info("[补密码-协议] 已拿到重认证 authorize URL")
 
         # ---- 3) 跟随重认证链（必要时邮箱 OTP）----
@@ -807,9 +843,39 @@ def add_password_protocol(
         continue_url = str(final_url or "")
         if "email-verification" in final_url or "email-otp" in final_url:
             from core.email_provider import OtpWaitSession, wait_for_otp
+            from core.openai_auth import send_email_otp
 
+            def _wait_otp(after: float) -> str:
+                # 每轮一个新预算：otp_wait 秒内没邮件就交给重发或失败收口
+                return OtpWaitSession(max_wait=otp_wait, wait_fn=wait_for_otp).wait(
+                    email, after_ts=after)
+
+            # 与 2FA（setup_2fa）/查活链路一致：仅跟随 authorize 有时只打开页面而不
+            # 真正投递邮件，必须显式触发一次 email-otp/send，否则等邮箱永远收不到码
+            # （2026-10-17 实测补密码三次 OTP 超时、邮箱零新邮件）。
+            try:
+                send_email_otp(session)
+            except Exception as exc:
+                logger.warning("[补密码-协议] 显式触发发信失败（继续等待）：%s", str(exc)[:140])
             logger.info("[补密码-协议] 需要邮箱 OTP，开始等待…")
-            otp = OtpWaitSession(wait_fn=wait_for_otp).wait(email, after_ts=reauth_after, max_wait=otp_wait)
+            try:
+                otp = _wait_otp(reauth_after)
+            except Exception as wait_exc:
+                # 重认证页没有可靠的 resend API；重新走一遍 signin→authorize 会让
+                # auth.openai.com 再发一封。只自动重发一次（对齐 2FA/查活流程）。
+                logger.warning("[补密码-协议] 首次等待 OTP 超时，尝试重发一次：%s", str(wait_exc)[:180])
+                resend_after = None
+                try:
+                    resend_after = time.time()
+                    _follow_reauth_with_retry(session, _start_reauth())
+                    send_email_otp(session)
+                    logger.info("[补密码-协议] 已重新触发重认证 OTP，开始第二轮等待")
+                except Exception as resend_exc:
+                    logger.warning("[补密码-协议] 重发失败：%s", str(resend_exc)[:180])
+                # 时间下界放宽 120s 容差（网关缓存/时钟漂移）；重发失败时沿用首轮
+                # 基准，避免第一封信刚到就被时间下界过滤掉。
+                broad_after = max(0.0, (resend_after or reauth_after) - 120.0)
+                otp = _wait_otp(broad_after)
             continue_url = str(_validate_reauth_otp(session, otp) or "")
             logger.info("[补密码-协议] OTP 通过，continue=%s", continue_url[:120])
 
@@ -851,6 +917,7 @@ def add_password_protocol(
         add_headers["openai-sentinel-token"] = sentinel_header
         if so_header:
             add_headers["openai-sentinel-so-token"] = so_header
+        submitted_state["done"] = True
         add_resp = session.post(
             "https://auth.openai.com/api/accounts/password/add",
             headers=add_headers,
@@ -866,6 +933,10 @@ def add_password_protocol(
                 "password": new_password,
                 "error": f"password/add HTTP {status}: {(getattr(add_resp, 'text', '') or '')[:240]}",
             })
+        try:
+            db.mark_account_password_verified(email)
+        except Exception as exc:
+            logger.warning("[补密码-协议] 标记密码已验证失败：%s", str(exc)[:140])
         return {"ok": True, "status": "updated", "email": email, "password": new_password, "method": "protocol"}
     except Exception as exc:
         logger.exception("[补密码-协议] 失败")

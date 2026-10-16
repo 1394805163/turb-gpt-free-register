@@ -3974,7 +3974,7 @@ function renderAccounts() {
       </td>
       <td class="col-source">${esc(r.email_source || '-')}</td>
       <td class="col-token">${_tokenCellV2(r)}</td>
-      <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}">${esc(short(r.password, 18))}</span>` : '<span class="acc-v2-muted">-</span>'}</td>
+      <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}${r.password_status === 'unverified' ? '（未验证：补密码提交后未拿到成功响应）' : ''}">${esc(short(r.password, 18))}</span>${r.password_status === 'unverified' ? '<span class="acc-v2-muted" style="margin-left:4px;" title="未验证：补密码可能没真正生效，建议重试补密码">未验证</span>' : ''}` : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-plan">${_planCell(r)}${_imageQuotaCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
       <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-small">${_totpCellV2(r)}</td>
