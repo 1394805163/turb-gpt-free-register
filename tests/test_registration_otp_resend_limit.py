@@ -1,8 +1,10 @@
 import logging
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -13,6 +15,17 @@ ALIAS = "long-private-alias@icloud.com"
 
 
 class RegistrationOtpResendLimitTests(unittest.TestCase):
+    def setUp(self):
+        # iCloud 池状态是文件存储：注册回收会回写池状态，必须隔离，
+        # 否则夹具邮箱会被写进真实 data/icloud_mailboxes.json。
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            patch.object(icloud_mail_client, "_STATE_FILE", Path(tmp.name) / "icloud_mailboxes.json")
+        )
+
     @staticmethod
     def _otp_wait_session() -> Mock:
         session = Mock()

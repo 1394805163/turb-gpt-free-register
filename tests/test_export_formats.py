@@ -40,12 +40,18 @@ class ExportFormatTests(unittest.TestCase):
         self.headers = {"X-Auth-Code": "test-auth"}
 
     def _export(self, fmt: str) -> str:
-        with patch("webui.app.db.get_account", side_effect=lambda account_id: _rows().get(int(account_id))):
+        with patch(
+            "webui.app.db.get_account", side_effect=lambda account_id: _rows().get(int(account_id))
+        ), patch(
+            # 导出端点会标记"已导出"；必须拦，否则夹具 id 会打到真实库的账号上。
+            "webui.app.db.mark_accounts_exported"
+        ) as mark_exported:
             response = self.client.post(
                 "/api/accounts/export-json-bulk",
                 headers=self.headers,
                 json={"account_ids": [1, 2], "prepare": True, "format": fmt},
             )
+            mark_exported.assert_called_once_with([1, 2])
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True)[:200])
         prepared = response.get_json()
         download = self.client.get(prepared["download_url"], headers=self.headers)

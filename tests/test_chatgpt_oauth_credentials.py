@@ -36,6 +36,13 @@ class ChatGPTOAuthCredentialTests(unittest.TestCase):
                 return_value={"accepted": False, "error": "fixture"},
             )
         )
+        self.stack.enter_context(
+            # 2FA 入队必须拦：否则后台线程会拿测试夹具邮箱跑真实 2FA 流程。
+            patch(
+                "core.twofa_service.enqueue_account_totp_setup",
+                return_value={"accepted": False, "error": "fixture"},
+            )
+        )
         # iCloud 池是文件存储：必须一起隔离，否则测试夹具邮箱会写进真实池
         # （历史上 access-only@icloud.com 就是这么进池的）。
         from config import email as email_config

@@ -161,7 +161,10 @@ class FastLivenessPushTests(unittest.TestCase):
             "core.plan_check_service.enqueue_account_plan_check", return_value={"accepted": True}
         ) as plan_enqueue, patch(
             "core.live_check_service.enqueue_account_live_check", return_value={"accepted": True}
-        ) as otp_enqueue:
+        ) as otp_enqueue, patch(
+            # 2FA 入队必须拦：否则后台线程会拿测试夹具邮箱跑真实 2FA 流程。
+            "core.twofa_service.enqueue_account_totp_setup", return_value={"accepted": True}
+        ):
             row_id = save_account_data(
                 "new-alias@icloud.com",
                 "new-fixture-token",

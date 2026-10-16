@@ -2,10 +2,12 @@
 """单文件 JSON 导出/导入往返：密码与 2FA 必须一起落库。"""
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from core import db
+from config import email as email_config
+from core import db, icloud_mail_client
 
 
 def _db_storage_patches(root: Path) -> dict:
@@ -27,10 +29,19 @@ def _db_storage_patches(root: Path) -> dict:
     }
 
 
+@contextmanager
+def _icloud_storage(root: Path):
+    """iCloud 池是文件存储：import_account_credentials 会回写池状态，必须一起隔离。"""
+    with patch.object(email_config, "ICLOUD_MAILBOXES_FILE", str(root / "icloud_mailboxes.txt")), patch.object(
+        icloud_mail_client, "_STATE_FILE", root / "icloud_mailboxes.json"
+    ):
+        yield
+
+
 class SingleJsonRoundTripTests(unittest.TestCase):
     def test_import_writes_password_and_totp_when_missing(self):
         with tempfile.TemporaryDirectory() as td:
-            with patch.multiple(db, **_db_storage_patches(Path(td))):
+            with patch.multiple(db, **_db_storage_patches(Path(td))), _icloud_storage(Path(td)):
                 db.insert_account(email="rt@example.com", access_token="AT-1", plan_type="free")
                 result = db.import_account_credentials([{
                     "type": "codex",
@@ -50,7 +61,7 @@ class SingleJsonRoundTripTests(unittest.TestCase):
     def test_import_keeps_existing_extra_json(self):
         """纯 AT 导入不能冲掉注册期 extra（密码种子/画像/出口国家都在这）。"""
         with tempfile.TemporaryDirectory() as td:
-            with patch.multiple(db, **_db_storage_patches(Path(td))):
+            with patch.multiple(db, **_db_storage_patches(Path(td))), _icloud_storage(Path(td)):
                 db.insert_account(
                     email="keepx@example.com",
                     access_token="AT-1",
@@ -79,7 +90,7 @@ class SingleJsonRoundTripTests(unittest.TestCase):
 
     def test_import_never_overwrites_existing_password(self):
         with tempfile.TemporaryDirectory() as td:
-            with patch.multiple(db, **_db_storage_patches(Path(td))):
+            with patch.multiple(db, **_db_storage_patches(Path(td))), _icloud_storage(Path(td)):
                 db.insert_account(email="keep@example.com", access_token="AT-1")
                 db.update_account_registration_password("keep@example.com", "Local-Pw")
                 db.import_account_credentials([{

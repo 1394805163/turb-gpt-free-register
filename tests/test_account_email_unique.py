@@ -34,6 +34,32 @@ class AccountEmailUniqueTests(unittest.TestCase):
                     count = conn.execute("SELECT COUNT(*) c FROM accounts").fetchone()["c"]
                 self.assertEqual(count, 1)
 
+    def test_totp_write_back_refuses_reused_id_with_other_email(self):
+        """id 复用保护：带 expect_email 的回写若与行内邮箱不一致必须拒写。"""
+        with tempfile.TemporaryDirectory() as td:
+            with patch.multiple(db, **_db_storage_patches(Path(td))):
+                acc_id = db.insert_account(email="fresh@example.com", access_token="AT-1")
+                before = db.get_account(acc_id)
+
+                refused = db.update_account_totp_secret(
+                    acc_id,
+                    {"ok": False, "status": "failed", "error": "stale task from deleted account"},
+                    expect_email="deleted@example.com",
+                )
+
+                self.assertFalse(refused)
+                after = db.get_account(acc_id)
+                self.assertEqual(after.get("totp_setup_status"), before.get("totp_setup_status"))
+                self.assertNotEqual(after.get("totp_setup_error"), "stale task from deleted account")
+
+                written = db.update_account_totp_secret(
+                    acc_id,
+                    {"ok": True, "status": "success", "totp_secret": "JBSWY3DPEHPK3PXP"},
+                    expect_email="Fresh@Example.com",
+                )
+                self.assertTrue(written)
+                self.assertEqual(db.get_account(acc_id).get("totp_secret"), "JBSWY3DPEHPK3PXP")
+
 
 if __name__ == "__main__":
     unittest.main()

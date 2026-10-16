@@ -156,6 +156,7 @@ def _run_twofa(
         db.update_account_totp_secret(
             account_id,
             {"ok": True, "status": "success", "totp_secret": secret, "message": "2FA 设置完成"},
+            expect_email=email,
         )
         _append_log(email, f"[2FA] 完成：secret={secret[:4]}...{secret[-4:]}")
         logger.info("[2FA] 完成：email=%s secret_len=%s", email, len(secret or ""))
@@ -163,7 +164,7 @@ def _run_twofa(
     except Exception as exc:
         result = {"ok": False, "status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
         try:
-            db.update_account_totp_secret(account_id, result)
+            db.update_account_totp_secret(account_id, result, expect_email=email)
         except Exception:
             logger.exception("[2FA] 写回失败状态失败: account_id=%s", account_id)
         try:
@@ -246,5 +247,9 @@ def enqueue_account_totp_setup(
         return {"accepted": True, "busy": False, "future": future, "log_path": str(log_path(email))}
     except Exception as exc:
         _release_outstanding()
-        db.update_account_totp_secret(account_id, {"ok": False, "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+        db.update_account_totp_secret(
+            account_id,
+            {"ok": False, "status": "failed", "error": f"{type(exc).__name__}: {exc}"},
+            expect_email=email,
+        )
         return {"accepted": False, "busy": False, "error": f"{type(exc).__name__}: {exc}"}

@@ -53,7 +53,10 @@ class EmailChangeTests(unittest.TestCase):
 
     def test_success_triggers_live_check_with_new_email(self):
         queued = {"accepted": True, "status": "queued"}
-        with patch("core.live_check_service.enqueue_account_live_check", return_value=queued) as enqueue:
+        with tempfile.TemporaryDirectory() as td, patch(
+            # 换绑日志走真实 注册日志/：测试必须重定向，否则夹具账号会留下日志文件。
+            "core.email_change_service._LOG_DIR", Path(td)
+        ), patch("core.live_check_service.enqueue_account_live_check", return_value=queued) as enqueue:
             result = email_change_service._enqueue_live_check_after_change(12, "new@example.com")
         self.assertTrue(result["accepted"])
         enqueue.assert_called_once_with(

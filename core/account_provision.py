@@ -280,6 +280,7 @@ def provision_account(
                 db.update_account_totp_secret(
                     acc_id,
                     {"ok": True, "status": "success", "totp_secret": secret, "message": "组合流程补设 2FA"},
+                    expect_email=email,
                 )
             out["twofa_status"] = "ok"
             out["totp_secret"] = secret

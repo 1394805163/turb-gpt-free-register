@@ -6,6 +6,7 @@ SQLite 持久化层（JSON/TXT 仅用于首次迁移）。
 """
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import uuid
@@ -13,6 +14,8 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DATA_DIR = _PROJECT_ROOT
@@ -2191,12 +2194,22 @@ def mark_account_totp_setup_running(acc_id: int) -> bool:
         return True
 
 
-def update_account_totp_secret(acc_id: int, result: dict | None = None) -> bool:
-    """更新账号 2FA/TOTP 设置结果。"""
+def update_account_totp_secret(
+    acc_id: int, result: dict | None = None, expect_email: str | None = None
+) -> bool:
+    """更新账号 2FA/TOTP 设置结果。
+
+    expect_email 提供时校验行内邮箱与任务邮箱一致：账号 id 是 MAX+1 复用制，
+    旧任务若在账号被删除后回写，可能误写到复用同一 id 的新账号。
+    """
     result = result or {}
+    expect = str(expect_email or "").strip().lower()
     with _LOCK:
         row = _load_account_row(acc_id=acc_id)
         if row is None:
+            return False
+        if expect and str(row.get("email") or "").strip().lower() != expect:
+            logger.warning("2FA 结果写入被拒绝：acc_id=%s 行内邮箱与任务邮箱不一致", acc_id)
             return False
         status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
         ok = bool(result.get("ok")) and status == "success"

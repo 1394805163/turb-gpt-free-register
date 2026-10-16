@@ -198,6 +198,7 @@ def set_account_2fa(
                 db.update_account_totp_secret(
                     acc_id,
                     {"ok": True, "status": "success", "totp_secret": secret, "message": "补设 2FA 完成"},
+                    expect_email=email,
                 )
                 logger.info("[补2FA] 已回写 totp_secret 到账号记录")
             except Exception as exc:
