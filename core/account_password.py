@@ -117,6 +117,50 @@ def _has_code_input(driver) -> bool:
         return False
 
 
+def _start_forgot_password_reset(driver, email: str) -> bool:
+    """登录密码页 → Forgot password → 提交邮箱，触发重置流程的邮箱 OTP。
+
+    2026-10-20 实测登录密码页没有"一次性验证码"入口，只有 Forgot password? 链接；
+    这条链路是本地没有可用密码时唯一的邮箱 OTP 通道。
+    """
+    from core.roxy_registration import (
+        _is_email_verification_page,
+        _submit_email_step,
+        _type_email_address,
+    )
+
+    clicked = False
+    try:
+        clicked = bool(driver.execute_script(r"""
+        const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+        const links = [...document.querySelectorAll('a,[role=link]')].filter(vis);
+        const hit = links.find(el => /forgot|忘记密码|忘記密碼|パスワードをお忘れ/i.test(el.innerText || '')
+          || (el.getAttribute('href') || '').includes('/reset-password'));
+        if (hit) { hit.click(); return true; }
+        return false;
+        """))
+    except Exception:
+        clicked = False
+    if not clicked:
+        try:
+            driver.get("https://auth.openai.com/reset-password")
+        except Exception:
+            return False
+    time.sleep(3)
+    if _is_email_verification_page(driver):
+        return True
+    for _ in range(3):
+        try:
+            _type_email_address(driver, email, timeout=12)
+            _submit_email_step(driver, email)
+        except Exception as exc:
+            logger.info("[补密码] 重置页提交邮箱失败（重试）：%s", str(exc)[:120])
+        time.sleep(3)
+        if _is_email_verification_page(driver):
+            return True
+    return False
+
+
 _FIND_PASSWORD_BUTTON_JS = r"""
 const vis = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
 const norm = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -412,6 +456,9 @@ def refresh_account_session(
         _clear_otp_inputs,
         _click_continue,
         _fetch_chatgpt_session,
+        _fill_password_page_if_present,
+        _is_email_verification_page,
+        _is_login_password_page,
         _is_mfa_challenge_page,
         _maybe_accept,
         _pass_mfa_challenge_if_needed,
@@ -504,6 +551,7 @@ def set_account_password(
     proxy: str | None = None,
     proxy_selection: dict | None = None,
     save: bool = True,
+    force_reset: bool = False,
 ) -> dict:
     """给已注册账号补设密码。
 
@@ -562,66 +610,105 @@ def set_account_password(
         logger.info("[补密码] 启动：%s profile=%s", email, opened.profile_id)
         _watchdog_timer = _start_driver_watchdog(driver)
 
-        # ---- 1) OTP 登录 ----
-        driver.get("https://chatgpt.com/auth/login")
-        _maybe_accept(driver)
-        time.sleep(2)
+        # ---- 1) OTP 登录 / 重置 ----
+        from core.roxy_registration import (
+            _fill_password_page_if_present,
+            _is_email_verification_page,
+            _is_login_password_page,
+        )
+
+        reset_flow = False
         login_otp_after = time.time()
-        _submit_email_and_wait_next(driver, email, attempts=2, timeout=120)
-        login_session = OtpWaitSession(wait_fn=wait_for_otp)
-        login_code = login_session.wait(email, after_ts=login_otp_after, max_wait=90)
-        logger.info("[补密码] 登录验证码已收到（len=%s），提交", len(str(login_code or "")))
-        _clear_otp_inputs(driver)
-        _type_otp(driver, login_code)
-        _click_continue(driver)
-        outcome = _wait_after_email_otp_submit(driver, timeout=25)
-        logger.info("[补密码] 登录验证码提交结果：%s", outcome)
-        time.sleep(2)
+        if force_reset:
+            logger.info("[补密码] 强制走 Forgot password 邮箱 OTP 重置")
+            if not _start_forgot_password_reset(driver, email):
+                raise RuntimeError("Forgot password 重置页未能提交邮箱")
+            reset_flow = True
+        else:
+            driver.get("https://chatgpt.com/auth/login")
+            _maybe_accept(driver)
+            time.sleep(2)
+            login_otp_after = time.time()
+            login_state = _submit_email_and_wait_next(
+                driver, email, attempts=2, timeout=120, allow_password_page=True
+            )
+            if login_state == "login_password":
+                # 账号服务端已有密码：先试一次性验证码入口；没有入口就走 Forgot password 重置（邮箱 OTP）。
+                logger.info("[补密码] 登录页要求密码，尝试切换一次性验证码入口")
+                _fill_password_page_if_present(driver, email, timeout=45)
+                if _is_login_password_page(driver):
+                    from core import db as _db_login
+                    from core.account_2fa import _submit_login_password
+
+                    acc_now = _db_login.get_account_by_email(email) or {}
+                    stored = str(acc_now.get("password") or "").strip()
+                    verified = str(acc_now.get("password_status") or "").strip().lower() == "verified"
+                    if stored and verified:
+                        logger.info("[补密码] 未找到一次性验证码入口，改用已验证的本地密码登录")
+                        _submit_login_password(driver, stored)
+                        time.sleep(4)
+                    else:
+                        logger.info("[补密码] 本地无可用密码，改走 Forgot password 邮箱 OTP 重置")
+                        login_otp_after = time.time()
+                        if not _start_forgot_password_reset(driver, email):
+                            raise RuntimeError("Forgot password 重置页未能提交邮箱")
+                        reset_flow = True
+        if _is_email_verification_page(driver):
+            login_session = OtpWaitSession(wait_fn=wait_for_otp)
+            login_code = login_session.wait(email, after_ts=login_otp_after, max_wait=90)
+            logger.info("[补密码] 登录验证码已收到（len=%s），提交", len(str(login_code or "")))
+            _clear_otp_inputs(driver)
+            _type_otp(driver, login_code)
+            _click_continue(driver)
+            outcome = _wait_after_email_otp_submit(driver, timeout=25)
+            logger.info("[补密码] 登录验证码提交结果：%s", outcome)
+            time.sleep(2)
         # 账号已启用 2FA 时登录后会停在 mfa-challenge，需要本地 TOTP 动态码。
         if _is_mfa_challenge_page(driver):
             logger.info("[补密码] 检测到 2FA 挑战页，提交本地 TOTP 动态码")
             if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
                 raise RuntimeError("2FA 动态码未通过，无法继续设置密码")
             time.sleep(2)
-        info = _fetch_chatgpt_session(driver, timeout=90)
-        if not info.get("accessToken"):
-            raise RuntimeError("登录后未拿到 accessToken")
-        logger.info("[补密码] 登录成功")
+        if not reset_flow:
+            info = _fetch_chatgpt_session(driver, timeout=90)
+            if not info.get("accessToken"):
+                raise RuntimeError("登录后未拿到 accessToken")
+            logger.info("[补密码] 登录成功")
 
-        # ---- 2) 设置页 -> Password Add ----
-        driver.get(SETTINGS_URL)
-        time.sleep(6)
-        click_ts = time.time()
-        clicked = _click_password_add(driver)
-        logger.info("[补密码] 点击 Password Add：%s", clicked)
-        if not clicked.get("found"):
-            raise RuntimeError(
-                f"设置页未找到 password-setting：{json.dumps(_page_state(driver), ensure_ascii=False)[:260]}"
-            )
+            # ---- 2) 设置页 -> Password Add ----
+            driver.get(SETTINGS_URL)
+            time.sleep(6)
+            click_ts = time.time()
+            clicked = _click_password_add(driver)
+            logger.info("[补密码] 点击 Password Add：%s", clicked)
+            if not clicked.get("found"):
+                raise RuntimeError(
+                    f"设置页未找到 password-setting：{json.dumps(_page_state(driver), ensure_ascii=False)[:260]}"
+                )
 
-        # ---- 3) 邮箱验证码重认证（新 OTP）----
-        # OTP 邮件在点击时即发送；服务端跳转偶发延迟 30s+，等待窗口给足。
-        if _wait_url_contains(driver, EMAIL_VERIFY_MARKER, timeout=45) or _has_code_input(driver):
-            add_session = OtpWaitSession(wait_fn=wait_for_otp)
-            add_code = add_session.wait(email, after_ts=click_ts, max_wait=90)
-            logger.info("[补密码] 添加密码验证码已收到（len=%s），提交", len(str(add_code or "")))
-            _clear_otp_inputs(driver)
-            _type_otp(driver, add_code)
-            _click_continue(driver)
-            outcome2 = _wait_after_email_otp_submit(driver, timeout=25)
-            logger.info("[补密码] 添加密码验证码提交结果：%s", outcome2)
-        else:
-            logger.info("[补密码] 未进入邮箱验证码页（继续等待新密码页）")
+            # ---- 3) 邮箱验证码重认证（新 OTP）----
+            # OTP 邮件在点击时即发送；服务端跳转偶发延迟 30s+，等待窗口给足。
+            if _wait_url_contains(driver, EMAIL_VERIFY_MARKER, timeout=45) or _has_code_input(driver):
+                add_session = OtpWaitSession(wait_fn=wait_for_otp)
+                add_code = add_session.wait(email, after_ts=click_ts, max_wait=90)
+                logger.info("[补密码] 添加密码验证码已收到（len=%s），提交", len(str(add_code or "")))
+                _clear_otp_inputs(driver)
+                _type_otp(driver, add_code)
+                _click_continue(driver)
+                outcome2 = _wait_after_email_otp_submit(driver, timeout=25)
+                logger.info("[补密码] 添加密码验证码提交结果：%s", outcome2)
+            else:
+                logger.info("[补密码] 未进入邮箱验证码页（继续等待新密码页）")
 
-        # 账号启用 2FA 时，"添加密码"重新认证后会再次要求 TOTP 动态码。
-        if _is_mfa_challenge_page(driver):
-            logger.info("[补密码] 添加密码步骤检测到 2FA 挑战页，提交本地 TOTP 动态码")
-            if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
-                raise RuntimeError("添加密码步骤的 2FA 动态码未通过")
-            time.sleep(2)
+            # 账号启用 2FA 时，"添加密码"重新认证后会再次要求 TOTP 动态码。
+            if _is_mfa_challenge_page(driver):
+                logger.info("[补密码] 添加密码步骤检测到 2FA 挑战页，提交本地 TOTP 动态码")
+                if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
+                    raise RuntimeError("添加密码步骤的 2FA 动态码未通过")
+                time.sleep(2)
 
         # ---- 4) 设置新密码页 ----
-        _wait_url_contains(driver, NEW_PASSWORD_MARKER, timeout=30)
+        _wait_url_contains(driver, NEW_PASSWORD_MARKER, timeout=60 if reset_flow else 30)
         state = _page_state(driver)
         logger.info("[补密码] 新密码页快照：%s", json.dumps(state, ensure_ascii=False)[:420])
 
@@ -670,6 +757,7 @@ def set_account_password(
                 from core import db
 
                 db.update_account_registration_password(email, new_password)
+                db.mark_account_password_verified(email)
                 logger.info("[补密码] 已回写密码到账号记录")
             except Exception as exc:
                 logger.warning("[补密码] 回写 DB 失败：%s", str(exc)[:160])

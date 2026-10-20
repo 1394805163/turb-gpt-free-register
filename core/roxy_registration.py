@@ -2093,11 +2093,17 @@ def _password_page_state(driver) -> dict:
         const forms = [...document.querySelectorAll('form')].map(f => ({action: f.getAttribute('action') || ''}));
         const buttons = [...document.querySelectorAll('button,input[type="submit"]')].map(el => ({
           type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: el.id || '',
+          text: (el.innerText || el.getAttribute('value') || '').replace(/\s+/g, ' ').trim().slice(0, 60),
           disabled: !!el.disabled, visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
         })).slice(0, 30);
+        const links = [...document.querySelectorAll('a')].map(el => ({
+          text: (el.innerText || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+          href: el.getAttribute('href') || '',
+          visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+        })).filter(x => x.text || x.href).slice(0, 30);
         const errors = [...document.querySelectorAll('[role="alert"],[aria-live="assertive"],[aria-live="polite"],.react-aria-FieldError,[slot="errorMessage"],[class*="error"]')]
           .filter(el => visible(el)).map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 10);
-        return {url: location.href, inputs, forms, buttons, errors};
+        return {url: location.href, inputs, forms, buttons, links, errors};
         """) or {}
     except Exception as exc:
         return {"url": getattr(driver, "current_url", ""), "error": f"{type(exc).__name__}: {exc}"}

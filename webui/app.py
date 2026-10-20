@@ -4100,7 +4100,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         "current": "", "started_at": None, "finished_at": None, "results": [],
     }
 
-    def _password_fix_worker(items, skip_existing: bool) -> None:
+    def _password_fix_worker(items, skip_existing: bool, force_reset: bool = False) -> None:
         from core.account_password import set_account_password
         for acc_id, email in items:
             with _password_fix_lock:
@@ -4113,7 +4113,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                     if str(acc.get("password") or "").strip():
                         status = "skipped"
                 if status != "skipped":
-                    result = set_account_password(email) or {}
+                    result = set_account_password(email, force_reset=force_reset) or {}
                     if result.get("ok"):
                         status = "ok"
                     else:
@@ -4160,7 +4160,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             })
         threading.Thread(
             target=_password_fix_worker,
-            args=(items, bool(data.get("skip_existing", True))),
+            args=(items, bool(data.get("skip_existing", True)), bool(data.get("force_reset", False))),
             name="password-fix-batch",
             daemon=True,
         ).start()
