@@ -514,8 +514,10 @@ def node_matches_multiplier(node_name: str, multiplier: object) -> bool:
         return False
     if value == "0.2" and any(marker in name for marker in ("低倍率", "低倍", "低速倍率")):
         return True
+    # 节点名里倍率写法不统一：0.2x / 0.20x / 0.200x 都是同一个倍率，
+    # 只匹配 "0.2" 会漏掉 "0.20x"，导致低倍率节点被当成正常节点选中。
     return bool(re.search(
-        rf"(?<![0-9.]){re.escape(value)}(?:\s*[xX×倍]|(?=$|[\s\-_|/]))",
+        rf"(?<![0-9.]){re.escape(value)}0*(?:\s*[xX×倍]|(?=$|[\s\-_|/]))",
         name,
     ))
 
