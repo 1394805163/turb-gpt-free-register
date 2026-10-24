@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """隔夜注册流水线（非 CLI）：分批注册 → 逐号补密码 → 批量 2FA → 07:40 查活 → 报告。
 
-- 批次：15+15+10+10（驱动 cloak / protocol_page 交替，出口国家 SG→JP→US→SG 轮换）
+- 批次：cloak 专属（protocol_page 2026-10-25 实测 18/20 阵亡，已停用）
 - 节奏：滚动 1 小时最多 15 次提交、提交间隔 ≥120 秒
 - 注册目标 50 个有效账号，失败自动补跑（总尝试 ≤60）
 - 每个账号注册成功后立即补密码（无头浏览器）
@@ -32,6 +32,10 @@ HOURLY_SUBMIT_CAP = 10
 MIN_SUBMIT_GAP_SECONDS = 120.0
 REG_JOB_WAIT_SECONDS = 1800.0
 LIVENESS_POLL_SECONDS = 900.0
+
+# 2026-10-25 实测：protocol_page 出生 18/20 被 OpenAI 停用（JP 100%、SG 78%），
+# cloak 仅 2/30。协议驱动在补指纹/画像前不得再进批次，否则等于烧邮箱。
+ALLOWED_DRIVERS = {"cloak"}
 
 # 默认批次：每批带 US 兜底（实测美国出口容错度最高），避免单国节点不可用时整批报废。
 DEFAULT_BATCHES = [
@@ -310,6 +314,11 @@ def _write_report(state: dict) -> None:
 
 def _apply_batch_config(batch: dict) -> None:
     driver = str(batch.get("driver") or "cloak").strip().lower()
+    if driver not in ALLOWED_DRIVERS:
+        st = _load()
+        _log(st, f"拒绝启用注册驱动 {driver}（实测高死亡率），已回落 cloak")
+        _save(st)
+        driver = "cloak"
     country = str(batch.get("country") or "").strip().upper()
     st = _load()
     try:
@@ -378,7 +387,7 @@ def _register_phase(token: str) -> None:
             attempt_no = int(st.get("attempts") or 0)
             batch = {
                 "count": 1,
-                "driver": "protocol_page" if attempt_no % 2 else "cloak",
+                "driver": "cloak",
                 # 并集：mihomo 透明路由的实测出口国家可能与节点国别不一致（IPv6 出道）
                 "country": ["SG,US", "JP,US", "US"][attempt_no % 3],
             }
