@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -69,6 +70,37 @@ def in_registration_flow() -> bool:
     return bool(getattr(_tls, "registration", False))
 
 
+def _pid_alive(pid: int) -> bool:
+    """跨平台存活检测。
+
+    注意：Windows 上 os.kill(pid, 0) 不是"探活"，而是 TerminateProcess(handle, 0)，
+    会直接把对方进程杀掉。注册子进程检查父进程占用标记时会走到这里，
+    实测把 WebUI 打崩（子进程继而 KeyboardInterrupt / cannot schedule new futures）。
+    """
+    if not pid:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
 def _foreign_marker_fresh() -> bool:
     try:
         if not _MARKER.exists():
@@ -78,11 +110,8 @@ def _foreign_marker_fresh() -> bool:
         age = time.time() - float(data.get("ts") or _MARKER.stat().st_mtime)
         if age > _STALE_SECONDS:
             return False
-        if pid and pid != os.getpid():
-            try:
-                os.kill(pid, 0)  # 进程还活着才算占用
-            except OSError:
-                return False
+        if pid and pid != os.getpid() and not _pid_alive(pid):
+            return False
         return True
     except Exception:
         return False
