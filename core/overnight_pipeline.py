@@ -37,12 +37,12 @@ LIVENESS_POLL_SECONDS = 900.0
 # cloak 仅 2/30。协议驱动在补指纹/画像前不得再进批次，否则等于烧邮箱。
 ALLOWED_DRIVERS = {"cloak"}
 
-# 默认批次：每批带 US 兜底（实测美国出口容错度最高），避免单国节点不可用时整批报废。
+# 默认批次：只用 US / JP / SG（2026-10-25 起停用 TW）；每批带 US 兜底。
 DEFAULT_BATCHES = [
+    {"count": 10, "driver": "cloak", "country": "US,JP"},
     {"count": 10, "driver": "cloak", "country": "SG,US"},
-    {"count": 10, "driver": "cloak", "country": "JP,US"},
+    {"count": 10, "driver": "cloak", "country": "JP,SG"},
     {"count": 10, "driver": "cloak", "country": "US"},
-    {"count": 10, "driver": "cloak", "country": "SG,US"},
 ]
 DEFAULT_TARGET_SUCCESS = 50
 DEFAULT_MAX_ATTEMPTS = 60
@@ -389,7 +389,7 @@ def _register_phase(token: str) -> None:
                 "count": 1,
                 "driver": "cloak",
                 # 并集：mihomo 透明路由的实测出口国家可能与节点国别不一致（IPv6 出道）
-                "country": ["SG,US", "JP,US", "US"][attempt_no % 3],
+                "country": ["US,JP", "SG,US", "JP,SG"][attempt_no % 3],
             }
         else:
             batch = batches[bi]
