@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core import icloud_mail_store as store
 from core.icloud_mail_pool import ICloudMailboxPool
 from core.log_safety import redact_email
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _STATE_FILE = _PROJECT_ROOT / "data" / "icloud_mailboxes.json"
+_DEFAULT_DB = _PROJECT_ROOT / "turb.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -31,9 +32,9 @@ def _settings() -> dict[str, Any]:
     from config import email as cfg
 
     mailbox_file = _resolve_path(getattr(cfg, "ICLOUD_MAILBOXES_FILE", "data/icloud_mailboxes.txt"))
-    mailboxes = mailbox_file.read_text(encoding="utf-8-sig", errors="replace") if mailbox_file.is_file() else ""
     return {
-        "mailboxes": mailboxes,
+        "legacy_txt": str(mailbox_file),
+        "db_path": str(_db_path()),
         "imap_host": getattr(cfg, "ICLOUD_IMAP_HOST", "imap.mail.me.com"),
         "imap_port": int(getattr(cfg, "ICLOUD_IMAP_PORT", 993) or 993),
         "imap_username": getattr(cfg, "ICLOUD_IMAP_USERNAME", ""),
@@ -56,19 +57,20 @@ def _pool(**overrides: Any) -> ICloudMailboxPool:
     return ICloudMailboxPool(settings, _STATE_FILE)
 
 
+def _db_path() -> Path:
+    """测试通过 patch _STATE_FILE 注入独立库；正式库与账号共用 turb.sqlite3。"""
+    from config import email as cfg
+
+    legacy = _resolve_path(getattr(cfg, "ICLOUD_MAILBOXES_FILE", "data/icloud_mailboxes.txt"))
+    if legacy == _PROJECT_ROOT / "data" / "icloud_mailboxes.txt":
+        return _DEFAULT_DB
+    return legacy.with_suffix(".sqlite3")
+
+
 def _mailboxes_path() -> Path:
     from config import email as cfg
 
     return _resolve_path(getattr(cfg, "ICLOUD_MAILBOXES_FILE", "data/icloud_mailboxes.txt"))
-
-
-def _write_mailboxes(entries: list[dict[str, str]]) -> None:
-    path = _mailboxes_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.tmp")
-    content = ICloudMailboxPool.serialize(entries)
-    temp_path.write_text(content + ("\n" if content else ""), encoding="utf-8")
-    temp_path.replace(path)
 
 
 def import_mailboxes(text: str, overwrite: bool = False) -> dict[str, int | bool]:
@@ -83,46 +85,11 @@ def import_mailboxes(text: str, overwrite: bool = False) -> dict[str, int | bool
         if raw and not raw.startswith("#") and "@" in raw.partition("----")[0]:
             valid_lines.append(raw)
     incoming = ICloudMailboxPool.parse_entries(valid_lines)
+    path = _db_path()
     pool = _pool()
-    inserted = updated = 0
-    now = datetime.now(timezone.utc).isoformat()
     with pool.lock:
-        existing = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))
-        by_email = {item["email"]: item for item in existing}
-        state = pool._load()
-        config_dirty = state_dirty = False
-        for item in incoming:
-            email = item["email"]
-            current = by_email.get(email)
-            if current is not None:
-                if not overwrite:
-                    continue
-                label = str(item.get("label") or "").strip()
-                if label and label != str(current.get("label") or ""):
-                    current["label"] = label
-                    config_dirty = True
-                entry = dict(state.get(email) or {})
-                if str(entry.get("state") or "available").strip().lower() == "failed":
-                    entry.update({"state": "available", "reason": "", "updated_at": now})
-                    state[email] = entry
-                    state_dirty = True
-                updated += 1
-                continue
-            existing.append(item)
-            by_email[email] = item
-            state[email] = {
-                "state": "available",
-                "reason": "",
-                "label": item.get("label") or "",
-                "imported_at": now,
-                "updated_at": now,
-            }
-            config_dirty = state_dirty = True
-            inserted += 1
-        if config_dirty:
-            _write_mailboxes(existing)
-        if state_dirty:
-            pool._save(state)
+        store.ensure(path, _mailboxes_path(), _STATE_FILE)
+        inserted, updated = store.upsert(path, incoming, overwrite=overwrite)
     return {
         "ok": True,
         "inserted": inserted,
@@ -153,96 +120,28 @@ def sync_registered_mailboxes(accounts: list[dict] | tuple[dict, ...]) -> dict[s
         seen.add(email)
         addresses.append(email)
 
+    path = _db_path()
     pool = _pool()
     with pool.lock:
-        existing = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))
-        existing_by_email = {item["email"]: item for item in existing}
-        state = pool._load()
-        now = datetime.now(timezone.utc).isoformat()
-        inserted = marked_used = already_used = preserved_disabled = 0
-        state_dirty = False
-        for email in addresses:
-            if email not in existing_by_email:
-                item = {"email": email, "label": ""}
-                existing.append(item)
-                existing_by_email[email] = item
-                state[email] = {
-                    "state": "used",
-                    "reason": "已有注册账号回填",
-                    "label": "",
-                    "imported_at": now,
-                    "updated_at": now,
-                }
-                inserted += 1
-                state_dirty = True
-                continue
-            current = dict(state.get(email) or {})
-            current_state = str(current.get("state") or "available").strip().lower()
-            if current_state == "disabled":
-                preserved_disabled += 1
-                continue
-            if current_state == "used":
-                already_used += 1
-                continue
-            current.update({
-                "state": "used",
-                "reason": "已有注册账号回填",
-                "label": existing_by_email[email].get("label") or current.get("label") or "",
-                "updated_at": now,
-            })
-            state[email] = current
-            marked_used += 1
-            state_dirty = True
-        if inserted:
-            _write_mailboxes(existing)
-        if state_dirty:
-            pool._save(state)
+        store.ensure(path, _mailboxes_path(), _STATE_FILE)
+        stats = store.mark_registered(path, addresses)
     return {
         "accounts": len(addresses),
-        "inserted": inserted,
-        "marked_used": marked_used,
-        "already_used": already_used,
-        "preserved_disabled": preserved_disabled,
+        **stats,
     }
 
 
 def list_mailboxes(status: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
-    pool = _pool()
-    entries = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))
-    with pool.lock:
-        state = pool._load()
-    rows: list[dict[str, Any]] = []
     wanted = str(status or "").strip().lower()
-    for item in entries:
-        email = item["email"]
-        current = dict(state.get(email) or {})
-        current_status = str(current.get("state") or "available").strip().lower()
-        if wanted and current_status != wanted:
-            continue
-        label = item.get("label") or str(current.get("label") or "")
-        updated_at = str(current.get("updated_at") or "")
-        rows.append({
-            "email": email,
-            "label": label,
-            "status": current_status,
-            "note": str(current.get("reason") or ""),
-            "copy_line": f"{email}----{label}" if label else email,
-            "imported_at": str(current.get("imported_at") or ""),
-            "created_at": str(current.get("imported_at") or ""),
-            "used_at": updated_at if current_status == "used" else "",
-            "updated_at": updated_at,
-            "access_token": "",
-        })
-    return rows[: max(0, int(limit))]
+    path = _db_path()
+    store.ensure(path, _mailboxes_path(), _STATE_FILE)
+    return store.list_rows(path, status=wanted or None, limit=limit)
 
 
 def mailbox_summary() -> dict[str, int]:
-    rows = list_mailboxes(limit=1_000_000)
-    result = {"total": len(rows), "available": 0, "in_use": 0, "used": 0, "failed": 0, "disabled": 0}
-    for row in rows:
-        key = str(row.get("status") or "available")
-        result[key] = int(result.get(key, 0)) + 1
-    return result
+    path = _db_path()
+    store.ensure(path, _mailboxes_path(), _STATE_FILE)
+    return store.summary(path)
 
 
 def set_mailbox_status(email: str, status: str, note: str | None = None) -> None:
@@ -250,37 +149,21 @@ def set_mailbox_status(email: str, status: str, note: str | None = None) -> None
     normalized = str(status or "").strip().lower()
     if normalized not in {"available", "in_use", "used", "failed", "disabled"}:
         raise ValueError("iCloud 邮箱状态非法")
+    path = _db_path()
     pool = _pool()
-    entries = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))
-    matched = next((item for item in entries if item["email"] == target), None)
-    if not matched:
-        raise KeyError(f"iCloud 邮箱不存在: {target}")
     with pool.lock:
-        state = pool._load()
-        current = dict(state.get(target) or {})
-        current.update({
-            "state": normalized,
-            "reason": str(note or "")[:300],
-            "label": matched.get("label") or current.get("label") or "",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
-        state[target] = current
-        pool._save(state)
+        store.ensure(path, _mailboxes_path(), _STATE_FILE)
+        if not store.set_status(path, target, normalized, note):
+            raise KeyError(f"iCloud 邮箱不存在: {target}")
 
 
 def delete_mailbox(email: str) -> bool:
     target = str(email or "").strip().lower()
+    path = _db_path()
     pool = _pool()
     with pool.lock:
-        entries = ICloudMailboxPool.parse_entries(pool.config.get("mailboxes"))
-        kept = [item for item in entries if item["email"] != target]
-        if len(kept) == len(entries):
-            return False
-        _write_mailboxes(kept)
-        state = pool._load()
-        state.pop(target, None)
-        pool._save(state)
-    return True
+        store.ensure(path, _mailboxes_path(), _STATE_FILE)
+        return store.delete(path, target)
 
 
 def pick_account() -> ICloudAccount:
@@ -292,17 +175,17 @@ def get_account_context(email: str) -> dict[str, Any] | None:
     target = str(email or "").strip().lower()
     if not target:
         return None
-    pool = _pool()
-    if target not in pool.parse(pool.config.get("mailboxes")):
+    row = store.get(_db_path(), target)
+    if not row:
         return None
-    state: dict[str, Any] = {}
-    try:
-        loaded = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            state = dict(loaded.get(target) or {})
-    except Exception:
-        pass
-    return {"email": target, **state}
+    return {
+        "email": target,
+        "state": row["status"],
+        "reason": row["note"],
+        "label": row["label"],
+        "imported_at": row["imported_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def fetch_latest_otp(

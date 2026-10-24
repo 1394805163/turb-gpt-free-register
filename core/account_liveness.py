@@ -715,7 +715,10 @@ def _validate_with_retry(
 ) -> dict:
     current_otp = None
     last_exc: Exception | None = None
-    otp_wait_session = OtpWaitSession(wait_fn=wait_for_otp)
+    # 查活链路实测：登录 OTP 比注册期慢得多，请求后 ~200 秒才落盘
+    # （2026-10-22 实测 15:08:21 请求 → 15:11:47 到信），而 OTP_MAX_WAIT
+    # 默认 100 秒直接判死。查活不赶注册那点时间，这里单独给足 300 秒。
+    otp_wait_session = OtpWaitSession(max_wait=300, wait_fn=wait_for_otp)
     for attempt in range(1, max_otp_attempts + 1):
         try:
             if current_otp is None:
@@ -732,6 +735,7 @@ def _validate_with_retry(
             send_email_otp(session)
             # 以“重新发送请求完成后”为新基准，避免刚刚失败的上一封旧码再次被 after 容忍窗口命中。
             otp_after_ts = time.time()
+            otp_wait_session.reset_budget()
             current_otp = None
             time.sleep(1)
         except Exception as exc:
@@ -746,6 +750,7 @@ def _validate_with_retry(
             except Exception:
                 raise
             otp_after_ts = time.time()
+            otp_wait_session.reset_budget()
             current_otp = None
             time.sleep(1)
     raise last_exc if last_exc else RuntimeError("OTP 验证失败")

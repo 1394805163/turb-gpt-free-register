@@ -668,6 +668,7 @@ def set_account_password(
             logger.info("[补密码] 检测到 2FA 挑战页，提交本地 TOTP 动态码")
             if not _pass_mfa_challenge_if_needed(driver, email, timeout=30):
                 raise RuntimeError("2FA 动态码未通过，无法继续设置密码")
+            logger.info("[补密码] 2FA 通过后 URL：%s", str(getattr(driver, "current_url", "") or "")[:160])
             time.sleep(2)
         if not reset_flow:
             info = _fetch_chatgpt_session(driver, timeout=90)
@@ -1025,7 +1026,28 @@ def add_password_protocol(
             db.mark_account_password_verified(email)
         except Exception as exc:
             logger.warning("[补密码-协议] 标记密码已验证失败：%s", str(exc)[:140])
-        return {"ok": True, "status": "updated", "email": email, "password": new_password, "method": "protocol"}
+        # password/add 会吊销注册期 AT（token_revoked）。不立刻换一条新会话，
+        # 后续套餐查询/查活/推送全部 401，号看起来像"注册完就死"。
+        token_refreshed = False
+        try:
+            from core.password_login import login_with_password
+
+            fresh = login_with_password(
+                email,
+                new_password,
+                totp_secret=str((db.get_account_by_email(email) or {}).get("totp_secret") or ""),
+                write_back=True,
+                timeout=40,
+            )
+            token_refreshed = bool(fresh.get("ok"))
+            logger.info("[补密码-协议] 换新会话: ok=%s %s", token_refreshed,
+                        str(fresh.get("error") or "")[:140])
+        except Exception as exc:
+            logger.warning("[补密码-协议] 换新会话失败（密码已生效）：%s", str(exc)[:140])
+        return {
+            "ok": True, "status": "updated", "email": email, "password": new_password,
+            "method": "protocol", "token_refreshed": token_refreshed,
+        }
     except Exception as exc:
         logger.exception("[补密码-协议] 失败")
         return _fail({"ok": False, "status": "failed", "email": email, "password": new_password,

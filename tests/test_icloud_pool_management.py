@@ -45,7 +45,7 @@ class ICloudPoolManagementTests(unittest.TestCase):
 
         self.assertTrue(icloud_mail_client.delete_mailbox("second@icloud.com"))
         self.assertEqual(icloud_mail_client.mailbox_summary()["total"], 1)
-        self.assertNotIn("second@icloud.com", self.mailbox_file.read_text(encoding="utf-8"))
+        self.assertIsNone(icloud_mail_client.get_account_context("second@icloud.com"))
 
     def test_webui_can_import_and_list_icloud_pool(self):
         client = create_app(auth_code="test-auth").test_client()

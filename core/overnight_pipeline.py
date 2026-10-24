@@ -385,7 +385,10 @@ def _register_phase(token: str) -> None:
         else:
             batch = batches[bi]
         applied = st.get("applied_batch")
-        if applied is None or int(applied) != bi:
+        # topup 阶段 batch_index 不再自增，按 bi 判重会让国家配置只在第一次生效，
+        # 后面全部沿用同一个国家列表（实测只跑了 JP,US，SG 一次都没轮到）。
+        # topup 每轮都要按 attempt_no 重新落到对应国家。
+        if topup or applied is None or int(applied) != bi:
             _apply_batch_config(batch)
             st = _load()
             st["applied_batch"] = bi
@@ -471,8 +474,17 @@ def _finalize_registration_job(job_id: int, job: dict) -> None:
                 password_status = "ok"
                 password_value = str(result.get("password") or "")
             else:
-                password_status = str(result.get("status") or "failed")
-                password_error = str(result.get("error") or "")[:200]
+                # 浏览器补密码实测高频失败（no-password-input / session 无 AT）。
+                # 协议版同一流程 25~30s 稳定成功，直接兜底，避免整批密码全丢。
+                from core.account_password import add_password_protocol
+
+                proto = add_password_protocol(email) or {}
+                if proto.get("ok"):
+                    password_status = "ok"
+                    password_value = str(proto.get("password") or "")
+                else:
+                    password_status = str(proto.get("status") or result.get("status") or "failed")
+                    password_error = str(proto.get("error") or result.get("error") or "")[:200]
     except Exception as exc:
         password_status = f"error:{type(exc).__name__}"
         password_error = str(exc)[:200]
@@ -547,6 +559,28 @@ def _liveness_deadline(st: dict) -> datetime:
 
 
 def _twofa_liveness_phase(token: str) -> None:
+    # 补密码/2FA 也可能在流水线外跑过（手工、扫描器），先按 DB 真值校准状态，
+    # 否则会对已有密码的账号重复走"添加密码"，把可用密码覆盖掉。
+    try:
+        from core import db
+
+        st = _load()
+        changed = False
+        for a in st.get("accounts") or []:
+            row = db.get_account_by_email(str(a.get("email") or "")) or {}
+            if row.get("password") and not a.get("password_ok"):
+                a["password_ok"] = True
+                a["password_status"] = "existing"
+                a["password"] = str(row.get("password") or "")
+                changed = True
+            if row.get("totp_secret") and not a.get("twofa_ok"):
+                a["twofa_ok"] = True
+                a["twofa_status"] = "existing"
+                changed = True
+        if changed:
+            _save(st)
+    except Exception as exc:
+        logger.warning("[流水线] 状态校准失败: %s", exc)
     while True:
         st = _load()
         if not st.get("enabled") or not _is_runner(token):
@@ -578,6 +612,16 @@ def _twofa_liveness_phase(token: str) -> None:
                 retry_status = "ok" if rr.get("ok") else str(rr.get("status") or "failed")
             except Exception as exc:
                 retry_status = f"error:{type(exc).__name__}"
+            if retry_status != "ok":
+                # 与注册收尾一致：浏览器版失败即兜底协议版，避免 2FA 前提缺失导致整批卡死。
+                try:
+                    from core.account_password import add_password_protocol
+
+                    proto = add_password_protocol(email) or {}
+                    if proto.get("ok"):
+                        retry_status = "ok"
+                except Exception as exc:
+                    logger.warning("[流水线] 协议补密码兜底失败 %s: %s", email, exc)
             st = _load()
             for a in st.get("accounts") or []:
                 if a.get("email") == email:

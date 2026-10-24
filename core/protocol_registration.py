@@ -329,7 +329,13 @@ def run_protocol_registration(
             if bool(getattr(_twofa_cfg, "ENABLE_2FA", False)):
                 from core.account_export import setup_2fa
 
-                totp_secret = str(setup_2fa(session, email) or "")
+                _twofa_tokens: dict = {}
+                totp_secret = str(setup_2fa(session, email, token_out=_twofa_tokens) or "")
+                # 2FA 重认证会吊销注册期 AT，落库必须用新 token。
+                _fresh_at = str(_twofa_tokens.get("access_token") or "").strip()
+                if _fresh_at:
+                    at = _fresh_at
+                    logger.info("[协议注册] 已用重认证新 AT 覆盖注册期 token")
                 logger.info("[协议注册] 2FA 已启用，secret_len=%s", len(totp_secret))
         except Exception as exc:
             logger.warning("[协议注册] 2FA 设置失败（账号已注册成功，仅缺少 2FA）：%s", str(exc)[:160])

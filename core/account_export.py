@@ -618,6 +618,7 @@ def setup_2fa(
     email: str,
     otp_code: str | None = None,
     access_token: str | None = None,
+    token_out: dict | None = None,
 ) -> str:
     """
     完整的 2FA 设置流程。
@@ -733,6 +734,10 @@ def setup_2fa(
     logger.info("[2FA] 正在交换新 token...")
     new_token = _exchange_new_token(session, continue_url)
     logger.info("[2FA] 已拿到新 token")
+    # 2FA 重认证会签发一条新会话；调用方必须拿它覆盖旧 AT，否则后续
+    # add_password/eligibility 等接口会以 token_revoked 拒绝。
+    if token_out is not None:
+        token_out["access_token"] = new_token
     human_delay("api")
 
     # 阶段二：enroll + activate

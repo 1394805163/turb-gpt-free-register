@@ -189,6 +189,10 @@ def set_account_2fa(
             try:
                 from core import db
 
+                # 重认证会吊销旧 AT；不写回 fresh_token，补密码/查活会一直 401。
+                if fresh_token:
+                    db.update_account_session_tokens(email, {"accessToken": fresh_token})
+                    logger.info("[补2FA] 已写回重认证新 AT")
                 acc = db.get_account_by_email(email) or {}
                 acc_id = int(acc.get("id") or 0)
                 if not acc_id:

@@ -51,6 +51,10 @@ class OtpWaitSession:
             raise TimeoutError(f"OTP 总等待已达到 {self.max_wait} 秒")
         return max(1, int(math.ceil(remaining)))
 
+    def reset_budget(self) -> None:
+        """重新发码后重置等待预算；否则首轮超时会把后续重试的额度全部吃光。"""
+        self.deadline = time.monotonic() + self.max_wait
+
     def wait(self, email: str, after_ts: float, **kwargs: Any) -> str:
         requested = kwargs.pop("max_wait", None)
         remaining = self.remaining_seconds()

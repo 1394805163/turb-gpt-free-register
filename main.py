@@ -811,7 +811,13 @@ def run_registration(
         if _twofa_cfg.ENABLE_2FA:
             # 步骤14-20: 重认证（要再收一次邮箱 OTP）→ enroll TOTP → activate
             try:
-                totp_secret = setup_2fa(session, email)
+                _twofa_tokens: dict = {}
+                totp_secret = setup_2fa(session, email, token_out=_twofa_tokens)
+                # 2FA 重认证会吊销注册期 AT，必须用新 token 落库。
+                _fresh_at = str(_twofa_tokens.get("access_token") or "").strip()
+                if _fresh_at:
+                    access_token = _fresh_at
+                    logger.info("[2FA] 已用重认证新 AT 覆盖注册期 token（len=%s）", len(_fresh_at))
             except Exception as exc:
                 logger.error("2FA 设置失败: %s", redact_emails(exc))
                 logger.debug("2FA 错误详情:\n%s", redact_emails(traceback.format_exc()))

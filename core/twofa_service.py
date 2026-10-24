@@ -152,12 +152,20 @@ def _run_twofa(
             f"source={proxy_source} device_id={session.device_id}",
         )
         _append_log(email, f"[2FA] 指纹摘要：{session.fingerprint_summary_text()}")
-        secret = setup_2fa(session, email, access_token=access_token)
+        fresh: dict = {}
+        secret = setup_2fa(session, email, access_token=access_token, token_out=fresh)
         db.update_account_totp_secret(
             account_id,
             {"ok": True, "status": "success", "totp_secret": secret, "message": "2FA 设置完成"},
             expect_email=email,
         )
+        # 2FA 重认证已吊销注册期 AT；不写回新 token，补密码/查活会一直 401。
+        new_at = str(fresh.get("access_token") or "").strip()
+        if new_at:
+            db.update_account_session_tokens(email, {"accessToken": new_at})
+            _append_log(email, f"[2FA] 已写回重认证新 AT（len={len(new_at)}）")
+        else:
+            _append_log(email, "[2FA] 警告：未拿到重认证新 AT，本地仍是旧 token")
         _append_log(email, f"[2FA] 完成：secret={secret[:4]}...{secret[-4:]}")
         logger.info("[2FA] 完成：email=%s secret_len=%s", email, len(secret or ""))
         return {"ok": True, "status": "success", "totp_secret": secret, "message": "2FA 设置完成"}

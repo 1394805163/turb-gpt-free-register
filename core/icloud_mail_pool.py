@@ -2,13 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import imaplib
-import json
 import logging
-import os
 import re
-import secrets
-import stat
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, policy
@@ -17,6 +12,8 @@ from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
+
+from core import icloud_mail_store as store
 
 
 _state_lock = Lock()
@@ -63,45 +60,24 @@ class ICloudMailboxPool:
     def serialize(entries: list[dict[str, str]]) -> str:
         return "\n".join(f'{item["email"]}----{item["label"]}' if item.get("label") else item["email"] for item in entries)
 
-    def _load(self) -> dict[str, dict[str, str]]:
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+    @property
+    def db_path(self) -> Path:
+        """池数据存 SQLite；state_file 只作为路径锚点，兼容既有测试注入。"""
+        configured = self.config.get("db_path")
+        if configured:
+            return Path(str(configured))
+        return self.state_file.with_suffix(".sqlite3")
 
-    def _save(self, state: dict[str, dict[str, str]]) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
-        previous = None
-        try:
-            previous = self.state_file.stat()
-        except FileNotFoundError:
-            pass
-        temp_name = ""
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self.state_file.parent,
-                prefix=f".{self.state_file.name}.",
-                delete=False,
-            ) as handle:
-                temp_name = handle.name
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temp_name, stat.S_IMODE(previous.st_mode) if previous else 0o600)
-            # Windows 没有 geteuid/chown；Linux 上保留原文件属主，跨平台时跳过。
-            if previous and getattr(os, "geteuid", lambda: -1)() == 0:
-                os.chown(temp_name, previous.st_uid, previous.st_gid)
-            os.replace(temp_name, self.state_file)
-        finally:
-            if temp_name:
-                try:
-                    os.unlink(temp_name)
-                except FileNotFoundError:
-                    pass
+    def _ensure(self) -> None:
+        legacy_txt = self.config.get("legacy_txt")
+        store.ensure(
+            self.db_path,
+            Path(legacy_txt) if legacy_txt else None,
+            self.state_file,
+        )
+        inline = self.config.get("mailboxes")
+        if inline and not store.summary(self.db_path).get("total"):
+            store.upsert(self.db_path, self.parse_entries(inline))
 
     @staticmethod
     def _available(item: dict[str, str] | None) -> bool:
@@ -121,22 +97,14 @@ class ICloudMailboxPool:
             return True
 
     def acquire(self) -> dict[str, Any]:
-        addresses = self.parse(self.config.get("mailboxes"))
-        if not addresses:
-            raise RuntimeError("iCloud 隐藏邮箱池为空")
         with self.lock:
-            state = self._load()
-            candidates = [item for item in addresses if self._available(state.get(item))]
-            if not candidates:
-                raise RuntimeError(f"iCloud 邮箱池暂无可用邮箱（共 {len(addresses)} 个）")
-            # Hide My Email aliases are not quality-ordered. Random selection prevents
-            # a run of historical/deactivated aliases at the head of an imported file
-            # from starving the registration pipeline.
-            address = secrets.choice(candidates)
-            current = dict(state.get(address) or {})
-            current.update({"state": "in_use", "reason": "", "updated_at": datetime.now(timezone.utc).isoformat()})
-            state[address] = current
-            self._save(state)
+            self._ensure()
+            address = store.claim(self.db_path)
+        if not address:
+            total = store.summary(self.db_path).get("total", 0)
+            if not total:
+                raise RuntimeError("iCloud 隐藏邮箱池为空")
+            raise RuntimeError(f"iCloud 邮箱池暂无可用邮箱（共 {total} 个）")
         return {"address": address, "_code_not_before": datetime.now(timezone.utc), "_seen": set()}
 
     def finish(self, mailbox: dict[str, Any], success: bool, error: Exception | str | None = None) -> None:
@@ -144,32 +112,19 @@ class ICloudMailboxPool:
         if not address:
             return
         with self.lock:
-            state = self._load()
-            current = dict(state.get(address) or {})
-            if str(current.get("state") or "") == "disabled":
-                # 已停用的别名不允许被成功/失败回收覆盖为其它状态。
-                return
-            current.update({
-                "state": "used" if success else "failed",
-                "reason": "" if success else str(error or "")[:300],
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
-            state[address] = current
-            self._save(state)
+            self._ensure()
+            store.finish(self.db_path, address, success, None if success else str(error or ""))
 
     def release(self, mailbox: dict[str, Any]) -> None:
         address = str(mailbox.get("address") or "").lower()
         with self.lock:
-            state = self._load()
-            if str((state.get(address) or {}).get("state")) == "in_use":
-                current = dict(state.get(address) or {})
-                current.update({"state": "available", "reason": "", "updated_at": datetime.now(timezone.utc).isoformat()})
-                state[address] = current
-                self._save(state)
+            self._ensure()
+            store.release(self.db_path, address)
 
     def reset(self) -> None:
         with self.lock:
-            self._save({})
+            self._ensure()
+            store.reset(self.db_path)
 
     @staticmethod
     def _decode(value: Any) -> str:

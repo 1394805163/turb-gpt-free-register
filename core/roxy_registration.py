@@ -1352,7 +1352,69 @@ def _pass_mfa_challenge_if_needed(driver, email: str, timeout: int = 25) -> bool
     _click_continue(driver)
     outcome = _wait_after_email_otp_submit(driver, timeout=timeout)
     logger.info("%s 2FA 动态码提交结果：%s", _log_prefix(driver), outcome)
-    return outcome == "accepted"
+    # _wait_after_email_otp_submit 只判断"离开了 email-verification"，
+    # 而 mfa-challenge 本来就不是验证码页，会立刻误报 accepted。
+    # 必须确认真的离开了 mfa-challenge，否则后面白等 90 秒 session。
+    if _wait_left_mfa_challenge(driver, timeout=max(8, timeout)):
+        return True
+    # UI 点击在这条链上常不生效（实测点完仍停在 mfa-challenge）。
+    # 退化为页内 fetch 提交：同域、带 cookie，服务端能正常认。
+    logger.info("%s 2FA UI 提交未跳转，改用页内 fetch 提交", _log_prefix(driver))
+    if _submit_mfa_via_page(driver, code):
+        if _wait_left_mfa_challenge(driver, timeout=20):
+            logger.info("%s 2FA 页内提交成功，已离开 mfa-challenge", _log_prefix(driver))
+            return True
+    logger.warning(
+        "%s 2FA 提交后仍停在 mfa-challenge，判定未通过 url=%s",
+        _log_prefix(driver), str(getattr(driver, "current_url", "") or "")[:120],
+    )
+    return False
+
+
+def _wait_left_mfa_challenge(driver, *, timeout: int) -> bool:
+    end = time.time() + max(3, timeout)
+    while time.time() < end:
+        try:
+            if not _is_mfa_challenge_page(driver):
+                return True
+        except Exception:
+            # 页面正在跳转时执行脚本会失败，按"已离开"处理，交给上层确认。
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _submit_mfa_via_page(driver, code: str) -> bool:
+    """页内 fetch 提交 TOTP。成功时页面会跳转，async script 可能拿不到回调，
+    因此把超时也当作"可能成功"，由调用方用 URL 复核。"""
+    try:
+        current = str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        current = ""
+    import re
+    match = re.search(r"/mfa-challenge/([A-Za-z0-9]+)", current)
+    factor_id = match.group(1) if match else ""
+    if not factor_id:
+        logger.warning("%s 页内提交 2FA 失败：URL 里没有 factor id", _log_prefix(driver))
+        return False
+    script = """
+    const done = arguments[0];
+    fetch('/api/accounts/mfa/verify', {
+      method: 'POST', credentials: 'include',
+      headers: {'content-type': 'application/json', 'accept': 'application/json'},
+      body: JSON.stringify({type: 'totp', code: arguments[1], id: arguments[2]})
+    }).then(r => done({status: r.status}))
+      .catch(e => done({status: -1, error: String(e)}));
+    """
+    try:
+        result = driver.execute_async_script(script, str(code), factor_id)
+    except Exception as exc:
+        # 提交成功会立刻导航，脚本回调丢失属正常现象。
+        logger.info("%s 页内提交 2FA 时页面已跳转（%s）", _log_prefix(driver), type(exc).__name__)
+        return True
+    status = int((result or {}).get("status") or 0)
+    logger.info("%s 页内提交 2FA 返回 status=%s", _log_prefix(driver), status)
+    return status == 200
 
 
 _OTP_INPUT_FINDER_JS = r"""
