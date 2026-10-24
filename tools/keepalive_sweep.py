@@ -71,6 +71,12 @@ def candidates(days: float, limit: int, skip_ids: set[int]) -> list[dict]:
             continue
         if str(row.get("downstream_rt_status") or "").strip().lower() in {"valid", "ok"}:
             continue
+        # 旧账号可能没有 downstream_rt_status 字段，靠 push_status/exported_at 判断。
+        if (
+            str(row.get("push_status") or "") in {"pushed", "success"}
+            or str(row.get("exported_at") or "").strip()
+        ) and not str(row.get("downstream_rt_status") or "").strip():
+            continue
         if not str(row.get("password") or "").strip() and not str(row.get("totp_secret") or "").strip():
             continue
         exp = at_exp(str(row.get("access_token") or ""))
